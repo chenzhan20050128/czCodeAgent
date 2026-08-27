@@ -21,12 +21,17 @@ from .domain import (
 )
 from .executor import AcceptedToolCall, ToolExecutor, ToolExecutorError
 from .model import SamplingResult
-from .projection import ProjectionEnvironment, PromptProjector
+from .projection import (
+    ProjectionEnvironment,
+    PromptProjector,
+    request_fits_budget,
+)
 from .store import RolloutStore
 from .tools.registry import ToolRegistry
 
 
 MAX_STEPS_FALLBACK = "Maximum tool steps reached before completion."
+REQUEST_SAFETY_MARGIN = 256
 
 _FAILURE_MESSAGES = {
     SamplingOutcome.LENGTH_EXCEEDED: (
@@ -178,13 +183,70 @@ class AgentLoop:
 
         self._require_ready(user_input)
         turn_id = str(uuid.uuid4())
-        tool_steps = 0
+        return self._drive_turn(
+            turn_id, tool_steps=0, new_user_input=user_input
+        )
+
+    def resume_active_turn(self) -> TurnResult:
+        """Continue the replayed active Turn after recovery reconciliation."""
+
+        if not self._usable:
+            raise AgentLoopError("agent loop is unusable after reducer divergence")
+        if self.state.session_id is None:
+            raise AgentLoopError("session has not been created")
+        if self.state.recovery_blocked:
+            raise RecoveryBlockedError(
+                "session recovery is blocked by an unknown tool outcome"
+            )
+        turn_id = self.state.active_turn_id
+        if turn_id is None or self.state.turns.get(turn_id) is not TurnStatus.ACTIVE:
+            raise AgentLoopError("session has no active turn to resume")
+        unresolved = [
+            call.call_key
+            for call in self.state.tool_calls.values()
+            if call.turn_id == turn_id
+            and call.status
+            in {
+                ToolStatus.REQUESTED,
+                ToolStatus.STARTED,
+                ToolStatus.OUTCOME_UNKNOWN,
+            }
+        ]
+        if unresolved:
+            raise RecoveryBlockedError(
+                "active turn has unresolved recovery tool calls"
+            )
+        turn_started_seq = max(
+            event.seq
+            for event in self.state.events
+            if event.type == "turn_started"
+            and event.payload.get("turn_id") == turn_id
+        )
+        tool_steps = sum(
+            event.type == "assistant_accepted"
+            and event.seq > turn_started_seq
+            and bool(event.payload.get("tool_calls", ()))
+            for event in self.state.events
+        )
+        return self._drive_turn(
+            turn_id, tool_steps=tool_steps, new_user_input=None
+        )
+
+    def _drive_turn(
+        self,
+        turn_id: str,
+        *,
+        tool_steps: int,
+        new_user_input: str | None,
+    ) -> TurnResult:
         observed: _ObservedSample | None = None
 
         try:
-            self._append(
-                "turn_started", {"turn_id": turn_id, "user_input": user_input}
-            )
+            if new_user_input is not None:
+                self._append(
+                    "turn_started",
+                    {"turn_id": turn_id, "user_input": new_user_input},
+                )
             while tool_steps < self.config.max_steps:
                 observed = self._sample_with_one_compaction(allow_tools=True)
                 if observed is None:
@@ -328,11 +390,22 @@ class AgentLoop:
         if self.state.session_id is None:
             raise AgentLoopError("session has not been created")
 
-    def _sample(self, *, allow_tools: bool) -> _ObservedSample:
+    def _project_request(
+        self, *, allow_tools: bool
+    ) -> tuple[list[dict[str, Any]], list[Mapping[str, Any]]]:
         messages = PromptProjector.project(
             self.store.load(), self.state, self.environment()
         )
         schemas = self.registry.provider_schemas() if allow_tools else []
+        return messages, schemas
+
+    def _sample_projected(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        schemas: Sequence[Mapping[str, Any]],
+        *,
+        allow_tools: bool,
+    ) -> _ObservedSample:
         stream = _StreamObservation(self.on_content, self.on_invalidate)
         try:
             sampled = self.model.sample(
@@ -350,22 +423,62 @@ class AgentLoop:
             raise
         return _ObservedSample(sampled, stream)
 
+    def _sample(self, *, allow_tools: bool) -> _ObservedSample:
+        messages, schemas = self._project_request(allow_tools=allow_tools)
+        return self._sample_projected(
+            messages, schemas, allow_tools=allow_tools
+        )
+
+    def _request_fits(
+        self,
+        messages: Sequence[Mapping[str, Any]],
+        schemas: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        return request_fits_budget(
+            messages,
+            schemas,
+            context_window=self.config.context_window,
+            reserved_output_tokens=self.config.max_output_tokens,
+            safety_margin=REQUEST_SAFETY_MARGIN,
+        )
+
+    def _compact_once(self) -> bool:
+        if self.compactor is None:
+            return False
+        try:
+            return bool(self.compactor())
+        except Exception:
+            return False
+
     def _sample_with_one_compaction(
         self, *, allow_tools: bool
     ) -> _ObservedSample | None:
-        observed = self._sample(allow_tools=allow_tools)
+        messages, schemas = self._project_request(allow_tools=allow_tools)
+        compacted = False
+        if not self._request_fits(messages, schemas):
+            if not self._compact_once():
+                return None
+            compacted = True
+            messages, schemas = self._project_request(allow_tools=allow_tools)
+            if not self._request_fits(messages, schemas):
+                return None
+
+        observed = self._sample_projected(
+            messages, schemas, allow_tools=allow_tools
+        )
         if observed.result.outcome is not SamplingOutcome.CONTEXT_OVERFLOW:
             return observed
         observed.discard()
-        if self.compactor is None:
+        if compacted:
+            return observed
+        if not self._compact_once():
             return None
-        try:
-            compacted = self.compactor()
-        except Exception:
+        messages, schemas = self._project_request(allow_tools=allow_tools)
+        if not self._request_fits(messages, schemas):
             return None
-        if not compacted:
-            return None
-        return self._sample(allow_tools=allow_tools)
+        return self._sample_projected(
+            messages, schemas, allow_tools=allow_tools
+        )
 
     def _accept_assistant(
         self, turn_id: str, sampled: SamplingResult, *, include_calls: bool
@@ -494,7 +607,15 @@ class AgentLoop:
         )
 
     def _finalize_after_limit(self, turn_id: str, tool_steps: int) -> TurnResult:
-        observed = self._sample(allow_tools=False)
+        observed = self._sample_with_one_compaction(allow_tools=False)
+        if observed is None:
+            return self._finish(
+                turn_id,
+                TurnStatus.MAX_STEPS_REACHED,
+                tool_steps,
+                final_text=MAX_STEPS_FALLBACK,
+                error="maximum tool steps reached; context compaction failed",
+            )
         sampled = observed.result
         final_text = MAX_STEPS_FALLBACK
         if (
@@ -629,5 +750,6 @@ __all__ = [
     "MAX_STEPS_FALLBACK",
     "ModelSampler",
     "RecoveryBlockedError",
+    "REQUEST_SAFETY_MARGIN",
     "TurnResult",
 ]

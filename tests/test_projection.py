@@ -550,7 +550,7 @@ class CheckpointProjectionTests(ProjectionTestCase):
         self.apply(
             "compaction_checkpoint",
             {
-                "through_seq": 3,
+                "through_seq": 5,
                 "summary": "The original task is still active.",
                 "replacement_conversation": [
                     {"role": "user", "content": "compressed task"},
@@ -558,6 +558,11 @@ class CheckpointProjectionTests(ProjectionTestCase):
                         "role": "assistant",
                         "content": None,
                         "tool_calls": [call],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "file contents",
                     },
                 ],
             },

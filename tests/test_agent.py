@@ -221,6 +221,7 @@ class AgentLoopTestCase(unittest.TestCase):
                 api_key="test",
                 model="test-model",
                 context_window=4096,
+                max_output_tokens=512,
             ),
             store=store,
             state=state,
@@ -713,6 +714,60 @@ class AgentLoopTests(AgentLoopTestCase):
         self.assertEqual(len(runtime.model.requests), 2)
         self.assertEqual(len(runtime.environment_calls), 2)
 
+    def test_request_budget_compacts_before_sampling_and_counts_tool_schemas(
+        self,
+    ) -> None:
+        compact_calls: list[str] = []
+        runtime = self.make_runtime(
+            text("after proactive compaction"),
+            specs=[tool_spec("read", lambda _: ToolResult("read", "ok"))],
+            compactor=lambda: compact_calls.append("compact") or True,
+        )
+
+        with patch(
+            "mca.agent.request_fits_budget", side_effect=[False, True]
+        ) as fits:
+            result = runtime.loop.run_turn("large projected request")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(compact_calls, ["compact"])
+        self.assertEqual(len(runtime.model.requests), 1)
+        self.assertEqual(len(runtime.environment_calls), 2)
+        self.assertEqual(fits.call_count, 2)
+        first_messages, first_schemas = fits.call_args_list[0].args
+        self.assertEqual(first_messages[1]["content"], "large projected request")
+        self.assertEqual(first_schemas, runtime.registry.provider_schemas())
+        self.assertEqual(
+            fits.call_args_list[0].kwargs["context_window"],
+            runtime.loop.config.context_window,
+        )
+        self.assertEqual(
+            fits.call_args_list[0].kwargs["reserved_output_tokens"],
+            runtime.loop.config.max_output_tokens,
+        )
+
+    def test_proactive_compaction_and_provider_overflow_share_one_retry_budget(
+        self,
+    ) -> None:
+        compact_calls: list[str] = []
+        runtime = self.make_runtime(
+            SamplingResult(SamplingOutcome.CONTEXT_OVERFLOW),
+            text("must not retry"),
+            compactor=lambda: compact_calls.append("compact") or True,
+        )
+
+        with patch(
+            "mca.agent.request_fits_budget", side_effect=[False, True]
+        ):
+            result = runtime.loop.run_turn("large projected request")
+
+        self.assertEqual(result.status, TurnStatus.FAILED)
+        self.assertEqual(
+            result.error, "model context overflow persisted after compaction"
+        )
+        self.assertEqual(compact_calls, ["compact"])
+        self.assertEqual(len(runtime.model.requests), 1)
+
     def test_second_context_overflow_fails_without_second_compaction(self) -> None:
         compact_calls: list[str] = []
         runtime = self.make_runtime(
@@ -767,6 +822,7 @@ class AgentLoopTests(AgentLoopTestCase):
                 api_key="test",
                 model="test-model",
                 context_window=4096,
+                max_output_tokens=512,
                 max_steps=2,
             ),
         )
@@ -808,6 +864,27 @@ class AgentLoopTests(AgentLoopTestCase):
         ]
         self.assertEqual(len(assistants), 2)
         self.assertEqual(assistants[-1].payload["tool_calls"], ())
+
+    def test_max_steps_final_sample_uses_the_same_preflight_budget_gate(self) -> None:
+        compact_calls: list[str] = []
+        runtime = self.make_runtime(
+            text("bounded after compaction"),
+            config=Config(api_key="test", max_steps=0),
+            compactor=lambda: compact_calls.append("compact") or True,
+        )
+
+        with patch(
+            "mca.agent.request_fits_budget", side_effect=[False, True]
+        ) as fits:
+            result = runtime.loop.run_turn("bounded")
+
+        self.assertEqual(result.status, TurnStatus.MAX_STEPS_REACHED)
+        self.assertEqual(result.final_text, "bounded after compaction")
+        self.assertEqual(compact_calls, ["compact"])
+        self.assertEqual(fits.call_count, 2)
+        self.assertEqual(len(runtime.model.requests), 1)
+        self.assertEqual(runtime.model.requests[0][1], [])
+        self.assertIs(runtime.model.requests[0][2], False)
 
     def test_batch_limit_executes_prefix_and_terminalizes_every_extra_once(self) -> None:
         executions: list[str] = []
@@ -1144,6 +1221,72 @@ class AgentLoopTests(AgentLoopTestCase):
 
         self.assertEqual(runtime.store.load(), before)
         self.assertEqual(runtime.model.requests, [])
+
+    def test_resume_active_turn_continues_reconciled_history_without_new_user(
+        self,
+    ) -> None:
+        runtime = self.make_runtime(text("continued old turn"))
+        old_turn_id = str(uuid.uuid4())
+        self.append(
+            runtime,
+            "turn_started",
+            {"turn_id": old_turn_id, "user_input": "old task"},
+        )
+        self.append(
+            runtime,
+            "assistant_accepted",
+            {
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "uncertain",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
+                ],
+            },
+        )
+        call_key = f"{runtime.state.last_seq}:uncertain"
+        self.append(
+            runtime,
+            "tool_started",
+            {"call_key": call_key, "call_id": "uncertain"},
+        )
+        self.append(
+            runtime,
+            "tool_finished",
+            {
+                "call_key": call_key,
+                "call_id": "uncertain",
+                "status": "outcome_unknown",
+                "result": "unknown after crash",
+                "recovery_blocked": True,
+            },
+        )
+        self.append(
+            runtime,
+            "tool_reconciled",
+            {
+                "call_key": call_key,
+                "call_id": "uncertain",
+                "outcome": "succeeded",
+                "note": "verified",
+            },
+        )
+
+        result = runtime.loop.resume_active_turn()
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(result.turn_id, old_turn_id)
+        self.assertEqual(result.tool_steps, 1)
+        self.assertEqual(result.final_text, "continued old turn")
+        self.assertEqual(
+            sum(event.type == "turn_started" for event in runtime.store.load()),
+            1,
+        )
+        self.assertEqual(
+            runtime.model.requests[0][0][-1]["tool_call_id"], "uncertain"
+        )
 
     def test_reducer_failure_after_append_poison_stops_the_loop(self) -> None:
         runtime = self.make_runtime(text("must not sample"))

@@ -458,7 +458,7 @@ class SessionReducerTests(ReducerTestCase):
         self.assertNotEqual(first, second)
         self.assertEqual(self.state.latest_checkpoint, second)
 
-    def test_checkpoint_requires_an_active_turn(self) -> None:
+    def test_checkpoint_is_allowed_while_the_session_is_idle(self) -> None:
         self.create_session()
         checkpoint = self.event(
             "compaction_checkpoint",
@@ -469,13 +469,12 @@ class SessionReducerTests(ReducerTestCase):
             },
         )
 
-        with self.assertRaises(DomainError):
-            SessionReducer.apply(self.state, checkpoint)
+        SessionReducer.apply(self.state, checkpoint)
 
-        self.assertEqual(self.state.last_seq, 1)
-        self.assertIsNone(self.state.latest_checkpoint)
+        self.assertEqual(self.state.last_seq, 2)
+        self.assertEqual(self.state.latest_checkpoint, checkpoint)
 
-    def test_checkpoint_requires_an_accepted_assistant_in_the_active_turn(self) -> None:
+    def test_checkpoint_is_allowed_after_a_new_turn_user_boundary(self) -> None:
         self.start_turn()
         checkpoint = self.event(
             "compaction_checkpoint",
@@ -486,13 +485,12 @@ class SessionReducerTests(ReducerTestCase):
             },
         )
 
-        with self.assertRaises(DomainError):
-            SessionReducer.apply(self.state, checkpoint)
+        SessionReducer.apply(self.state, checkpoint)
 
-        self.assertEqual(self.state.last_seq, 2)
-        self.assertIsNone(self.state.latest_checkpoint)
+        self.assertEqual(self.state.last_seq, 3)
+        self.assertEqual(self.state.latest_checkpoint, checkpoint)
 
-    def test_checkpoint_does_not_reuse_an_assistant_from_an_earlier_turn(self) -> None:
+    def test_checkpoint_after_new_user_does_not_need_a_current_assistant(self) -> None:
         self.start_turn()
         self.apply(
             "assistant_accepted",
@@ -519,11 +517,10 @@ class SessionReducerTests(ReducerTestCase):
             },
         )
 
-        with self.assertRaises(DomainError):
-            SessionReducer.apply(self.state, checkpoint)
+        SessionReducer.apply(self.state, checkpoint)
 
-        self.assertEqual(self.state.last_seq, last_seq)
-        self.assertIsNone(self.state.latest_checkpoint)
+        self.assertEqual(self.state.last_seq, last_seq + 1)
+        self.assertEqual(self.state.latest_checkpoint, checkpoint)
 
     def test_checkpoint_rejects_every_unresolved_tool_state(self) -> None:
         for unresolved_status in (

@@ -742,25 +742,8 @@ class SessionReducer:
 
     @staticmethod
     def _apply_compaction_checkpoint(state: SessionState, event: Event) -> None:
-        turn_id = SessionReducer._require_active_turn(state)
-        turn_started_seq = max(
-            previous.seq
-            for previous in state.events
-            if previous.type == "turn_started"
-            and previous.payload.get("turn_id") == turn_id
-        )
-        has_assistant = any(
-            assistant.seq > turn_started_seq
-            for assistant in state.assistant_events
-        )
-        if not has_assistant:
-            raise DomainError(
-                "compaction requires an accepted assistant in the active turn"
-            )
         unresolved = any(
-            call.turn_id == turn_id
-            and call.status
-            in {
+            call.status in {
                 ToolStatus.REQUESTED,
                 ToolStatus.STARTED,
                 ToolStatus.OUTCOME_UNKNOWN,
@@ -772,9 +755,18 @@ class SessionReducer:
         through_seq = event.payload.get("through_seq")
         if type(through_seq) is not int or not 0 <= through_seq < event.seq:
             raise DomainError("through_seq must reference an earlier event")
+        for call in state.tool_calls.values():
+            if (
+                call.requested_seq is not None
+                and call.finished_seq is not None
+                and call.requested_seq <= through_seq < call.finished_seq
+            ):
+                raise DomainError(
+                    "through_seq must reference a completed sampling boundary"
+                )
         summary = event.payload.get("summary")
-        if not isinstance(summary, str):
-            raise DomainError("checkpoint summary must be a string")
+        if not isinstance(summary, str) or not summary.strip():
+            raise DomainError("checkpoint summary must be a non-empty string")
         replacement_conversation = event.payload.get("replacement_conversation")
         if not isinstance(replacement_conversation, (list, tuple)):
             raise DomainError("replacement_conversation must be an array")
