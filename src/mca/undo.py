@@ -162,6 +162,9 @@ class ManagedUndo:
                     )
                 except (UnicodeEncodeError, binascii.Error):
                     error = "snapshot before_bytes is not valid base64"
+                else:
+                    if len(before_bytes) > self.max_file_bytes:
+                        error = "snapshot baseline exceeds size limit"
             if error is None and snapshot.after_hash is None:
                 error = "snapshot has no successful after_hash"
             if (

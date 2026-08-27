@@ -166,7 +166,7 @@ class ManagedUndoTests(UndoTestCase):
             "file_snapshot",
             {
                 "turn_id": self.turn_id,
-                "path": str(path),
+                "path": str(path.resolve()),
                 "existed_before": True,
                 "before_bytes": base64.b64encode(b"old").decode(),
                 "before_encoding": "base64",
@@ -443,6 +443,31 @@ class ManagedUndoTests(UndoTestCase):
         self.assertEqual(result.status, "conflict")
         self.assertEqual(result.files[0].status, "ineligible")
         self.assertIn("size limit", result.files[0].detail)
+
+    def test_oversized_snapshot_baseline_is_ineligible(self) -> None:
+        path = self.workspace / "large-baseline.txt"
+        path.write_text("current", encoding="utf-8")
+        self.append(
+            "file_snapshot",
+            {
+                "turn_id": self.turn_id,
+                "path": str(path.resolve()),
+                "existed_before": True,
+                "before_bytes": base64.b64encode(b"x" * 65).decode(),
+                "before_encoding": "base64",
+                "before_mode": 0o644,
+                "after_hash": hashlib.sha256(b"current").hexdigest(),
+            },
+        )
+
+        result = ManagedUndo(
+            self.store, self.state, self.workspace, max_file_bytes=64
+        ).undo_turn(self.turn_id)
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "ineligible")
+        self.assertIn("baseline exceeds size limit", result.files[0].detail)
+        self.assertEqual(path.read_text(encoding="utf-8"), "current")
 
     def test_baseline_bytes_with_wrong_mode_are_not_treated_as_already_restored(self) -> None:
         path = self.workspace / "mode.txt"
