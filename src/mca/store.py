@@ -68,6 +68,9 @@ class RolloutStore:
         try:
             os.fchmod(fd, 0o600)
             self._acquire_lock()
+            if create:
+                os.fsync(fd)
+                self._fsync_directory(self.sessions_root)
             self._events = self._read_and_repair_tail()
         except BaseException:
             self.close()
@@ -86,10 +89,23 @@ class RolloutStore:
         return cls(sessions_root, session_id, create=False)
 
     def _prepare_directory(self) -> None:
+        directory_existed = self.sessions_root.exists()
         self.sessions_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         if not self.sessions_root.is_dir() or self.sessions_root.is_symlink():
             raise ValueError("sessions_root must be a real directory")
         os.chmod(self.sessions_root, 0o700)
+        if not directory_existed:
+            self._fsync_directory(self.sessions_root)
+            self._fsync_directory(self.sessions_root.parent)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path, flags)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
 
     def _acquire_lock(self) -> None:
         assert self._fd is not None
@@ -136,16 +152,28 @@ class RolloutStore:
             try:
                 event = Event.from_dict(document)
             except DomainError as error:
+                if is_final and not has_newline:
+                    os.ftruncate(self._fd, offset)
+                    os.fsync(self._fd)
+                    break
                 raise RolloutCorruptionError(
                     f"invalid event at line {line_number}: {error}"
                 ) from error
 
             if event.session_id != self.session_id:
+                if is_final and not has_newline:
+                    os.ftruncate(self._fd, offset)
+                    os.fsync(self._fd)
+                    break
                 raise RolloutCorruptionError(
                     f"session mismatch at line {line_number}"
                 )
             expected_seq = len(events) + 1
             if event.seq != expected_seq:
+                if is_final and not has_newline:
+                    os.ftruncate(self._fd, offset)
+                    os.fsync(self._fd)
+                    break
                 raise RolloutCorruptionError(
                     f"invalid sequence at line {line_number}: "
                     f"expected {expected_seq}, got {event.seq}"

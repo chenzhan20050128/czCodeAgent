@@ -418,6 +418,19 @@ class SessionReducer:
     @staticmethod
     def _apply_assistant_accepted(state: SessionState, event: Event) -> None:
         turn_id = SessionReducer._require_active_turn(state)
+        if state.recovery_blocked:
+            raise DomainError(
+                "cannot accept an assistant response while recovery is blocked"
+            )
+        unresolved = any(
+            call.turn_id == turn_id
+            and call.status in {ToolStatus.REQUESTED, ToolStatus.STARTED}
+            for call in state.tool_calls.values()
+        )
+        if unresolved:
+            raise DomainError(
+                "cannot accept an assistant response with unresolved tool calls"
+            )
         explicit_turn_id = event.payload.get("turn_id")
         if explicit_turn_id is not None and explicit_turn_id != turn_id:
             raise DomainError("assistant event belongs to another turn")
@@ -611,6 +624,10 @@ class SessionReducer:
     @staticmethod
     def _apply_turn_finished(state: SessionState, event: Event) -> None:
         turn_id = SessionReducer._require_active_turn(state)
+        if state.recovery_blocked:
+            raise DomainError(
+                "cannot finish a recovery-blocked turn before reconciliation"
+            )
         event_turn_id = _payload_uuid(event.payload, "turn_id")
         if event_turn_id != turn_id:
             raise DomainError("turn_finished belongs to another turn")
@@ -628,6 +645,33 @@ class SessionReducer:
 
     @staticmethod
     def _apply_compaction_checkpoint(state: SessionState, event: Event) -> None:
+        turn_id = SessionReducer._require_active_turn(state)
+        turn_started_seq = max(
+            previous.seq
+            for previous in state.events
+            if previous.type == "turn_started"
+            and previous.payload.get("turn_id") == turn_id
+        )
+        has_assistant = any(
+            assistant.seq > turn_started_seq
+            for assistant in state.assistant_events
+        )
+        if not has_assistant:
+            raise DomainError(
+                "compaction requires an accepted assistant in the active turn"
+            )
+        unresolved = any(
+            call.turn_id == turn_id
+            and call.status
+            in {
+                ToolStatus.REQUESTED,
+                ToolStatus.STARTED,
+                ToolStatus.OUTCOME_UNKNOWN,
+            }
+            for call in state.tool_calls.values()
+        )
+        if unresolved:
+            raise DomainError("compaction requires a completed sampling boundary")
         through_seq = event.payload.get("through_seq")
         if type(through_seq) is not int or not 0 <= through_seq < event.seq:
             raise DomainError("through_seq must reference an earlier event")
@@ -703,6 +747,23 @@ class SessionReducer:
             state.turns[state.active_turn_id] = (
                 TurnStatus.RECOVERY_BLOCKED if unknown else TurnStatus.ACTIVE
             )
+
+
+def reduce_event(state: SessionState, event: Event) -> SessionState:
+    """Apply one event to an independent derived copy of ``state``."""
+
+    if not isinstance(state, SessionState) or not isinstance(event, Event):
+        raise TypeError("reduce_event requires a SessionState and Event")
+    derived = replace(
+        state,
+        turns=dict(state.turns),
+        turn_inputs=dict(state.turn_inputs),
+        tool_calls=dict(state.tool_calls),
+        file_snapshots=dict(state.file_snapshots),
+        assistant_events=list(state.assistant_events),
+        events=list(state.events),
+    )
+    return SessionReducer.apply(derived, event)
 
 
 def plan_recovery_events(state: SessionState) -> list[Event]:

@@ -24,6 +24,7 @@ from mca.domain import (
     ToolStatus,
     TurnStatus,
     plan_recovery_events,
+    reduce_event,
 )
 
 
@@ -105,6 +106,49 @@ class DomainValueTests(ReducerTestCase):
 
 
 class SessionReducerTests(ReducerTestCase):
+    def test_reduce_event_returns_independent_state_without_mutating_input(self) -> None:
+        self.start_turn()
+        before = SessionReducer.replay(self.state.events)
+        assistant = self.event(
+            "assistant_accepted",
+            {"content": "done", "tool_calls": []},
+        )
+
+        derived = reduce_event(self.state, assistant)
+
+        self.assertEqual(self.state, before)
+        self.assertIsNot(derived, self.state)
+        self.assertEqual(derived.last_seq, 3)
+        self.assertEqual(derived.assistant_events, [assistant])
+        for attribute in (
+            "turns",
+            "turn_inputs",
+            "tool_calls",
+            "file_snapshots",
+            "assistant_events",
+            "events",
+        ):
+            self.assertIsNot(
+                getattr(derived, attribute), getattr(self.state, attribute)
+            )
+        derived.turns[self.turn_id] = TurnStatus.FAILED
+        self.assertEqual(self.state.turns[self.turn_id], TurnStatus.ACTIVE)
+
+    def test_reduce_event_leaves_input_unchanged_when_transition_fails(self) -> None:
+        self.start_turn()
+        before = SessionReducer.replay(self.state.events)
+        invalid = Event.create(
+            seq=self.state.last_seq + 1,
+            session_id=self.session_id,
+            event_type="unknown_event",
+            payload={},
+        )
+
+        with self.assertRaises(DomainError):
+            reduce_event(self.state, invalid)
+
+        self.assertEqual(self.state, before)
+
     def test_session_created_establishes_identity_and_runtime_configuration(self) -> None:
         self.create_session()
 
@@ -139,6 +183,64 @@ class SessionReducerTests(ReducerTestCase):
         self.assertEqual(self.state.tool_calls["call-1"].status, ToolStatus.REQUESTED)
         self.assertEqual(self.state.tool_calls["call-2"].name, "grep")
         self.assertEqual(self.state.tool_calls["call-2"].turn_id, self.turn_id)
+
+    def test_assistant_accepted_rejects_while_a_prior_call_is_unresolved(self) -> None:
+        for prior_status in (ToolStatus.REQUESTED, ToolStatus.STARTED):
+            with self.subTest(prior_status=prior_status):
+                self.setUp()
+                self.start_turn()
+                self.apply(
+                    "assistant_accepted",
+                    {"tool_calls": [self.tool("call-1", "bash")]},
+                )
+                if prior_status is ToolStatus.STARTED:
+                    self.apply("tool_started", {"call_id": "call-1"})
+                last_seq = self.state.last_seq
+                accepted_count = len(self.state.assistant_events)
+                next_assistant = Event.create(
+                    seq=last_seq + 1,
+                    session_id=self.session_id,
+                    event_type="assistant_accepted",
+                    payload={"content": "continuing", "tool_calls": []},
+                )
+
+                with self.assertRaises(DomainError):
+                    SessionReducer.apply(self.state, next_assistant)
+
+                self.assertEqual(self.state.last_seq, last_seq)
+                self.assertEqual(len(self.state.assistant_events), accepted_count)
+
+    def test_assistant_accepted_rejects_while_recovery_is_blocked(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("call-1", "bash")]},
+        )
+        self.apply("tool_started", {"call_id": "call-1"})
+        self.apply(
+            "tool_finished",
+            {
+                "call_id": "call-1",
+                "status": "outcome_unknown",
+                "result": "unknown",
+                "recovery_blocked": True,
+            },
+        )
+        last_seq = self.state.last_seq
+        accepted_count = len(self.state.assistant_events)
+        next_assistant = Event.create(
+            seq=last_seq + 1,
+            session_id=self.session_id,
+            event_type="assistant_accepted",
+            payload={"content": "continuing", "tool_calls": []},
+        )
+
+        with self.assertRaises(DomainError):
+            SessionReducer.apply(self.state, next_assistant)
+
+        self.assertEqual(self.state.last_seq, last_seq)
+        self.assertEqual(len(self.state.assistant_events), accepted_count)
+        self.assertTrue(self.state.recovery_blocked)
 
     def test_approval_start_and_finish_update_a_call_to_terminal(self) -> None:
         self.start_turn()
@@ -188,6 +290,10 @@ class SessionReducerTests(ReducerTestCase):
 
     def test_latest_compaction_checkpoint_replaces_the_previous_one(self) -> None:
         self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"content": "checkpoint boundary", "tool_calls": []},
+        )
         first = self.apply(
             "compaction_checkpoint",
             {
@@ -207,6 +313,116 @@ class SessionReducerTests(ReducerTestCase):
 
         self.assertNotEqual(first, second)
         self.assertEqual(self.state.latest_checkpoint, second)
+
+    def test_checkpoint_requires_an_active_turn(self) -> None:
+        self.create_session()
+        checkpoint = self.event(
+            "compaction_checkpoint",
+            {
+                "through_seq": 1,
+                "summary": "summary",
+                "replacement_conversation": [],
+            },
+        )
+
+        with self.assertRaises(DomainError):
+            SessionReducer.apply(self.state, checkpoint)
+
+        self.assertEqual(self.state.last_seq, 1)
+        self.assertIsNone(self.state.latest_checkpoint)
+
+    def test_checkpoint_requires_an_accepted_assistant_in_the_active_turn(self) -> None:
+        self.start_turn()
+        checkpoint = self.event(
+            "compaction_checkpoint",
+            {
+                "through_seq": 2,
+                "summary": "summary",
+                "replacement_conversation": [],
+            },
+        )
+
+        with self.assertRaises(DomainError):
+            SessionReducer.apply(self.state, checkpoint)
+
+        self.assertEqual(self.state.last_seq, 2)
+        self.assertIsNone(self.state.latest_checkpoint)
+
+    def test_checkpoint_does_not_reuse_an_assistant_from_an_earlier_turn(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"content": "first turn complete", "tool_calls": []},
+        )
+        self.apply(
+            "turn_finished",
+            {"turn_id": self.turn_id, "status": "completed"},
+        )
+        second_turn_id = str(uuid.uuid4())
+        self.apply(
+            "turn_started",
+            {"turn_id": second_turn_id, "user_input": "second task"},
+        )
+        last_seq = self.state.last_seq
+        checkpoint = Event.create(
+            seq=last_seq + 1,
+            session_id=self.session_id,
+            event_type="compaction_checkpoint",
+            payload={
+                "through_seq": last_seq,
+                "summary": "summary",
+                "replacement_conversation": [],
+            },
+        )
+
+        with self.assertRaises(DomainError):
+            SessionReducer.apply(self.state, checkpoint)
+
+        self.assertEqual(self.state.last_seq, last_seq)
+        self.assertIsNone(self.state.latest_checkpoint)
+
+    def test_checkpoint_rejects_every_unresolved_tool_state(self) -> None:
+        for unresolved_status in (
+            ToolStatus.REQUESTED,
+            ToolStatus.STARTED,
+            ToolStatus.OUTCOME_UNKNOWN,
+        ):
+            with self.subTest(unresolved_status=unresolved_status):
+                self.setUp()
+                self.start_turn()
+                self.apply(
+                    "assistant_accepted",
+                    {"tool_calls": [self.tool("call-1", "bash")]},
+                )
+                if unresolved_status is not ToolStatus.REQUESTED:
+                    self.apply("tool_started", {"call_id": "call-1"})
+                if unresolved_status is ToolStatus.OUTCOME_UNKNOWN:
+                    self.apply(
+                        "tool_finished",
+                        {
+                            "call_id": "call-1",
+                            "status": "outcome_unknown",
+                            "result": "unknown",
+                            "recovery_blocked": True,
+                        },
+                    )
+                last_seq = self.state.last_seq
+                checkpoint = Event.create(
+                    seq=last_seq + 1,
+                    session_id=self.session_id,
+                    event_type="compaction_checkpoint",
+                    payload={
+                        "through_seq": last_seq,
+                        "summary": "summary",
+                        "replacement_conversation": [],
+                    },
+                )
+
+                with self.assertRaises(DomainError):
+                    SessionReducer.apply(self.state, checkpoint)
+
+                self.assertEqual(self.state.last_seq, last_seq)
+                self.assertIsNone(self.state.latest_checkpoint)
 
     def test_file_snapshot_keeps_first_baseline_and_success_updates_after_hash(self) -> None:
         self.start_turn()
@@ -274,6 +490,41 @@ class SessionReducerTests(ReducerTestCase):
         self.assertEqual(call.status, ToolStatus.USER_CONFIRMED_SUCCESS)
         self.assertEqual(call.reconciliation_note, "verified the generated file")
         self.assertFalse(self.state.recovery_blocked)
+
+    def test_unknown_outcome_blocks_turn_completion_until_reconciled(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("call-1", "bash")]},
+        )
+        self.apply("tool_started", {"call_id": "call-1"})
+        self.apply(
+            "tool_finished",
+            {
+                "call_id": "call-1",
+                "status": "outcome_unknown",
+                "result": "execution outcome is unknown",
+                "recovery_blocked": True,
+            },
+        )
+        last_seq = self.state.last_seq
+        event_count = len(self.state.events)
+        blocked_turn = self.state.turns[self.turn_id]
+        finish = Event.create(
+            seq=last_seq + 1,
+            session_id=self.session_id,
+            event_type="turn_finished",
+            payload={"turn_id": self.turn_id, "status": "completed"},
+        )
+
+        with self.assertRaises(DomainError):
+            SessionReducer.apply(self.state, finish)
+
+        self.assertEqual(self.state.last_seq, last_seq)
+        self.assertEqual(len(self.state.events), event_count)
+        self.assertEqual(self.state.active_turn_id, self.turn_id)
+        self.assertEqual(self.state.turns[self.turn_id], blocked_turn)
+        self.assertTrue(self.state.recovery_blocked)
 
     def test_recovery_planner_returns_deterministic_explicit_events(self) -> None:
         self.start_turn()

@@ -12,6 +12,7 @@ import unittest
 import uuid
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -182,6 +183,17 @@ class RolloutStoreTests(unittest.TestCase):
         with RolloutStore.open(self.sessions_root, self.session_id) as store:
             self.assertEqual([event.seq for event in store.load()], [1, 2, 3])
 
+    def test_load_ignores_a_json_final_tail_that_is_not_a_complete_event(self) -> None:
+        incomplete_event = b'{"version":1,"seq":2}'
+        self._write_raw(self._event_line(1) + incomplete_event)
+
+        with RolloutStore.open(self.sessions_root, self.session_id) as store:
+            self.assertEqual([event.seq for event in store.load()], [1])
+            self.assertEqual(store.append("example", {"number": 2}).seq, 2)
+
+        with RolloutStore.open(self.sessions_root, self.session_id) as store:
+            self.assertEqual([event.seq for event in store.load()], [1, 2])
+
     def test_load_accepts_a_valid_final_record_without_a_newline(self) -> None:
         self._write_raw(self._event_line(1).rstrip(b"\n"))
 
@@ -255,6 +267,22 @@ class RolloutStoreTests(unittest.TestCase):
         first.close()
         with RolloutStore.open(self.sessions_root, self.session_id):
             pass
+
+    def test_create_fsyncs_new_directory_and_file_entries(self) -> None:
+        real_fsync = os.fsync
+        synced_kinds: list[str] = []
+
+        def recording_fsync(fd: int) -> None:
+            mode = os.fstat(fd).st_mode
+            synced_kinds.append("directory" if stat.S_ISDIR(mode) else "file")
+            real_fsync(fd)
+
+        with patch("mca.store.os.fsync", side_effect=recording_fsync):
+            with RolloutStore.create(self.sessions_root, self.session_id):
+                pass
+
+        self.assertIn("file", synced_kinds)
+        self.assertGreaterEqual(synced_kinds.count("directory"), 2)
 
     def test_append_rejects_an_event_for_another_session_or_sequence(self) -> None:
         with RolloutStore.create(self.sessions_root, self.session_id) as store:
