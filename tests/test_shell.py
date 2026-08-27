@@ -139,6 +139,62 @@ class ShellRunnerTests(unittest.TestCase):
         self.assertIn("hello", result.output)
         self.assertIn("world", result.output)
 
+    def test_blocking_callback_never_blocks_or_leaks_drain_threads(self) -> None:
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        real_thread = threading.Thread
+        drain_threads: list[threading.Thread] = []
+        callback_threads: list[threading.Thread] = []
+        outcomes: list[object] = []
+        errors: list[BaseException] = []
+
+        def blocking_callback(stream: str, text: str) -> None:
+            del stream, text
+            callback_threads.append(threading.current_thread())
+            callback_entered.set()
+            release_callback.wait(timeout=2)
+
+        def recording_thread(*args: object, **kwargs: object) -> threading.Thread:
+            thread = real_thread(*args, **kwargs)
+            drain_threads.append(thread)
+            return thread
+
+        def execute() -> None:
+            try:
+                with patch(
+                    "mca.tools.shell.threading.Thread",
+                    side_effect=recording_thread,
+                ):
+                    outcomes.append(
+                        ShellRunner(self.workspace)
+                        .prepare({"command": "printf ready"})
+                        .execute(on_output=blocking_callback)
+                    )
+            except BaseException as error:
+                errors.append(error)
+
+        owner = real_thread(target=execute, daemon=True)
+        try:
+            owner.start()
+            self.assertTrue(callback_entered.wait(timeout=1))
+            deadline = time.monotonic() + 1
+            while (
+                any(thread.is_alive() for thread in drain_threads)
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.01)
+            self.assertEqual(len(drain_threads), 2)
+            self.assertTrue(all(not thread.is_alive() for thread in drain_threads))
+            self.assertTrue(owner.is_alive())
+        finally:
+            release_callback.set()
+            owner.join(timeout=2)
+
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(outcomes), 1)
+        self.assertTrue(all(thread is owner for thread in callback_threads))
+
     def test_known_model_secrets_are_removed_but_ordinary_environment_remains(self) -> None:
         keys = (
             "MCA_API_KEY",

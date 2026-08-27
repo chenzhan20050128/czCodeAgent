@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import codecs
 import os
+import queue
 import signal
 import subprocess
 import threading
@@ -39,6 +40,8 @@ _MODEL_SECRET_KEYS = frozenset(
     }
 )
 _STREAM_HEADERS = ("[stdout]\n", "\n[stderr]\n")
+_OUTPUT_QUEUE_CHUNKS = 64
+_OUTPUT_POLL_SECONDS = 0.01
 
 OutputCallback = Callable[[str, str], object]
 
@@ -142,6 +145,9 @@ class PreparedShellCommand:
         stdout = _BoundedCapture(self.max_output_bytes)
         stderr = _BoundedCapture(self.max_output_bytes)
         callback_gate = _CallbackGate(on_output)
+        output_queue: queue.Queue[tuple[str, str]] = queue.Queue(
+            maxsize=_OUTPUT_QUEUE_CHUNKS
+        )
         drain_stop = threading.Event()
         threads = (
             threading.Thread(
@@ -150,7 +156,7 @@ class PreparedShellCommand:
                     process.stdout,
                     "stdout",
                     stdout,
-                    callback_gate.emit,
+                    output_queue,
                     drain_stop,
                 ),
                 daemon=True,
@@ -161,7 +167,7 @@ class PreparedShellCommand:
                     process.stderr,
                     "stderr",
                     stderr,
-                    callback_gate.emit,
+                    output_queue,
                     drain_stop,
                 ),
                 daemon=True,
@@ -189,7 +195,16 @@ class PreparedShellCommand:
         timed_out = False
         interrupted = False
         try:
-            process.wait(timeout=self.timeout_seconds)
+            timed_out = not _wait_process_with_output(
+                process,
+                timeout=self.timeout_seconds,
+                output_queue=output_queue,
+                callback=callback_gate.emit,
+            )
+            if timed_out:
+                _stop_process_group(
+                    process, signal.SIGTERM, self.termination_grace_seconds
+                )
         except subprocess.TimeoutExpired:
             timed_out = True
             _stop_process_group(
@@ -206,8 +221,11 @@ class PreparedShellCommand:
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
             _wait_process_bounded(process, self.termination_grace_seconds)
-            drains_finished = _join_threads(
-                tuple(started_threads), timeout=self.termination_grace_seconds
+            drains_finished = _join_threads_with_output(
+                tuple(started_threads),
+                timeout=self.termination_grace_seconds,
+                output_queue=output_queue,
+                callback=callback_gate.emit,
             )
             if not drains_finished:
                 timed_out = True
@@ -221,13 +239,17 @@ class PreparedShellCommand:
                 callback_gate.disable()
                 drain_stop.set()
                 _close_pipes(process.stdout, process.stderr)
-                drains_finished = _join_threads(
-                    tuple(started_threads), timeout=self.termination_grace_seconds
+                drains_finished = _join_threads_with_output(
+                    tuple(started_threads),
+                    timeout=self.termination_grace_seconds,
+                    output_queue=output_queue,
+                    callback=None,
                 )
                 if not drains_finished:
                     raise ShellToolError(
                         "output drain threads did not stop after bounded cleanup"
                     )
+            _deliver_output(output_queue, callback_gate.emit)
             callback_gate.disable()
 
         output, rendering_truncated = _render_streams(
@@ -327,7 +349,7 @@ def _drain_pipe(
     pipe: BinaryIO,
     stream_name: str,
     capture: _BoundedCapture,
-    callback: OutputCallback | None,
+    output_queue: queue.Queue[tuple[str, str]] | None,
     stop: threading.Event | None = None,
 ) -> None:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -350,22 +372,80 @@ def _drain_pipe(
                 break
             capture.append(chunk)
             rendered = decoder.decode(chunk)
-            if callback is not None and rendered:
-                try:
-                    callback(stream_name, rendered)
-                except Exception:
-                    pass
+            if output_queue is not None and rendered:
+                _offer_output(output_queue, stream_name, rendered)
         rendered = decoder.decode(b"", final=True)
-        if callback is not None and rendered:
-            try:
-                callback(stream_name, rendered)
-            except Exception:
-                pass
+        if output_queue is not None and rendered:
+            _offer_output(output_queue, stream_name, rendered)
     finally:
         try:
             pipe.close()
         except OSError:
             pass
+
+
+def _offer_output(
+    output_queue: queue.Queue[tuple[str, str]], stream_name: str, text: str
+) -> None:
+    try:
+        output_queue.put_nowait((stream_name, text))
+    except queue.Full:
+        pass
+
+
+def _deliver_output(
+    output_queue: queue.Queue[tuple[str, str]], callback: OutputCallback | None
+) -> None:
+    while True:
+        try:
+            stream_name, text = output_queue.get_nowait()
+        except queue.Empty:
+            return
+        if callback is not None:
+            try:
+                callback(stream_name, text)
+            except Exception:
+                pass
+
+
+def _wait_process_with_output(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout: float,
+    output_queue: queue.Queue[tuple[str, str]],
+    callback: OutputCallback | None,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while True:
+        _deliver_output(output_queue, callback)
+        if process.poll() is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        try:
+            process.wait(timeout=min(_OUTPUT_POLL_SECONDS, remaining))
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _join_threads_with_output(
+    threads: tuple[threading.Thread, ...],
+    *,
+    timeout: float,
+    output_queue: queue.Queue[tuple[str, str]],
+    callback: OutputCallback | None,
+) -> bool:
+    deadline = time.monotonic() + timeout
+    while any(thread.is_alive() for thread in threads):
+        _deliver_output(output_queue, callback)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        for thread in threads:
+            thread.join(timeout=min(_OUTPUT_POLL_SECONDS, remaining))
+    _deliver_output(output_queue, callback)
+    return True
 
 
 def _stop_process_group(
