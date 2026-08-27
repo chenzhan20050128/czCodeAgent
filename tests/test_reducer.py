@@ -522,6 +522,81 @@ class SessionReducerTests(ReducerTestCase):
         self.assertEqual(self.state.last_seq, last_seq + 1)
         self.assertEqual(self.state.latest_checkpoint, checkpoint)
 
+    def test_checkpoint_rejects_invalid_replacement_without_mutating_state(
+        self,
+    ) -> None:
+        invalid_replacements = {
+            "system message": [
+                {"role": "system", "content": "stale environment"}
+            ],
+            "noncanonical message shape": [
+                {
+                    "role": "user",
+                    "content": "compressed task",
+                    "unexpected": True,
+                }
+            ],
+            "unclosed tool batch": [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [self.tool("call-1")],
+                }
+            ],
+        }
+        for case, replacement_conversation in invalid_replacements.items():
+            with self.subTest(case=case):
+                self.setUp()
+                self.create_session()
+                before_events = list(self.state.events)
+                before_last_seq = self.state.last_seq
+                before_checkpoint = self.state.latest_checkpoint
+                checkpoint = self.event(
+                    "compaction_checkpoint",
+                    {
+                        "through_seq": before_last_seq,
+                        "summary": "summary",
+                        "replacement_conversation": replacement_conversation,
+                    },
+                )
+
+                with self.assertRaisesRegex(
+                    DomainError, "replacement_conversation"
+                ):
+                    SessionReducer.apply(self.state, checkpoint)
+
+                self.assertEqual(self.state.last_seq, before_last_seq)
+                self.assertEqual(self.state.events, before_events)
+                self.assertIs(self.state.latest_checkpoint, before_checkpoint)
+
+    def test_checkpoint_accepts_a_complete_canonical_tool_batch(self) -> None:
+        self.create_session()
+        checkpoint = self.event(
+            "compaction_checkpoint",
+            {
+                "through_seq": 1,
+                "summary": "summary",
+                "replacement_conversation": [
+                    {"role": "user", "content": "inspect the file"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [self.tool("call-1")],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "file contents",
+                    },
+                ],
+            },
+        )
+
+        SessionReducer.apply(self.state, checkpoint)
+
+        self.assertEqual(self.state.last_seq, 2)
+        self.assertEqual(self.state.latest_checkpoint, checkpoint)
+
     def test_checkpoint_rejects_every_unresolved_tool_state(self) -> None:
         for unresolved_status in (
             ToolStatus.REQUESTED,

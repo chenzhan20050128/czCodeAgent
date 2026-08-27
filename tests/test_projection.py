@@ -12,7 +12,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from mca.domain import Event, SessionReducer, SessionState
+from mca.domain import DomainError, Event, SessionReducer, SessionState
 from mca.projection import (
     ProjectionBlockedError,
     ProjectionEnvironment,
@@ -717,61 +717,77 @@ class CheckpointProjectionTests(ProjectionTestCase):
     def test_invalid_checkpoint_replacement_is_rejected(self) -> None:
         self.start_turn()
         self.apply("assistant_accepted", {"content": "boundary", "tool_calls": []})
-        self.apply(
-            "compaction_checkpoint",
-            {
-                "through_seq": 3,
-                "summary": "summary",
-                "replacement_conversation": [
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            self.tool_call("orphaned-call", "read_file", "{}")
-                        ],
-                    }
-                ],
-            },
-        )
-
-        with self.assertRaisesRegex(ProjectionError, "result"):
-            self.project()
+        with self.assertRaisesRegex(
+            DomainError, "replacement_conversation.*result"
+        ):
+            self.apply(
+                "compaction_checkpoint",
+                {
+                    "through_seq": 3,
+                    "summary": "summary",
+                    "replacement_conversation": [
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                self.tool_call(
+                                    "orphaned-call", "read_file", "{}"
+                                )
+                            ],
+                        }
+                    ],
+                },
+            )
 
     def test_checkpoint_rejects_noncanonical_flat_tool_call(self) -> None:
         self.start_turn()
         self.apply("assistant_accepted", {"content": "boundary", "tool_calls": []})
-        self.apply(
-            "compaction_checkpoint",
-            {
-                "through_seq": 3,
-                "summary": "summary",
-                "replacement_conversation": [
-                    {"role": "user", "content": "compressed task"},
-                    {
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [
-                            {
-                                "id": "flat-call",
-                                "name": "read_file",
-                                "arguments": "{}",
-                            }
-                        ],
-                    },
-                    {
-                        "role": "tool",
-                        "tool_call_id": "flat-call",
-                        "content": "contents",
-                    },
-                ],
-            },
-        )
-
-        with self.assertRaisesRegex(ProjectionError, "canonical|fields"):
-            self.project()
+        with self.assertRaisesRegex(
+            DomainError, "replacement_conversation.*(canonical|fields)"
+        ):
+            self.apply(
+                "compaction_checkpoint",
+                {
+                    "through_seq": 3,
+                    "summary": "summary",
+                    "replacement_conversation": [
+                        {"role": "user", "content": "compressed task"},
+                        {
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [
+                                {
+                                    "id": "flat-call",
+                                    "name": "read_file",
+                                    "arguments": "{}",
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": "flat-call",
+                            "content": "contents",
+                        },
+                    ],
+                },
+            )
 
 
 class ConversationValidationTests(unittest.TestCase):
+    def test_projection_reexports_the_low_level_validator_and_error_type(
+        self,
+    ) -> None:
+        self.assertEqual(validate_conversation.__module__, "mca.conversation")
+
+        from mca.conversation import (
+            ConversationError,
+            validate_conversation as canonical_validator,
+        )
+
+        self.assertIs(validate_conversation, canonical_validator)
+        self.assertIs(ProjectionError, ConversationError)
+        self.assertTrue(issubclass(ProjectionBlockedError, ProjectionError))
+
     def test_rejects_more_than_one_system_message(self) -> None:
         messages = [
             {"role": "system", "content": "current environment"},

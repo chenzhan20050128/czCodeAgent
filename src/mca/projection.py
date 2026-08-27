@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import date as Date
 from typing import Any
 
+from .conversation import ProjectionError, validate_conversation
 from .domain import (
     DomainError,
     Event,
@@ -21,10 +22,6 @@ from .domain import (
     SessionState,
     ToolStatus,
 )
-
-
-class ProjectionError(ValueError):
-    """Raised when facts cannot form a valid provider conversation."""
 
 
 class ProjectionBlockedError(ProjectionError):
@@ -219,31 +216,6 @@ def _normalize_tool_call(document: object) -> dict[str, Any]:
     }
 
 
-def _validate_canonical_tool_call(document: object) -> str:
-    if not isinstance(document, Mapping):
-        raise ProjectionError("assistant tool call must be an object")
-    _validate_message_fields(
-        document, frozenset({"id", "type", "function"}), role="tool call"
-    )
-    if document["type"] != "function":
-        raise ProjectionError("only function tool calls are canonical")
-    call_id = document["id"]
-    if not isinstance(call_id, str) or not call_id:
-        raise ProjectionError("assistant tool call id must be a non-empty string")
-
-    function = document["function"]
-    if not isinstance(function, Mapping):
-        raise ProjectionError("assistant tool function must be an object")
-    _validate_message_fields(
-        function, frozenset({"name", "arguments"}), role="tool function"
-    )
-    if not isinstance(function["name"], str) or not function["name"]:
-        raise ProjectionError("assistant tool name must be a non-empty string")
-    if not isinstance(function["arguments"], str):
-        raise ProjectionError("canonical tool arguments must be a string")
-    return call_id
-
-
 def _assistant_message(event: Event) -> dict[str, Any]:
     content = event.payload.get("content")
     if content is not None and not isinstance(content, str):
@@ -347,124 +319,6 @@ def _project_event(
         call_tracker.close(occurrence)
         return message
     return None
-
-
-def _validate_message_fields(
-    message: Mapping[str, Any], allowed: frozenset[str], *, role: str
-) -> None:
-    fields = set(message)
-    if fields != allowed:
-        missing = sorted(allowed - fields)
-        extra = sorted(fields - allowed)
-        raise ProjectionError(
-            f"{role} message fields mismatch (missing={missing}, extra={extra})"
-        )
-
-
-def validate_conversation(messages: Sequence[Mapping[str, Any]]) -> None:
-    """Validate the strict Chat Completions subset emitted by MCA.
-
-    A tool batch is atomic in the model-visible conversation: after an
-    assistant requests calls, exactly one result for every ID must appear
-    before another assistant or user message.  IDs may be reused by a later
-    assistant after the earlier batch is closed.
-    """
-
-    if not isinstance(messages, (list, tuple)):
-        raise ProjectionError("conversation must be an array")
-
-    pending: set[str] = set()
-    completed_in_batch: set[str] = set()
-    conversation_started = False
-    system_seen = False
-    for index, message in enumerate(messages):
-        if not isinstance(message, Mapping):
-            raise ProjectionError(f"message {index} must be an object")
-        role = message.get("role")
-        if role not in {"system", "user", "assistant", "tool"}:
-            raise ProjectionError(f"message {index} has invalid role: {role!r}")
-
-        if pending and role != "tool":
-            raise ProjectionError(
-                f"{role} message appears before every tool call has a result"
-            )
-
-        if role == "system":
-            _validate_message_fields(
-                message, frozenset({"role", "content"}), role=role
-            )
-            if system_seen or conversation_started:
-                raise ProjectionError(
-                    "conversation may contain only one leading system message"
-                )
-            if not isinstance(message["content"], str):
-                raise ProjectionError("system message content must be a string")
-            system_seen = True
-            continue
-
-        conversation_started = True
-        if role == "user":
-            _validate_message_fields(
-                message, frozenset({"role", "content"}), role=role
-            )
-            if not isinstance(message["content"], str):
-                raise ProjectionError("user message content must be a string")
-            continue
-
-        if role == "assistant":
-            allowed = frozenset({"role", "content"})
-            if "tool_calls" in message:
-                allowed = allowed | {"tool_calls"}
-            if "reasoning_content" in message:
-                allowed = allowed | {"reasoning_content"}
-            _validate_message_fields(message, allowed, role=role)
-            content = message["content"]
-            if content is not None and not isinstance(content, str):
-                raise ProjectionError(
-                    "assistant message content must be a string or null"
-                )
-            if "reasoning_content" in message and not isinstance(
-                message["reasoning_content"], str
-            ):
-                raise ProjectionError(
-                    "assistant reasoning_content must be a string"
-                )
-            raw_calls = message.get("tool_calls", ())
-            if not isinstance(raw_calls, (list, tuple)):
-                raise ProjectionError("assistant tool_calls must be an array")
-            call_ids = [_validate_canonical_tool_call(call) for call in raw_calls]
-            if len(call_ids) != len(set(call_ids)):
-                raise ProjectionError(
-                    "assistant message contains a duplicate tool call ID"
-                )
-            if content is None and not call_ids:
-                raise ProjectionError(
-                    "assistant message must contain text or tool calls"
-                )
-            pending = set(call_ids)
-            completed_in_batch = set()
-            continue
-
-        _validate_message_fields(
-            message,
-            frozenset({"role", "tool_call_id", "content"}),
-            role=role,
-        )
-        call_id = message["tool_call_id"]
-        if not isinstance(call_id, str) or not call_id:
-            raise ProjectionError("tool_call_id must be a non-empty string")
-        if not isinstance(message["content"], str):
-            raise ProjectionError("tool message content must be a string")
-        if call_id in completed_in_batch:
-            raise ProjectionError(f"duplicate tool result for call ID {call_id!r}")
-        if call_id not in pending:
-            raise ProjectionError(f"orphan tool result for call ID {call_id!r}")
-        pending.remove(call_id)
-        completed_in_batch.add(call_id)
-
-    if pending:
-        missing = sorted(pending)
-        raise ProjectionError(f"tool calls are missing a result: {missing}")
 
 
 class PromptProjector:

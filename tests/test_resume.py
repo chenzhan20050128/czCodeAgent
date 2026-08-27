@@ -59,8 +59,9 @@ class ResumeTestCase(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        self.workspace = (self.root / "work").resolve()
-        self.workspace.mkdir()
+        workspace = self.root / "work"
+        workspace.mkdir()
+        self.workspace = workspace.resolve(strict=True)
         self.sessions = self.root / "sessions"
         self.session_id = str(uuid.uuid4())
         self.turn_id = str(uuid.uuid4())
@@ -365,7 +366,9 @@ class SessionResumeTests(ResumeTestCase):
         other = self.root / "other"
         other.mkdir()
         with self.assertRaisesRegex(ResumeError, "cwd.*match"):
-            resume_session(self.sessions, self.session_id, other)
+            resume_session(
+                self.sessions, self.session_id, other.resolve(strict=True)
+            )
 
         with resume_session(
             self.sessions, self.session_id, self.workspace
@@ -396,7 +399,23 @@ class SessionResumeTests(ResumeTestCase):
         link.symlink_to(second, target_is_directory=True)
 
         with self.assertRaisesRegex(ResumeError, "recorded cwd.*canonical"):
-            resume_session(self.root / "linked-sessions", session_id, link)
+            resume_session(
+                self.root / "linked-sessions",
+                session_id,
+                second.resolve(strict=True),
+            )
+
+    def test_resume_rejects_requested_symlink_alias_of_recorded_workspace(
+        self,
+    ) -> None:
+        alias = self.root / "workspace-alias"
+        alias.symlink_to(self.workspace, target_is_directory=True)
+        self.store.close()
+
+        with self.assertRaisesRegex(
+            ResumeError, "requested workspace.*canonical"
+        ):
+            resume_session(self.sessions, self.session_id, alias)
 
     def test_recovery_intent_schema_and_transitions_are_strict(self) -> None:
         self.start_turn(("pending",))

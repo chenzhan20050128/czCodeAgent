@@ -48,12 +48,19 @@ class ResumedSession:
 def _canonical_workspace(
     workspace: str | os.PathLike[str], *, label: str
 ) -> Path:
+    raw_workspace = os.fspath(workspace)
     try:
-        candidate = Path(workspace).resolve(strict=True)
+        candidate = Path(raw_workspace).resolve(strict=True)
     except (FileNotFoundError, OSError) as error:
         raise ResumeError(f"{label} workspace does not exist") from error
     if not candidate.is_dir():
         raise ResumeError(f"{label} workspace must be a directory")
+    if label == "requested" and (
+        not Path(raw_workspace).is_absolute() or str(candidate) != raw_workspace
+    ):
+        raise ResumeError(
+            f"{label} workspace must be a canonical absolute path"
+        )
     return candidate
 
 

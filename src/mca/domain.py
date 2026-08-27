@@ -14,6 +14,8 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable
 
+from .conversation import ConversationError, validate_conversation
+
 
 EVENT_VERSION = 1
 _EVENT_FIELDS = {
@@ -864,6 +866,19 @@ class SessionReducer:
         replacement_conversation = event.payload.get("replacement_conversation")
         if not isinstance(replacement_conversation, (list, tuple)):
             raise DomainError("replacement_conversation must be an array")
+        try:
+            validate_conversation(replacement_conversation)
+        except ConversationError as error:
+            raise DomainError(
+                f"invalid checkpoint replacement_conversation: {error}"
+            ) from error
+        if any(
+            message.get("role") == "system"
+            for message in replacement_conversation
+        ):
+            raise DomainError(
+                "checkpoint replacement_conversation must not contain system messages"
+            )
         state.latest_checkpoint = event
 
     @staticmethod
