@@ -11,7 +11,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from .domain import DomainError, Event
+from .domain import EVENT_FIELDS, DomainError, Event
 
 
 class RolloutCorruptionError(RuntimeError):
@@ -152,7 +152,9 @@ class RolloutStore:
             try:
                 event = Event.from_dict(document)
             except DomainError as error:
-                if is_final and not has_newline:
+                if self._is_incomplete_unterminated_event(
+                    document, is_final=is_final, has_newline=has_newline
+                ):
                     os.ftruncate(self._fd, offset)
                     os.fsync(self._fd)
                     break
@@ -161,19 +163,11 @@ class RolloutStore:
                 ) from error
 
             if event.session_id != self.session_id:
-                if is_final and not has_newline:
-                    os.ftruncate(self._fd, offset)
-                    os.fsync(self._fd)
-                    break
                 raise RolloutCorruptionError(
                     f"session mismatch at line {line_number}"
                 )
             expected_seq = len(events) + 1
             if event.seq != expected_seq:
-                if is_final and not has_newline:
-                    os.ftruncate(self._fd, offset)
-                    os.fsync(self._fd)
-                    break
                 raise RolloutCorruptionError(
                     f"invalid sequence at line {line_number}: "
                     f"expected {expected_seq}, got {event.seq}"
@@ -186,6 +180,17 @@ class RolloutStore:
                 os.fsync(self._fd)
 
         return events
+
+    @staticmethod
+    def _is_incomplete_unterminated_event(
+        document: object, *, is_final: bool, has_newline: bool
+    ) -> bool:
+        return (
+            is_final
+            and not has_newline
+            and isinstance(document, dict)
+            and not EVENT_FIELDS.issubset(document)
+        )
 
     def append(
         self,

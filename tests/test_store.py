@@ -242,6 +242,28 @@ class RolloutStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RolloutCorruptionError, "version"):
             RolloutStore.open(self.sessions_root, self.session_id)
 
+    def test_load_rejects_complete_invalid_version_without_newline(self) -> None:
+        self._write_raw(
+            self._event_line(1) + self._event_line(2, version=99).rstrip(b"\n")
+        )
+
+        with self.assertRaisesRegex(RolloutCorruptionError, "version"):
+            RolloutStore.open(self.sessions_root, self.session_id)
+
+    def test_load_rejects_complete_initial_sequence_gap_without_newline(self) -> None:
+        self._write_raw(self._event_line(2).rstrip(b"\n"))
+
+        with self.assertRaisesRegex(RolloutCorruptionError, "sequence"):
+            RolloutStore.open(self.sessions_root, self.session_id)
+
+    def test_load_rejects_complete_wrong_session_without_newline(self) -> None:
+        self._write_raw(
+            self._event_line(1, session_id=str(uuid.uuid4())).rstrip(b"\n")
+        )
+
+        with self.assertRaisesRegex(RolloutCorruptionError, "session"):
+            RolloutStore.open(self.sessions_root, self.session_id)
+
     def test_session_id_must_be_a_canonical_uuid_before_path_construction(self) -> None:
         invalid_ids = (
             "../escape",

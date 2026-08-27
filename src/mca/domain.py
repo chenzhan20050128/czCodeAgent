@@ -23,6 +23,7 @@ _EVENT_FIELDS = {
     "type",
     "payload",
 }
+EVENT_FIELDS = frozenset(_EVENT_FIELDS)
 
 
 class DomainError(ValueError):
