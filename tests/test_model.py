@@ -166,11 +166,34 @@ class ModelClientTests(unittest.TestCase):
                 "n": 1,
                 "max_tokens": 8192,
                 "tools": TOOLS,
-                "tool_choice": "auto",
             },
         )
 
-    def test_finalization_omits_tools_and_forces_tool_choice_none(self) -> None:
+    def test_default_deepseek_tool_request_does_not_force_tool_choice(self) -> None:
+        bodies: list[dict[str, object]] = []
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: (
+                    bodies.append(json.loads(request.content)),
+                    response(text_body("ok")),
+                )[1]
+            )
+        )
+        self.addCleanup(http_client.close)
+        client = ModelClient(
+            Config(api_key="test-secret"),
+            client=http_client,
+            sleep=lambda _: None,
+        )
+
+        client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+        self.assertEqual(bodies[0]["model"], "deepseek-v4-flash")
+        self.assertEqual(bodies[0]["tools"], TOOLS)
+        self.assertEqual(bodies[0]["max_tokens"], 8192)
+        self.assertNotIn("tool_choice", bodies[0])
+
+    def test_finalization_omits_tools_and_tool_choice(self) -> None:
         bodies: list[dict[str, object]] = []
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -192,10 +215,11 @@ class ModelClientTests(unittest.TestCase):
                     "stream": True,
                     "n": 1,
                     "max_tokens": 8192,
-                    "tool_choice": "none",
                 }
             ],
         )
+        self.assertNotIn("tools", bodies[0])
+        self.assertNotIn("tool_choice", bodies[0])
 
     def test_returns_immutable_tool_batch_even_when_finish_reason_is_stop(self) -> None:
         body = stream_body(
@@ -239,6 +263,45 @@ class ModelClientTests(unittest.TestCase):
         with self.assertRaises(FrozenInstanceError):
             result.tool_calls[0].name = "changed"  # type: ignore[misc]
 
+    def test_preserves_streamed_reasoning_content_for_tool_batch(self) -> None:
+        body = stream_body(
+            choice({"reasoning_content": "inspect "}),
+            choice(
+                {
+                    "reasoning_content": "first",
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                }
+            ),
+            choice({}, "tool_calls"),
+        )
+        client, http_client, _ = self.make_client(lambda _: response(body))
+        self.addCleanup(http_client.close)
+
+        result = client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+        self.assertEqual(result.outcome, SamplingOutcome.VALID_TOOL_BATCH)
+        self.assertEqual(result.reasoning_content, "inspect first")
+
+    def test_preserves_streamed_reasoning_content_for_text(self) -> None:
+        body = stream_body(
+            choice({"reasoning_content": "think", "content": "answer"}),
+            choice({}, "stop"),
+        )
+        client, http_client, _ = self.make_client(lambda _: response(body))
+        self.addCleanup(http_client.close)
+
+        result = client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+        self.assertEqual(result.outcome, SamplingOutcome.COMPLETE_TEXT)
+        self.assertEqual(result.reasoning_content, "think")
+
     def test_classifies_empty_stop_length_and_content_filter(self) -> None:
         cases = (
             (text_body(""), SamplingOutcome.PROTOCOL_ERROR),
@@ -264,6 +327,7 @@ class ModelClientTests(unittest.TestCase):
                     choice(
                         {
                             "content": "diagnostic",
+                            "reasoning_content": "thinking",
                             "tool_calls": [
                                 {
                                     "index": 0,
@@ -283,6 +347,7 @@ class ModelClientTests(unittest.TestCase):
 
                 self.assertEqual(result.outcome, expected)
                 self.assertEqual(result.content, "diagnostic")
+                self.assertEqual(result.reasoning_content, "thinking")
                 self.assertEqual(result.tool_calls, ())
 
     def test_retries_429_then_succeeds_with_exponential_jitter(self) -> None:
@@ -674,6 +739,28 @@ class ModelClientTests(unittest.TestCase):
         self.assertEqual(result.outcome, SamplingOutcome.PROTOCOL_ERROR)
         self.assertNotIn(secret, rendered)
         self.assertIn("HTTP 400", result.error or "")
+
+    def test_nonretryable_status_is_classified_before_truncated_body_read(self) -> None:
+        for status in (401, 400):
+            with self.subTest(status=status):
+                attempts = 0
+
+                def handler(_: httpx.Request) -> httpx.Response:
+                    nonlocal attempts
+                    attempts += 1
+                    return httpx.Response(
+                        status,
+                        stream=BrokenStream(b"", httpx.RemoteProtocolError),
+                    )
+
+                client, http_client, timing = self.make_client(handler)
+                self.addCleanup(http_client.close)
+                result = client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+                self.assertEqual(result.outcome, SamplingOutcome.PROTOCOL_ERROR)
+                self.assertEqual(attempts, 1)
+                self.assertEqual(timing.sleeps, [])
+                self.assertEqual(result.error, f"HTTP {status} from model API")
 
 
 if __name__ == "__main__":

@@ -28,6 +28,7 @@ class SamplingResult:
 
     outcome: SamplingOutcome
     content: str = ""
+    reasoning_content: str = ""
     tool_calls: tuple[SampledToolCall, ...] = ()
     finish_reason: str | None = None
     error: str | None = None
@@ -103,9 +104,6 @@ class ModelClient:
         }
         if allow_tools:
             request_body["tools"] = list(tools)
-            request_body["tool_choice"] = "auto"
-        else:
-            request_body["tool_choice"] = "none"
 
         url = f"{self._config.base_url.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {self._config.api_key}"}
@@ -147,16 +145,27 @@ class ModelClient:
                     timeout=httpx.Timeout(attempt_timeout),
                 ) as response:
                     if response.status_code != 200:
-                        response.read()
-                        if response.status_code == 400 and _is_context_overflow(response):
-                            return SamplingResult(
-                                SamplingOutcome.CONTEXT_OVERFLOW,
-                                error="model context window exceeded",
-                            )
                         if response.status_code in _RETRYABLE_STATUS_CODES:
                             retryable = True
                             retry_after = response.headers.get("Retry-After")
                             last_error = f"HTTP {response.status_code} from model API"
+                        elif response.status_code == 400:
+                            try:
+                                response.read()
+                            except httpx.TransportError:
+                                return SamplingResult(
+                                    SamplingOutcome.PROTOCOL_ERROR,
+                                    error="HTTP 400 from model API",
+                                )
+                            if _is_context_overflow(response):
+                                return SamplingResult(
+                                    SamplingOutcome.CONTEXT_OVERFLOW,
+                                    error="model context window exceeded",
+                                )
+                            return SamplingResult(
+                                SamplingOutcome.PROTOCOL_ERROR,
+                                error="HTTP 400 from model API",
+                            )
                         else:
                             return SamplingResult(
                                 SamplingOutcome.PROTOCOL_ERROR,
@@ -221,14 +230,14 @@ def _classify(candidate: Any) -> SamplingResult:
         return SamplingResult(
             SamplingOutcome.LENGTH_EXCEEDED,
             content=candidate.content,
-            tool_calls=candidate.tool_calls,
+            reasoning_content=candidate.reasoning_content,
             finish_reason=candidate.finish_reason,
         )
     if candidate.finish_reason == "content_filter":
         return SamplingResult(
             SamplingOutcome.FILTERED,
             content=candidate.content,
-            tool_calls=candidate.tool_calls,
+            reasoning_content=candidate.reasoning_content,
             finish_reason=candidate.finish_reason,
         )
     outcome = (
@@ -239,6 +248,7 @@ def _classify(candidate: Any) -> SamplingResult:
     return SamplingResult(
         outcome,
         content=candidate.content,
+        reasoning_content=candidate.reasoning_content,
         tool_calls=candidate.tool_calls,
         finish_reason=candidate.finish_reason,
     )

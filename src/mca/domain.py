@@ -522,6 +522,12 @@ class SessionReducer:
         content = event.payload.get("content")
         if content is not None and not isinstance(content, str):
             raise DomainError("assistant content must be a string or null")
+        if "reasoning_content" in event.payload and not isinstance(
+            event.payload["reasoning_content"], str
+        ):
+            raise DomainError(
+                "assistant reasoning_content must be a string"
+            )
         for call in pending:
             if call.call_key in state.tool_calls:
                 raise DomainError(f"duplicate internal tool call key: {call.call_key}")

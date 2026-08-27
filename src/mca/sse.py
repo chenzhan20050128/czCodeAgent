@@ -111,6 +111,7 @@ class StreamResponse:
     """A complete stream candidate, before outcome classification."""
 
     content: str
+    reasoning_content: str
     tool_calls: tuple[SampledToolCall, ...]
     finish_reason: str
 
@@ -142,6 +143,7 @@ class StreamAssembler:
         self._decoder = SSEDecoder()
         self._on_content = on_content
         self._content: list[str] = []
+        self._reasoning_content: list[str] = []
         self._tool_calls: dict[int, _ToolCallParts] = {}
         self._finish_reason: str | None = None
         self._done = False
@@ -172,12 +174,15 @@ class StreamAssembler:
             raise ProtocolError("stream is missing a terminal finish_reason")
 
         content = "".join(self._content)
+        reasoning_content = "".join(self._reasoning_content)
         if self._finish_reason in {
             "length",
             "content_filter",
             "insufficient_system_resource",
         }:
-            return StreamResponse(content, (), self._finish_reason)
+            return StreamResponse(
+                content, reasoning_content, (), self._finish_reason
+            )
 
         calls: list[SampledToolCall] = []
         for index in sorted(self._tool_calls):
@@ -204,7 +209,9 @@ class StreamAssembler:
             raise ProtocolError("terminal response is empty")
         if self._finish_reason == "tool_calls" and not calls:
             raise ProtocolError("tool_calls finish_reason has no tool calls")
-        return StreamResponse(content, tuple(calls), self._finish_reason)
+        return StreamResponse(
+            content, reasoning_content, tuple(calls), self._finish_reason
+        )
 
     def _consume_payload(self, payload: str) -> None:
         if payload == "[DONE]":
@@ -245,6 +252,17 @@ class StreamAssembler:
             self._finish_reason = finish_reason
 
     def _consume_delta(self, delta: dict[str, Any]) -> None:
+        if (
+            "reasoning_content" in delta
+            and delta["reasoning_content"] is not None
+        ):
+            reasoning_content = delta["reasoning_content"]
+            if not isinstance(reasoning_content, str):
+                raise ProtocolError(
+                    "reasoning_content delta must be a string or null"
+                )
+            self._reasoning_content.append(reasoning_content)
+
         if "content" in delta and delta["content"] is not None:
             content = delta["content"]
             if not isinstance(content, str):

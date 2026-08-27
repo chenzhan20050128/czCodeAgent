@@ -95,6 +95,23 @@ class StreamAssemblerTests(unittest.TestCase):
         self.assertEqual(response.finish_reason, "stop")
         self.assertEqual(response.tool_calls, ())
 
+    def test_assembles_reasoning_content_and_rejects_non_string_delta(self) -> None:
+        assembler = StreamAssembler()
+        assembler.feed(event({"reasoning_content": "plan "}))
+        assembler.feed(event({"reasoning_content": None, "content": "answer"}))
+        assembler.feed(event({"reasoning_content": "details"}))
+        assembler.feed(event({}, "stop"))
+        assembler.feed(DONE)
+
+        response = assembler.finish()
+
+        self.assertEqual(response.reasoning_content, "plan details")
+        self.assertEqual(response.content, "answer")
+
+        invalid = StreamAssembler()
+        with self.assertRaisesRegex(ProtocolError, "reasoning_content"):
+            invalid.feed(event({"reasoning_content": 42}))
+
     def test_tool_id_and_name_may_arrive_after_arguments_start(self) -> None:
         assembler = StreamAssembler()
         assembler.feed(

@@ -22,6 +22,7 @@ from mca.projection import (
     request_fits_budget,
     validate_conversation,
 )
+from mca.sse import StreamAssembler
 
 
 class ProjectionTestCase(unittest.TestCase):
@@ -94,6 +95,101 @@ class ProjectionTestCase(unittest.TestCase):
 
 
 class PromptProjectionTests(ProjectionTestCase):
+    def test_preserves_reasoning_content_for_followup_after_tool_result(self) -> None:
+        self.start_turn("Inspect the file")
+        assembler = StreamAssembler()
+        streamed = {
+            "id": "response-1",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "reasoning_content": "I need the file contents.",
+                        "tool_calls": [
+                            {
+                                "index": 0,
+                                "id": "call-1",
+                                "type": "function",
+                                "function": {
+                                    "name": "read_file",
+                                    "arguments": '{"path":"a.py"}',
+                                },
+                            }
+                        ],
+                    },
+                    "finish_reason": None,
+                }
+            ],
+        }
+        terminal = {
+            "id": "response-1",
+            "choices": [
+                {"index": 0, "delta": {}, "finish_reason": "tool_calls"}
+            ],
+        }
+        for item in (streamed, terminal):
+            assembler.feed(f"data: {json.dumps(item)}\n\n".encode())
+        assembler.feed(b"data: [DONE]\n\n")
+        sampled = assembler.finish()
+        call = {
+            "id": sampled.tool_calls[0].id,
+            "type": sampled.tool_calls[0].type,
+            "function": {
+                "name": sampled.tool_calls[0].name,
+                "arguments": sampled.tool_calls[0].arguments,
+            },
+        }
+        self.apply(
+            "assistant_accepted",
+            {
+                "content": sampled.content or None,
+                "reasoning_content": sampled.reasoning_content,
+                "finish_reason": sampled.finish_reason,
+                "tool_calls": [call],
+            },
+        )
+        self.apply(
+            "tool_finished",
+            {
+                "call_id": "call-1",
+                "status": "invalid_arguments",
+                "result": "contents",
+            },
+        )
+
+        messages = self.project()
+
+        self.assertEqual(
+            messages[-2],
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "I need the file contents.",
+                "tool_calls": [call],
+            },
+        )
+        validate_conversation(messages)
+
+    def test_reasoning_content_is_assistant_only_and_must_be_a_string(self) -> None:
+        call = self.tool_call("call-1", "read_file", "{}")
+        for message in (
+            {"role": "assistant", "content": "x", "reasoning_content": 1},
+            {"role": "assistant", "content": "x", "reasoning_content": None},
+            {"role": "user", "content": "x", "reasoning_content": "no"},
+            {"role": "system", "content": "x", "reasoning_content": "no"},
+            {"role": "tool", "tool_call_id": "call-1", "content": "x", "reasoning_content": "no"},
+        ):
+            with self.subTest(role=message["role"]):
+                with self.assertRaises(ProjectionError):
+                    validate_conversation([message])
+
+        validate_conversation(
+            [
+                {"role": "assistant", "content": None, "reasoning_content": "think", "tool_calls": [call]},
+                {"role": "tool", "tool_call_id": "call-1", "content": "done"},
+            ]
+        )
+
     def test_projects_text_path_as_exact_chat_completion_messages(self) -> None:
         self.start_turn("Explain the failure")
         self.apply(

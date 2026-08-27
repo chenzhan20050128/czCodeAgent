@@ -107,6 +107,41 @@ class DomainValueTests(ReducerTestCase):
 
 
 class SessionReducerTests(ReducerTestCase):
+    def test_assistant_accepted_validates_optional_reasoning_content(self) -> None:
+        self.start_turn()
+        accepted = self.apply(
+            "assistant_accepted",
+            {
+                "content": None,
+                "reasoning_content": "I should inspect the file.",
+                "tool_calls": [self.tool("call-1")],
+            },
+        )
+        self.assertEqual(
+            accepted.payload["reasoning_content"],
+            "I should inspect the file.",
+        )
+
+        state = SessionState()
+        SessionReducer.apply(state, self.state.events[0])
+        SessionReducer.apply(state, self.state.events[1])
+        for invalid_reasoning in (None, 1):
+            with self.subTest(reasoning_content=invalid_reasoning):
+                state = SessionState()
+                SessionReducer.apply(state, self.state.events[0])
+                SessionReducer.apply(state, self.state.events[1])
+                invalid = Event.create(
+                    seq=3,
+                    session_id=self.session_id,
+                    event_type="assistant_accepted",
+                    payload={
+                        "content": "x",
+                        "reasoning_content": invalid_reasoning,
+                    },
+                )
+                with self.assertRaisesRegex(DomainError, "reasoning_content"):
+                    SessionReducer.apply(state, invalid)
+
     def test_reduce_event_returns_independent_state_without_mutating_input(self) -> None:
         self.start_turn()
         before = SessionReducer.replay(self.state.events)

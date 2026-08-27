@@ -248,6 +248,12 @@ def _assistant_message(event: Event) -> dict[str, Any]:
     content = event.payload.get("content")
     if content is not None and not isinstance(content, str):
         raise ProjectionError("assistant content must be a string or null")
+    reasoning_present = "reasoning_content" in event.payload
+    reasoning_content = event.payload.get("reasoning_content")
+    if reasoning_present and not isinstance(reasoning_content, str):
+        raise ProjectionError(
+            "assistant reasoning_content must be a string"
+        )
     raw_calls = event.payload.get("tool_calls", ())
     if not isinstance(raw_calls, (tuple, list)):
         raise ProjectionError("assistant tool_calls must be an array")
@@ -258,6 +264,8 @@ def _assistant_message(event: Event) -> dict[str, Any]:
         )
 
     message: dict[str, Any] = {"role": "assistant", "content": content}
+    if reasoning_present:
+        message["reasoning_content"] = reasoning_content
     if calls:
         message["tool_calls"] = calls
     return message
@@ -407,11 +415,19 @@ def validate_conversation(messages: Sequence[Mapping[str, Any]]) -> None:
             allowed = frozenset({"role", "content"})
             if "tool_calls" in message:
                 allowed = allowed | {"tool_calls"}
+            if "reasoning_content" in message:
+                allowed = allowed | {"reasoning_content"}
             _validate_message_fields(message, allowed, role=role)
             content = message["content"]
             if content is not None and not isinstance(content, str):
                 raise ProjectionError(
                     "assistant message content must be a string or null"
+                )
+            if "reasoning_content" in message and not isinstance(
+                message["reasoning_content"], str
+            ):
+                raise ProjectionError(
+                    "assistant reasoning_content must be a string"
                 )
             raw_calls = message.get("tool_calls", ())
             if not isinstance(raw_calls, (list, tuple)):
