@@ -72,6 +72,12 @@ class SSEDecoderTests(unittest.TestCase):
 
         self.assertEqual(decoded, ('{"value":\n1}', "[DONE]"))
 
+    def test_eof_does_not_dispatch_event_without_blank_line(self) -> None:
+        decoder = SSEDecoder()
+
+        self.assertEqual(decoder.feed(b"data: incomplete\n"), ())
+        self.assertEqual(decoder.close(), ())
+
 
 class StreamAssemblerTests(unittest.TestCase):
     def test_assembles_text_and_reports_content_deltas(self) -> None:
@@ -181,6 +187,57 @@ class StreamAssemblerTests(unittest.TestCase):
         self.assertEqual(
             response.tool_calls[1].arguments, '{"pattern":"TODO"}'
         )
+
+    def test_uses_first_choice_and_ignores_additional_choices(self) -> None:
+        assembler = StreamAssembler()
+        payload = {
+            "id": "response-1",
+            "choices": [
+                {"index": 0, "delta": {"content": "first"}, "finish_reason": None},
+                {"index": 1, "delta": {"content": "ignored"}, "finish_reason": "stop"},
+            ],
+        }
+        assembler.feed(f"data: {json.dumps(payload)}\n\n".encode())
+        assembler.feed(event({}, "stop"))
+        assembler.feed(DONE)
+
+        self.assertEqual(assembler.finish().content, "first")
+
+    def test_repeated_identical_tool_metadata_is_allowed(self) -> None:
+        assembler = StreamAssembler()
+        metadata = {
+            "index": 0,
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": "{"},
+        }
+        assembler.feed(event({"tool_calls": [metadata]}))
+        repeated = dict(metadata)
+        repeated["function"] = {"name": "bash", "arguments": "}"}
+        assembler.feed(event({"tool_calls": [repeated]}))
+        assembler.feed(event({}, "tool_calls"))
+        assembler.feed(DONE)
+
+        self.assertEqual(assembler.finish().tool_calls[0].arguments, "{}")
+
+    def test_conflicting_repeated_tool_metadata_is_rejected(self) -> None:
+        initial = {
+            "index": 0,
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "bash", "arguments": ""},
+        }
+        conflicts = (
+            {"index": 0, "id": "call-2"},
+            {"index": 0, "type": "other"},
+            {"index": 0, "function": {"name": "read_file"}},
+        )
+        for conflict in conflicts:
+            with self.subTest(conflict=conflict):
+                assembler = StreamAssembler()
+                assembler.feed(event({"tool_calls": [initial]}))
+                with self.assertRaisesRegex(ProtocolError, "conflicting"):
+                    assembler.feed(event({"tool_calls": [conflict]}))
 
     def test_missing_done_is_an_interrupted_stream(self) -> None:
         assembler = StreamAssembler()

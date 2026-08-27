@@ -22,14 +22,6 @@ from .sse import (
 
 
 _RETRYABLE_STATUS_CODES = frozenset({408, 409, 429, 500, 502, 503, 504})
-_RETRYABLE_EXCEPTIONS = (
-    httpx.ConnectError,
-    httpx.ConnectTimeout,
-    httpx.ReadError,
-    httpx.ReadTimeout,
-)
-
-
 @dataclass(frozen=True)
 class SamplingResult:
     """Typed result of one logical sample, including its HTTP attempts."""
@@ -107,6 +99,7 @@ class ModelClient:
             "messages": list(messages),
             "stream": True,
             "n": 1,
+            "max_tokens": self._config.max_output_tokens,
         }
         if allow_tools:
             request_body["tools"] = list(tools)
@@ -118,16 +111,29 @@ class ModelClient:
         headers = {"Authorization": f"Bearer {self._config.api_key}"}
         started_at = self._clock()
         last_error = "model request failed"
+        content_callback_enabled = True
 
         for attempt in range(1, self._config.max_attempts + 1):
+            remaining = self._config.retry_budget_seconds - (
+                self._clock() - started_at
+            )
+            if remaining <= 0:
+                return SamplingResult(
+                    SamplingOutcome.TRANSPORT_INTERRUPTED,
+                    error=f"{last_error}; retry budget exhausted",
+                )
+            attempt_timeout = min(self._config.request_timeout, remaining)
             displayed = False
 
             def display(delta: str) -> None:
-                nonlocal displayed
+                nonlocal displayed, content_callback_enabled
                 if delta:
                     displayed = True
-                if on_content is not None:
-                    on_content(delta)
+                if on_content is not None and content_callback_enabled:
+                    try:
+                        on_content(delta)
+                    except Exception:
+                        content_callback_enabled = False
 
             assembler = StreamAssembler(on_content=display)
             retry_after: str | None = None
@@ -138,7 +144,7 @@ class ModelClient:
                     url,
                     headers=headers,
                     json=request_body,
-                    timeout=self._config.request_timeout,
+                    timeout=httpx.Timeout(attempt_timeout),
                 ) as response:
                     if response.status_code != 200:
                         response.read()
@@ -162,17 +168,21 @@ class ModelClient:
                             if assembler.is_done:
                                 break
                         candidate = assembler.finish()
-                        return _classify(candidate)
+                        if candidate.finish_reason == "insufficient_system_resource":
+                            retryable = True
+                            last_error = "model reported insufficient system resources"
+                        else:
+                            return _classify(candidate)
             except StreamInterruptedError:
                 retryable = True
                 last_error = "model stream ended before completion"
             except ProtocolError as exc:
-                if displayed and on_invalidate is not None:
-                    on_invalidate()
+                if displayed:
+                    _notify_invalidation(on_invalidate)
                 return SamplingResult(
                     SamplingOutcome.PROTOCOL_ERROR, error=_safe_protocol_error(exc)
                 )
-            except _RETRYABLE_EXCEPTIONS as exc:
+            except httpx.TransportError as exc:
                 retryable = True
                 last_error = f"{type(exc).__name__} during model request"
 
@@ -180,8 +190,8 @@ class ModelClient:
                 return SamplingResult(
                     SamplingOutcome.PROTOCOL_ERROR, error="model request failed"
                 )
-            if displayed and on_invalidate is not None:
-                on_invalidate()
+            if displayed:
+                _notify_invalidation(on_invalidate)
             if attempt >= self._config.max_attempts:
                 return SamplingResult(
                     SamplingOutcome.TRANSPORT_INTERRUPTED, error=last_error
@@ -193,8 +203,10 @@ class ModelClient:
                 wall_time=self._wall_clock(),
                 jitter=self._random(),
             )
-            elapsed = max(0.0, self._clock() - started_at)
-            if elapsed + delay > self._config.retry_budget_seconds:
+            remaining = self._config.retry_budget_seconds - (
+                self._clock() - started_at
+            )
+            if remaining <= 0 or delay >= remaining:
                 return SamplingResult(
                     SamplingOutcome.TRANSPORT_INTERRUPTED,
                     error=f"{last_error}; retry budget exhausted",
@@ -298,6 +310,15 @@ def _safe_protocol_error(error: ProtocolError) -> str:
     if any(fragment in message for fragment in allowed_fragments):
         return message
     return "invalid model stream protocol"
+
+
+def _notify_invalidation(callback: Callable[[], None] | None) -> None:
+    if callback is None:
+        return
+    try:
+        callback()
+    except Exception:
+        pass
 
 
 __all__ = ["ModelClient", "SampledToolCall", "SamplingResult"]

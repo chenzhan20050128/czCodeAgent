@@ -124,7 +124,15 @@ class _ToolCallParts:
     saw_arguments: bool = False
 
 
-_FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "content_filter"})
+_FINISH_REASONS = frozenset(
+    {
+        "stop",
+        "tool_calls",
+        "length",
+        "content_filter",
+        "insufficient_system_resource",
+    }
+)
 
 
 class StreamAssembler:
@@ -163,6 +171,14 @@ class StreamAssembler:
         if self._finish_reason is None:
             raise ProtocolError("stream is missing a terminal finish_reason")
 
+        content = "".join(self._content)
+        if self._finish_reason in {
+            "length",
+            "content_filter",
+            "insufficient_system_resource",
+        }:
+            return StreamResponse(content, (), self._finish_reason)
+
         calls: list[SampledToolCall] = []
         for index in sorted(self._tool_calls):
             parts = self._tool_calls[index]
@@ -184,7 +200,6 @@ class StreamAssembler:
                 )
             )
 
-        content = "".join(self._content)
         if self._finish_reason in {"stop", "tool_calls"} and not content and not calls:
             raise ProtocolError("terminal response is empty")
         if self._finish_reason == "tool_calls" and not calls:
@@ -209,8 +224,8 @@ class StreamAssembler:
         if not isinstance(document, dict):
             raise ProtocolError("stream event must be a JSON object")
         choices = document.get("choices")
-        if not isinstance(choices, list) or len(choices) != 1:
-            raise ProtocolError("stream event choices must contain exactly one item")
+        if not isinstance(choices, list) or not choices:
+            raise ProtocolError("stream event choices must contain an item")
         choice = choices[0]
         if not isinstance(choice, dict):
             raise ProtocolError("stream choice must be an object")
@@ -257,11 +272,13 @@ class StreamAssembler:
         if "id" in tool_delta:
             if not isinstance(tool_delta["id"], str):
                 raise ProtocolError("tool call id must be a string")
-            parts.id = tool_delta["id"]
+            parts.id = _merge_metadata(parts.id, tool_delta["id"], "id")
         if "type" in tool_delta:
             if not isinstance(tool_delta["type"], str):
                 raise ProtocolError("tool call type must be a string")
-            parts.type = tool_delta["type"]
+            parts.type = _merge_metadata(
+                parts.type, tool_delta["type"], "type"
+            )
         if "function" not in tool_delta:
             return
         function = tool_delta["function"]
@@ -270,13 +287,23 @@ class StreamAssembler:
         if "name" in function:
             if not isinstance(function["name"], str):
                 raise ProtocolError("tool call function name must be a string")
-            parts.name = function["name"]
+            parts.name = _merge_metadata(
+                parts.name, function["name"], "function name"
+            )
         if "arguments" in function:
             arguments = function["arguments"]
             if not isinstance(arguments, str):
                 raise ProtocolError("tool call arguments must be a string")
             parts.saw_arguments = True
             parts.arguments += arguments
+
+
+def _merge_metadata(
+    current: str | None, incoming: str, field_name: str
+) -> str:
+    if current is not None and current != incoming:
+        raise ProtocolError(f"tool call has conflicting {field_name}")
+    return incoming
 
 
 __all__ = [
