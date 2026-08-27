@@ -867,6 +867,127 @@ class AgentLoopTests(AgentLoopTestCase):
         self.assertEqual(len(runtime.model.requests), 1)
         self.assertEqual(len(self.terminal_events(runtime)), 1)
 
+    def test_keyboard_interrupt_after_turn_started_append_closes_the_durable_turn(
+        self,
+    ) -> None:
+        runtime = self.make_runtime(text("next turn succeeds"))
+        real_append = runtime.store.append
+        interrupted = False
+
+        def append_then_interrupt(
+            event_or_type: object, payload: Mapping[str, Any] | None = None
+        ) -> object:
+            nonlocal interrupted
+            event = real_append(event_or_type, payload)
+            if event.type == "turn_started" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return event
+
+        with patch.object(runtime.store, "append", side_effect=append_then_interrupt):
+            first = runtime.loop.run_turn("interrupt at start")
+
+        self.assertEqual(first.status, TurnStatus.INTERRUPTED)
+        self.assertEqual(first.error, "turn interrupted by user")
+        self.assertEqual(runtime.model.requests, [])
+        self.assertEqual(
+            [event.type for event in runtime.store.load()],
+            ["session_created", "turn_started", "turn_finished"],
+        )
+        self.assertEqual(SessionReducer.replay(runtime.store.load()), runtime.state)
+
+        second = runtime.loop.run_turn("continue")
+
+        self.assertEqual(second.status, TurnStatus.COMPLETED)
+        self.assertEqual(second.final_text, "next turn succeeds")
+        self.assertEqual(len(self.terminal_events(runtime)), 2)
+
+    def test_keyboard_interrupt_after_text_assistant_append_completes_without_invalidate(
+        self,
+    ) -> None:
+        invalidated: list[str] = []
+        runtime = self.make_runtime(
+            StreamedSample(text("durable answer")),
+            on_content=lambda _: None,
+            on_invalidate=lambda: invalidated.append("invalid"),
+        )
+        real_append = runtime.store.append
+        interrupted = False
+
+        def append_then_interrupt(
+            event_or_type: object, payload: Mapping[str, Any] | None = None
+        ) -> object:
+            nonlocal interrupted
+            event = real_append(event_or_type, payload)
+            if event.type == "assistant_accepted" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return event
+
+        with patch.object(runtime.store, "append", side_effect=append_then_interrupt):
+            result = runtime.loop.run_turn("finish")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(result.final_text, "durable answer")
+        self.assertIsNone(result.error)
+        self.assertEqual(invalidated, [])
+        self.assertEqual(
+            [event.type for event in runtime.store.load()],
+            [
+                "session_created",
+                "turn_started",
+                "assistant_accepted",
+                "turn_finished",
+            ],
+        )
+        self.assertEqual(SessionReducer.replay(runtime.store.load()), runtime.state)
+
+    def test_keyboard_interrupt_after_tool_assistant_append_closes_accepted_calls(
+        self,
+    ) -> None:
+        executions: list[str] = []
+        invalidated: list[str] = []
+        runtime = self.make_runtime(
+            StreamedSample(
+                tool_batch(call("one", "record"), call("two", "record"))
+            ),
+            specs=[
+                tool_spec(
+                    "record",
+                    lambda _: executions.append("ran")
+                    or ToolResult(title="record", output="ran"),
+                )
+            ],
+            on_content=lambda _: None,
+            on_invalidate=lambda: invalidated.append("invalid"),
+        )
+        real_append = runtime.store.append
+        interrupted = False
+
+        def append_then_interrupt(
+            event_or_type: object, payload: Mapping[str, Any] | None = None
+        ) -> object:
+            nonlocal interrupted
+            event = real_append(event_or_type, payload)
+            if event.type == "assistant_accepted" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return event
+
+        with patch.object(runtime.store, "append", side_effect=append_then_interrupt):
+            result = runtime.loop.run_turn("use tools")
+
+        self.assertEqual(result.status, TurnStatus.INTERRUPTED)
+        self.assertEqual(result.tool_steps, 1)
+        self.assertEqual(executions, [])
+        self.assertEqual(invalidated, [])
+        self.assertEqual(
+            [call.status for call in runtime.state.tool_calls.values()],
+            [ToolStatus.NOT_EXECUTED, ToolStatus.NOT_EXECUTED],
+        )
+        self.assertEqual(len(self.terminal_events(runtime)), 1)
+        self.assertEqual(SessionReducer.replay(runtime.store.load()), runtime.state)
+
     def test_keyboard_interrupt_after_terminal_append_preserves_original_finish(
         self,
     ) -> None:

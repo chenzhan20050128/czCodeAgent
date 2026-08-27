@@ -178,13 +178,13 @@ class AgentLoop:
 
         self._require_ready(user_input)
         turn_id = str(uuid.uuid4())
-        self._append(
-            "turn_started", {"turn_id": turn_id, "user_input": user_input}
-        )
         tool_steps = 0
         observed: _ObservedSample | None = None
 
         try:
+            self._append(
+                "turn_started", {"turn_id": turn_id, "user_input": user_input}
+            )
             while tool_steps < self.config.max_steps:
                 observed = self._sample_with_one_compaction(allow_tools=True)
                 if observed is None:
@@ -212,7 +212,16 @@ class AgentLoop:
                             tool_steps,
                             error="model returned an empty text response",
                         )
-                    self._accept_assistant(turn_id, sampled, include_calls=False)
+                    before_accept = self.state.last_seq
+                    try:
+                        self._accept_assistant(
+                            turn_id, sampled, include_calls=False
+                        )
+                    except KeyboardInterrupt:
+                        if self._accepted_assistant_event(
+                            before_accept + 1, turn_id
+                        ) is None:
+                            raise
                     observed = None
                     return self._finish(
                         turn_id,
@@ -229,9 +238,27 @@ class AgentLoop:
                             tool_steps,
                             error="model returned an invalid tool batch",
                         )
-                    accepted = self._accept_assistant(
-                        turn_id, sampled, include_calls=True
-                    )
+                    before_accept = self.state.last_seq
+                    try:
+                        accepted = self._accept_assistant(
+                            turn_id, sampled, include_calls=True
+                        )
+                    except KeyboardInterrupt:
+                        accepted_event = self._accepted_assistant_event(
+                            before_accept + 1, turn_id
+                        )
+                        if accepted_event is None:
+                            raise
+                        observed = None
+                        tool_steps += 1
+                        accepted = self._accepted_calls(accepted_event, sampled)
+                        self._close_calls(accepted)
+                        return self._finish(
+                            turn_id,
+                            TurnStatus.INTERRUPTED,
+                            tool_steps,
+                            error="turn interrupted by user",
+                        )
                     observed = None
                     tool_steps += 1
                     interrupted = self._execute_batch(accepted)
@@ -262,6 +289,11 @@ class AgentLoop:
         except KeyboardInterrupt:
             if observed is not None:
                 observed.discard()
+            persisted = self._persisted_turn_result(turn_id, tool_steps)
+            if persisted is not None:
+                return persisted
+            if self.state.active_turn_id != turn_id:
+                raise
             self._close_open_calls_after_interrupt(turn_id)
             return self._finish(
                 turn_id,
@@ -363,12 +395,30 @@ class AgentLoop:
                 "tool_calls": call_documents,
             },
         )
+        return self._accepted_calls(event, sampled) if include_calls else ()
+
+    def _accepted_calls(
+        self, event: Event, sampled: SamplingResult
+    ) -> tuple[AcceptedToolCall, ...]:
         return tuple(
             AcceptedToolCall.from_tool_call(
                 self.state.tool_calls[f"{event.seq}:{call.id}"]
             )
             for call in sampled.tool_calls
-        ) if include_calls else ()
+        )
+
+    def _accepted_assistant_event(
+        self, expected_seq: int, turn_id: str
+    ) -> Event | None:
+        if not self.state.assistant_events:
+            return None
+        event = self.state.assistant_events[-1]
+        if (
+            event.seq != expected_seq
+            or event.payload.get("turn_id") != turn_id
+        ):
+            return None
+        return event
 
     def _execute_batch(self, calls: Sequence[AcceptedToolCall]) -> bool:
         limit = self.config.max_tool_calls_per_batch
