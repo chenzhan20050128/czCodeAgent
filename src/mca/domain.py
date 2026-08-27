@@ -96,6 +96,7 @@ _UNDO_SUCCESS_STATUSES = frozenset(
 _UNDO_PREFLIGHT_ABORT_STATUSES = frozenset(
     {"conflict", "ineligible", "not_modified"}
 )
+_RECOVERY_INTENT_ACTIONS = frozenset({"recover_interrupted", "abandon"})
 _TOOL_FINISH_TRANSITIONS = {
     ToolStatus.REQUESTED: frozenset(
         {
@@ -379,6 +380,7 @@ class SessionState:
     )
     undo_results: dict[str, Event] = field(default_factory=dict)
     latest_checkpoint: Event | None = None
+    pending_recovery_intent: Event | None = None
     assistant_events: list[Event] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     recovery_blocked: bool = False
@@ -499,6 +501,9 @@ class SessionReducer:
     @staticmethod
     def _apply_assistant_accepted(state: SessionState, event: Event) -> None:
         turn_id = SessionReducer._require_active_turn(state)
+        SessionReducer._reject_pending_recovery_action(
+            state, "accept an assistant response"
+        )
         if state.recovery_blocked:
             raise DomainError(
                 "cannot accept an assistant response while recovery is blocked"
@@ -583,6 +588,9 @@ class SessionReducer:
 
     @staticmethod
     def _apply_approval_decided(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(
+            state, "record an approval decision"
+        )
         call = SessionReducer._call_for_active_turn(state, event.payload)
         if call.is_terminal or call.status is ToolStatus.STARTED:
             raise DomainError("approval decision is too late for this call")
@@ -605,6 +613,9 @@ class SessionReducer:
 
     @staticmethod
     def _apply_tool_started(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(
+            state, "start a tool call"
+        )
         call = SessionReducer._call_for_active_turn(state, event.payload)
         if call.status is not ToolStatus.REQUESTED:
             raise DomainError("only a requested tool call can start")
@@ -620,6 +631,14 @@ class SessionReducer:
         if call.is_terminal:
             raise DomainError("tool call already has a terminal result")
         status = _tool_status(event.payload.get("status"))
+        intent = state.pending_recovery_intent
+        if intent is not None and (
+            intent.payload["action"] != "recover_interrupted"
+            or status is not ToolStatus.NOT_EXECUTED
+        ):
+            raise DomainError(
+                "tool result does not match the pending recovery intent"
+            )
         if status not in _TERMINAL_TOOL_STATUSES:
             raise DomainError("tool_finished requires a terminal status")
         allowed = _TOOL_FINISH_TRANSITIONS.get(call.status, frozenset())
@@ -690,11 +709,74 @@ class SessionReducer:
         SessionReducer._refresh_recovery_block(state)
 
     @staticmethod
+    def _apply_turn_recovery_intent(
+        state: SessionState, event: Event
+    ) -> None:
+        expected_fields = {"turn_id", "action", "reason"}
+        fields = set(event.payload)
+        if fields != expected_fields:
+            missing = sorted(expected_fields - fields)
+            extra = sorted(fields - expected_fields)
+            raise DomainError(
+                "turn_recovery_intent payload fields mismatch "
+                f"(missing={missing}, extra={extra})"
+            )
+        turn_id = SessionReducer._require_active_turn(state)
+        event_turn_id = _payload_uuid(event.payload, "turn_id")
+        if event_turn_id != turn_id:
+            raise DomainError(
+                "turn_recovery_intent belongs to another turn"
+            )
+        action = _payload_string(event.payload, "action")
+        if action not in _RECOVERY_INTENT_ACTIONS:
+            raise DomainError(f"unknown recovery intent action: {action!r}")
+        reason = event.payload.get("reason")
+        if not isinstance(reason, str):
+            raise DomainError("recovery intent reason must be a string")
+        if state.pending_recovery_intent is not None:
+            raise DomainError("a recovery intent is already pending")
+
+        turn_calls = [
+            call
+            for call in state.tool_calls.values()
+            if call.turn_id == turn_id
+        ]
+        if action == "recover_interrupted":
+            if not any(
+                call.status is ToolStatus.REQUESTED for call in turn_calls
+            ):
+                raise DomainError(
+                    "recover_interrupted requires a requested tool call"
+                )
+            if any(
+                call.status
+                in {ToolStatus.STARTED, ToolStatus.OUTCOME_UNKNOWN}
+                for call in turn_calls
+            ):
+                raise DomainError(
+                    "recover_interrupted cannot cover an uncertain tool call"
+                )
+        elif not any(
+            call.status is ToolStatus.OUTCOME_UNKNOWN for call in turn_calls
+        ):
+            raise DomainError("abandon requires an unknown tool outcome")
+
+        state.pending_recovery_intent = event
+
+    @staticmethod
     def _apply_tool_reconciled(state: SessionState, event: Event) -> None:
         call = SessionReducer._call_for_active_turn(state, event.payload)
         if call.status is not ToolStatus.OUTCOME_UNKNOWN:
             raise DomainError("only an unknown tool outcome can be reconciled")
         raw_outcome = event.payload.get("outcome")
+        intent = state.pending_recovery_intent
+        if intent is not None and (
+            intent.payload["action"] != "abandon"
+            or raw_outcome != "abandoned"
+        ):
+            raise DomainError(
+                "tool reconciliation does not match the pending recovery intent"
+            )
         statuses = {
             "succeeded": ToolStatus.USER_CONFIRMED_SUCCESS,
             "failed": ToolStatus.USER_CONFIRMED_FAILURE,
@@ -729,6 +811,17 @@ class SessionReducer:
         if event_turn_id != turn_id:
             raise DomainError("turn_finished belongs to another turn")
         status = _turn_status(event.payload.get("status"))
+        intent = state.pending_recovery_intent
+        if intent is not None:
+            expected_status = (
+                TurnStatus.INTERRUPTED
+                if intent.payload["action"] == "recover_interrupted"
+                else TurnStatus.ABANDONED
+            )
+            if status is not expected_status:
+                raise DomainError(
+                    "turn status does not match the pending recovery intent"
+                )
         unfinished = [
             call.call_key
             for call in state.tool_calls.values()
@@ -739,6 +832,7 @@ class SessionReducer:
         state.turns[turn_id] = status
         state.active_turn_id = None
         state.recovery_blocked = False
+        state.pending_recovery_intent = None
 
     @staticmethod
     def _apply_compaction_checkpoint(state: SessionState, event: Event) -> None:
@@ -774,6 +868,9 @@ class SessionReducer:
 
     @staticmethod
     def _apply_file_snapshot(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(
+            state, "record a file snapshot"
+        )
         active_turn_id = SessionReducer._require_active_turn(state)
         turn_id = _payload_uuid(event.payload, "turn_id")
         if turn_id != active_turn_id:
@@ -829,6 +926,9 @@ class SessionReducer:
 
     @staticmethod
     def _apply_sampling_failed(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(
+            state, "record a sampling failure"
+        )
         SessionReducer._require_active_turn(state)
 
     @staticmethod
@@ -877,6 +977,15 @@ class SessionReducer:
         if state.active_turn_id is None:
             raise DomainError("event requires an active turn")
         return state.active_turn_id
+
+    @staticmethod
+    def _reject_pending_recovery_action(
+        state: SessionState, action: str
+    ) -> None:
+        if state.pending_recovery_intent is not None:
+            raise DomainError(
+                f"cannot {action} while a recovery intent is pending"
+            )
 
     @staticmethod
     def _call_for_active_turn(

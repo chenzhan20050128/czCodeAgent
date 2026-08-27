@@ -411,6 +411,59 @@ class PromptProjectionTests(ProjectionTestCase):
         with self.assertRaisesRegex(ProjectionBlockedError, "recovery"):
             self.project()
 
+    def test_pending_recovery_intent_blocks_until_matching_turn_finish(
+        self,
+    ) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool_call("call-1", "bash", "{}")]},
+        )
+        self.apply(
+            "turn_recovery_intent",
+            {
+                "turn_id": self.turn_id,
+                "action": "recover_interrupted",
+                "reason": "resume found an unstarted call",
+            },
+        )
+        self.apply(
+            "tool_finished",
+            {
+                "call_key": "3:call-1",
+                "call_id": "call-1",
+                "status": "not_executed",
+                "result": "tool call was not started before recovery",
+                "recovery_blocked": False,
+            },
+        )
+
+        with self.assertRaisesRegex(
+            ProjectionBlockedError, "pending recovery intent"
+        ):
+            self.project()
+
+        self.apply(
+            "turn_finished",
+            {
+                "turn_id": self.turn_id,
+                "status": "interrupted",
+                "error": "resume found an unstarted call",
+            },
+        )
+        messages = self.project()
+        validate_conversation(messages)
+        self.assertEqual(
+            [message for message in messages if message["role"] == "tool"],
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": "tool call was not started before recovery",
+                }
+            ],
+        )
+
     def test_reconciled_unknown_projects_one_explicit_recovery_result(self) -> None:
         self.start_turn()
         self.apply(

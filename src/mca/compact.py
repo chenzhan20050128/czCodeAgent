@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
@@ -44,9 +45,23 @@ SUMMARY_PROMPT = (
     "names verbatim: "
     + ", ".join(f"## {section}" for section in SUMMARY_SECTIONS)
     + ". Preserve concrete paths, commands, observed results, remaining work, "
-    "and uncertainty. Do not invent facts or tool results."
+    "and uncertainty. Never copy credentials, tokens, or secrets into the "
+    "summary; replace each such value with [REDACTED]. Do not invent facts "
+    "or tool results."
 )
 _SHORTENING_MARKER = "[tool output shortened for compaction]"
+_REDACTION_MARKER = "[REDACTED]"
+_KNOWN_SECRET_KEYS = (
+    "MCA_API_KEY",
+    "DEEPSEEK_API_KEY",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "MISTRAL_API_KEY",
+    "GROQ_API_KEY",
+)
 
 
 class CompactionError(RuntimeError):
@@ -91,6 +106,35 @@ def _plain_messages(
             "conversation must be safely JSON serializable"
         ) from None
     return copied
+
+
+def _known_secret_values() -> tuple[str, ...]:
+    values = {os.environ[key] for key in _KNOWN_SECRET_KEYS if os.environ.get(key)}
+    return tuple(sorted(values, key=lambda value: (-len(value), value)))
+
+
+def _redact_json_strings(value: Any, secret_values: Sequence[str]) -> Any:
+    if isinstance(value, str):
+        for secret in secret_values:
+            value = value.replace(secret, _REDACTION_MARKER)
+        return value
+    if isinstance(value, Mapping):
+        return {
+            key: _redact_json_strings(item, secret_values)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_json_strings(item, secret_values) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_json_strings(item, secret_values) for item in value)
+    return value
+
+
+def _redacted_messages(
+    messages: Sequence[Mapping[str, Any]], secret_values: Sequence[str]
+) -> list[dict[str, Any]]:
+    copied = _plain_messages(messages)
+    return _redact_json_strings(copied, secret_values)
 
 
 def atomic_groups(
@@ -171,6 +215,7 @@ def prepare_compaction(
     tail_group_count: int = DEFAULT_TAIL_GROUP_COUNT,
     max_summary_input_chars: int = DEFAULT_MAX_SUMMARY_INPUT_CHARS,
     max_old_tool_chars: int = DEFAULT_MAX_OLD_TOOL_CHARS,
+    summarized_prefix_message_count: int = 0,
 ) -> CompactionDraft:
     """Prepare a deterministic summary request and complete replacement tail."""
 
@@ -183,8 +228,16 @@ def prepare_compaction(
     ):
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    if (
+        type(summarized_prefix_message_count) is not int
+        or summarized_prefix_message_count < 0
+    ):
+        raise ValueError(
+            "summarized_prefix_message_count must be a non-negative integer"
+        )
 
-    copied = _plain_messages(messages)
+    secret_values = _known_secret_values()
+    copied = _redacted_messages(messages, secret_values)
     system_messages = [
         message for message in copied if message.get("role") == "system"
     ]
@@ -211,11 +264,27 @@ def prepare_compaction(
     )
     validate_conversation(replacement)
 
+    remaining_prefix_messages = summarized_prefix_message_count
+    summary_groups: list[AtomicGroup] = []
+    for group in groups:
+        if remaining_prefix_messages:
+            if len(group.messages) > remaining_prefix_messages:
+                raise CompactionError(
+                    "summarized prefix must end at an atomic group boundary"
+                )
+            remaining_prefix_messages -= len(group.messages)
+            continue
+        summary_groups.append(group)
+    if remaining_prefix_messages:
+        raise CompactionError(
+            "summarized prefix exceeds the projected conversation"
+        )
+
     summary_conversation = [
         *system_messages,
         *(
             message
-            for group in groups
+            for group in summary_groups
             for message in group.messages
         ),
     ]
@@ -231,7 +300,7 @@ def prepare_compaction(
             group.index for group in groups if group.index not in retained_indexes
         }
         shortened_any = False
-        for group in groups:
+        for group in summary_groups:
             if group.index not in old_group_indexes:
                 continue
             for message in group.messages:
@@ -256,9 +325,12 @@ def prepare_compaction(
                 "summary input remains too large after shortening old tool outputs"
             )
 
+    summary_messages = _redacted_messages(
+        _summary_request_messages(summary_conversation), secret_values
+    )
     return CompactionDraft(
         through_seq=through_seq,
-        summary_messages=_summary_request_messages(summary_conversation),
+        summary_messages=tuple(summary_messages),
         replacement_conversation=replacement,
     )
 
@@ -272,7 +344,11 @@ def finalize_checkpoint(
         raise TypeError("draft must be a CompactionDraft")
     if not isinstance(summary, str) or not summary.strip():
         raise CompactionError("compaction summary must be non-empty text")
-    replacement = _plain_messages(draft.replacement_conversation)
+    secret_values = _known_secret_values()
+    summary = _redact_json_strings(summary, secret_values)
+    replacement = _redacted_messages(
+        draft.replacement_conversation, secret_values
+    )
     if any(message.get("role") == "system" for message in replacement):
         raise CompactionError("replacement conversation must not contain system")
     validate_conversation(replacement)
@@ -321,12 +397,22 @@ class SessionCompactor:
             messages = PromptProjector.project(
                 events, self.state, current_environment
             )
+            summarized_prefix_message_count = 0
+            if self.state.latest_checkpoint is not None:
+                summarized_prefix_message_count = len(
+                    self.state.latest_checkpoint.payload[
+                        "replacement_conversation"
+                    ]
+                )
             draft = prepare_compaction(
                 messages,
                 through_seq=self.state.last_seq,
                 tail_group_count=self.tail_group_count,
                 max_summary_input_chars=self.max_summary_input_chars,
                 max_old_tool_chars=self.max_old_tool_chars,
+                summarized_prefix_message_count=(
+                    summarized_prefix_message_count
+                ),
             )
         except (DomainError, ProjectionError) as error:
             raise CompactionError(

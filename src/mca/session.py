@@ -79,12 +79,17 @@ def _append_candidates(
     for candidate in candidates:
         try:
             durable = store.append(candidate)
-        except Exception as error:
+        except BaseException as error:
+            store.close()
+            if not isinstance(error, Exception):
+                raise
             raise error_type("recovery event append failed") from error
         try:
             SessionReducer.apply(state, durable)
-        except Exception as error:
+        except BaseException as error:
             store.close()
+            if not isinstance(error, Exception):
+                raise
             raise error_type(
                 "durable recovery event could not be applied"
             ) from error
@@ -110,25 +115,124 @@ def _finish_candidate(
     )
 
 
+def _intent_candidate(
+    state: SessionState, *, action: str, reason: str
+) -> Event:
+    turn_id = state.active_turn_id
+    if turn_id is None or state.session_id is None:
+        raise DomainError("cannot recover a session without an active turn")
+    return Event.create(
+        seq=state.last_seq + 1,
+        session_id=state.session_id,
+        event_type="turn_recovery_intent",
+        payload={
+            "turn_id": turn_id,
+            "action": action,
+            "reason": reason,
+        },
+    )
+
+
+def _abandon_candidates(state: SessionState, *, note: str) -> list[Event]:
+    if state.session_id is None:
+        raise DomainError("cannot reconcile before session creation")
+    candidates: list[Event] = []
+    next_seq = state.last_seq + 1
+    for call in state.tool_calls.values():
+        if (
+            call.turn_id == state.active_turn_id
+            and call.status is ToolStatus.OUTCOME_UNKNOWN
+        ):
+            candidates.append(
+                Event.create(
+                    seq=next_seq,
+                    session_id=state.session_id,
+                    event_type="tool_reconciled",
+                    payload={
+                        "call_key": call.call_key,
+                        "call_id": call.provider_call_id,
+                        "outcome": "abandoned",
+                        "note": note,
+                    },
+                )
+            )
+            next_seq += 1
+    return candidates
+
+
+def _complete_recovery_intent(
+    store: RolloutStore,
+    state: SessionState,
+    *,
+    error_type: type[ResumeError] | type[ReconciliationError],
+) -> list[Event]:
+    intent = state.pending_recovery_intent
+    if intent is None:
+        raise DomainError("no recovery intent is pending")
+    action = intent.payload["action"]
+    reason = intent.payload["reason"]
+    if action == "recover_interrupted":
+        candidates = plan_recovery_events(state)
+        finish_status = TurnStatus.INTERRUPTED
+    else:
+        candidates = _abandon_candidates(state, note=reason)
+        finish_status = TurnStatus.ABANDONED
+
+    durable: list[Event] = []
+    if candidates:
+        durable.extend(
+            _append_candidates(
+                store, state, candidates, error_type=error_type
+            )
+        )
+    if state.recovery_blocked:
+        return durable
+    finish = _finish_candidate(
+        state, status=finish_status, error=reason
+    )
+    durable.extend(
+        _append_candidates(store, state, [finish], error_type=error_type)
+    )
+    return durable
+
+
 def _recover_open_calls(store: RolloutStore, state: SessionState) -> None:
-    had_requested = any(
+    if state.pending_recovery_intent is not None:
+        _complete_recovery_intent(
+            store, state, error_type=ResumeError
+        )
+        return
+
+    has_requested = any(
         call.status is ToolStatus.REQUESTED for call in state.tool_calls.values()
     )
+    has_started = any(
+        call.status is ToolStatus.STARTED for call in state.tool_calls.values()
+    )
+    has_unknown = any(
+        call.status is ToolStatus.OUTCOME_UNKNOWN
+        for call in state.tool_calls.values()
+    )
+    if (
+        has_requested
+        and not has_started
+        and not has_unknown
+        and not state.recovery_blocked
+    ):
+        intent = _intent_candidate(
+            state,
+            action="recover_interrupted",
+            reason="turn interrupted before requested tools were started",
+        )
+        _append_candidates(store, state, [intent], error_type=ResumeError)
+        _complete_recovery_intent(
+            store, state, error_type=ResumeError
+        )
+        return
+
     candidates = plan_recovery_events(state)
     if candidates:
         _append_candidates(store, state, candidates, error_type=ResumeError)
-
-    if (
-        had_requested
-        and state.active_turn_id is not None
-        and not state.recovery_blocked
-    ):
-        finish = _finish_candidate(
-            state,
-            status=TurnStatus.INTERRUPTED,
-            error="turn interrupted before requested tools were started",
-        )
-        _append_candidates(store, state, [finish], error_type=ResumeError)
 
 
 def resume_session(
@@ -152,6 +256,10 @@ def resume_session(
         if state.cwd is None:
             raise ResumeError("session has no recorded cwd")
         recorded_workspace = _canonical_workspace(state.cwd, label="recorded")
+        if str(recorded_workspace) != state.cwd:
+            raise ResumeError(
+                "recorded cwd must be a canonical absolute path"
+            )
         if recorded_workspace != requested_workspace:
             raise ResumeError("requested cwd does not match session cwd")
         _recover_open_calls(store, state)
@@ -166,6 +274,10 @@ def continuable_turn_id(state: SessionState) -> str | None:
 
     if not isinstance(state, SessionState):
         raise TypeError("state must be a SessionState")
+    if state.pending_recovery_intent is not None:
+        raise ReconciliationError(
+            "session has a pending recovery intent"
+        )
     if state.recovery_blocked:
         raise ReconciliationError(
             "session recovery is blocked by an unknown tool outcome"
@@ -210,46 +322,39 @@ def reconcile_tool(
         raise ReconciliationError("unknown tool call is not in the active turn")
     assert state.session_id is not None
 
-    unknown_calls = [
-        target,
-        *(
-            call
-            for call in state.tool_calls.values()
-            if call.call_key != target.call_key
-            and call.turn_id == target.turn_id
-            and call.status is ToolStatus.OUTCOME_UNKNOWN
-        ),
-    ]
-    selected = unknown_calls if outcome == "abandoned" else [target]
-    candidates: list[Event] = []
-    next_seq = state.last_seq + 1
-    for call in selected:
-        candidates.append(
-            Event.create(
-                seq=next_seq,
-                session_id=state.session_id,
-                event_type="tool_reconciled",
-                payload={
-                    "call_key": call.call_key,
-                    "call_id": call.provider_call_id,
-                    "outcome": outcome,
-                    "note": note,
-                },
-            )
-        )
-        next_seq += 1
+    if state.pending_recovery_intent is not None:
+        raise ReconciliationError("a recovery intent is already pending")
 
     if outcome == "abandoned":
-        working = state
-        for candidate in candidates:
-            working = reduce_event(working, candidate)
-        candidates.append(
-            _finish_candidate(
-                working,
-                status=TurnStatus.ABANDONED,
-                error="turn abandoned during recovery reconciliation",
-            )
+        intent = _intent_candidate(
+            state, action="abandon", reason=note
         )
+        _append_candidates(
+            store, state, [intent], error_type=ReconciliationError
+        )
+        durable = _complete_recovery_intent(
+            store, state, error_type=ReconciliationError
+        )
+        if not durable:
+            raise ReconciliationError(
+                "abandon recovery produced no reconciliation facts"
+            )
+        return durable[0]
+
+    candidates: list[Event] = []
+    candidates.append(
+        Event.create(
+            seq=state.last_seq + 1,
+            session_id=state.session_id,
+            event_type="tool_reconciled",
+            payload={
+                "call_key": target.call_key,
+                "call_id": target.provider_call_id,
+                "outcome": outcome,
+                "note": note,
+            },
+        )
+    )
 
     durable = _append_candidates(
         store, state, candidates, error_type=ReconciliationError

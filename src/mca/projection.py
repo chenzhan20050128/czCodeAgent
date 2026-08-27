@@ -488,6 +488,10 @@ class PromptProjector:
         if replayed != state:
             raise ProjectionError("state does not match the supplied rollout facts")
 
+        if state.pending_recovery_intent is not None:
+            raise ProjectionBlockedError(
+                "session has a pending recovery intent"
+            )
         if state.recovery_blocked or any(
             call.status is ToolStatus.OUTCOME_UNKNOWN
             for call in state.tool_calls.values()

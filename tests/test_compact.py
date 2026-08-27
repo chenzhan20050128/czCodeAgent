@@ -297,6 +297,154 @@ class SessionCompactorTests(unittest.TestCase):
         )
         validate_conversation(projected)
 
+    def test_known_environment_secrets_are_redacted_end_to_end(self) -> None:
+        secret_keys = (
+            "MCA_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "MISTRAL_API_KEY",
+            "GROQ_API_KEY",
+        )
+        secrets = {
+            key: f"known-secret-{index}-{key.lower()}"
+            for index, key in enumerate(secret_keys)
+        }
+        secret_values = tuple(secrets.values())
+        assistant_secrets = " | ".join(secret_values[:4])
+        tool_secrets = " | ".join(secret_values[4:])
+        summary_secrets = " | ".join(secret_values)
+        self.append(
+            "assistant_accepted",
+            {
+                "turn_id": self.turn_id,
+                "content": f"assistant observed {assistant_secrets}",
+                "tool_calls": [tool_call("secret-tool")],
+            },
+        )
+        self.append(
+            "tool_started",
+            {"call_id": "secret-tool"},
+        )
+        self.append(
+            "tool_finished",
+            {
+                "call_id": "secret-tool",
+                "status": "succeeded",
+                "result": f"tool returned {tool_secrets}",
+            },
+        )
+        model = RecordingSummaryModel(
+            SamplingResult(
+                SamplingOutcome.COMPLETE_TEXT,
+                content=f"## Goal\nContinue without {summary_secrets}",
+            )
+        )
+
+        with patch.dict("os.environ", secrets, clear=True):
+            self.assertTrue(self.make_compactor(model).compact())
+
+        request_text = json.dumps(model.requests[0][0], ensure_ascii=False)
+        checkpoint = self.store.load()[-1]
+        checkpoint_text = json.dumps(checkpoint.to_dict(), ensure_ascii=False)
+        projection_text = json.dumps(
+            PromptProjector.project(
+                self.store.load(), self.state, self.environment
+            ),
+            ensure_ascii=False,
+        )
+        for rendered in (request_text, checkpoint_text, projection_text):
+            with self.subTest(rendered=rendered[:80]):
+                self.assertIn("[REDACTED]", rendered)
+                for secret in secret_values:
+                    self.assertNotIn(secret, rendered)
+        prompt = model.requests[0][0][0]["content"]
+        self.assertIn("credentials", prompt)
+        self.assertIn("tokens", prompt)
+        self.assertIn("secrets", prompt)
+        self.assertIn("[REDACTED]", prompt)
+
+    def test_second_compaction_keeps_one_baseline_and_only_latest_summary(
+        self,
+    ) -> None:
+        self.accept_plain_assistant()
+        first_model = RecordingSummaryModel(
+            SamplingResult(
+                SamplingOutcome.COMPLETE_TEXT, content="first compacted summary"
+            )
+        )
+        self.assertTrue(self.make_compactor(first_model).compact())
+        self.append(
+            "turn_finished",
+            {"turn_id": self.turn_id, "status": "completed"},
+        )
+        current_turn_id = str(uuid.uuid4())
+        self.append(
+            "turn_started",
+            {
+                "turn_id": current_turn_id,
+                "user_input": "continue with current tail",
+            },
+        )
+        self.append(
+            "assistant_accepted",
+            {
+                "turn_id": current_turn_id,
+                "content": "current tail answer",
+                "tool_calls": [],
+            },
+        )
+        second_model = RecordingSummaryModel(
+            SamplingResult(
+                SamplingOutcome.COMPLETE_TEXT, content="latest compacted summary"
+            )
+        )
+
+        self.assertTrue(self.make_compactor(second_model).compact())
+
+        second_request = json.dumps(
+            second_model.requests[0][0], ensure_ascii=False
+        )
+        self.assertEqual(second_request.count("first compacted summary"), 1)
+        self.assertNotIn("inspect the project", second_request)
+        self.assertEqual(second_request.count("continue with current tail"), 1)
+        self.assertEqual(second_request.count("current tail answer"), 1)
+        projected = PromptProjector.project(
+            self.store.load(), self.state, self.environment
+        )
+        self.assertEqual(
+            sum(message["role"] == "system" for message in projected), 1
+        )
+        self.assertEqual(
+            projected[0]["content"].count("latest compacted summary"), 1
+        )
+        self.assertNotIn("first compacted summary", projected[0]["content"])
+        self.assertEqual(
+            sum(
+                message.get("content") == "inspect the project"
+                for message in projected
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                message.get("content") == "continue with current tail"
+                for message in projected
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                message.get("content") == "current tail answer"
+                for message in projected
+            ),
+            1,
+        )
+        validate_conversation(projected)
+
     def test_invalid_or_empty_summary_does_not_append_a_checkpoint(self) -> None:
         invalid_results = (
             SamplingResult(SamplingOutcome.COMPLETE_TEXT, content=""),
