@@ -326,6 +326,46 @@ class RolloutStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.append(wrong_sequence)
 
+    def test_partial_write_failure_poison_closes_the_store(self) -> None:
+        store = RolloutStore.create(self.sessions_root, self.session_id)
+        self.addCleanup(store.close)
+        real_write = os.write
+        write_count = 0
+
+        def partial_then_fail(fd: int, data: bytes) -> int:
+            nonlocal write_count
+            write_count += 1
+            if write_count == 1:
+                return real_write(fd, data[:8])
+            raise OSError("simulated partial write failure")
+
+        with patch("mca.store.os.write", side_effect=partial_then_fail):
+            with self.assertRaisesRegex(OSError, "partial write failure"):
+                store.append("example", {"number": 1})
+
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            store.load()
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            store.append("example", {"number": 1})
+
+        with RolloutStore.open(self.sessions_root, self.session_id) as reopened:
+            self.assertEqual(reopened.load(), [])
+
+    def test_fsync_failure_poison_closes_the_store(self) -> None:
+        store = RolloutStore.create(self.sessions_root, self.session_id)
+        self.addCleanup(store.close)
+
+        with patch(
+            "mca.store.os.fsync", side_effect=OSError("simulated fsync failure")
+        ):
+            with self.assertRaisesRegex(OSError, "fsync failure"):
+                store.append("example", {"number": 1})
+
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            store.load()
+        with self.assertRaisesRegex(RuntimeError, "poisoned"):
+            store.append("example", {"number": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

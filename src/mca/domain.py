@@ -57,6 +57,7 @@ class ToolStatus(str, Enum):
     INTERRUPTED = "interrupted"
     CANCELLED = "cancelled"
     NOT_EXECUTED = "not_executed"
+    BATCH_LIMIT_EXCEEDED = "batch_limit_exceeded"
     CONFLICT = "conflict"
     OUTCOME_UNKNOWN = "outcome_unknown"
     USER_CONFIRMED_SUCCESS = "user_confirmed_success"
@@ -86,6 +87,29 @@ _TERMINAL_TURN_STATUSES = frozenset(
     for status in TurnStatus
     if status not in {TurnStatus.ACTIVE, TurnStatus.RECOVERY_BLOCKED}
 )
+_TOOL_FINISH_TRANSITIONS = {
+    ToolStatus.REQUESTED: frozenset(
+        {
+            ToolStatus.DENIED,
+            ToolStatus.INVALID_ARGUMENTS,
+            ToolStatus.UNKNOWN_TOOL,
+            ToolStatus.NOT_EXECUTED,
+            ToolStatus.BATCH_LIMIT_EXCEEDED,
+            ToolStatus.CANCELLED,
+        }
+    ),
+    ToolStatus.STARTED: frozenset(
+        {
+            ToolStatus.SUCCEEDED,
+            ToolStatus.FAILED,
+            ToolStatus.TIMED_OUT,
+            ToolStatus.INTERRUPTED,
+            ToolStatus.CONFLICT,
+            ToolStatus.CANCELLED,
+            ToolStatus.OUTCOME_UNKNOWN,
+        }
+    ),
+}
 
 
 def _canonical_uuid(value: object, *, field_name: str) -> str:
@@ -233,7 +257,8 @@ class Event:
 class ToolCall:
     """Immutable derived view of a tool call's current lifecycle state."""
 
-    call_id: str
+    call_key: str
+    provider_call_id: str
     turn_id: str
     name: str
     arguments: str
@@ -250,8 +275,10 @@ class ToolCall:
     finished_seq: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.call_id, str) or not self.call_id:
-            raise DomainError("call_id must be a non-empty string")
+        if not isinstance(self.call_key, str) or not self.call_key:
+            raise DomainError("call_key must be a non-empty string")
+        if not isinstance(self.provider_call_id, str) or not self.provider_call_id:
+            raise DomainError("provider_call_id must be a non-empty string")
         _canonical_uuid(self.turn_id, field_name="turn_id")
         if not isinstance(self.name, str) or not self.name:
             raise DomainError("tool name must be a non-empty string")
@@ -259,6 +286,12 @@ class ToolCall:
             raise DomainError("tool arguments must be a JSON string")
         if not isinstance(self.status, ToolStatus):
             raise DomainError("status must be a ToolStatus")
+
+    @property
+    def call_id(self) -> str:
+        """Compatibility alias for the provider-visible call ID."""
+
+        return self.provider_call_id
 
     @property
     def is_terminal(self) -> bool:
@@ -447,7 +480,7 @@ class SessionReducer:
             call_id = document.get("id", document.get("call_id"))
             if not isinstance(call_id, str) or not call_id:
                 raise DomainError("tool call id must be a non-empty string")
-            if call_id in seen or call_id in state.tool_calls:
+            if call_id in seen:
                 raise DomainError(f"duplicate tool call id: {call_id}")
             seen.add(call_id)
 
@@ -477,7 +510,8 @@ class SessionReducer:
                     raise DomainError("tool arguments must be JSON-compatible") from None
             pending.append(
                 ToolCall(
-                    call_id=call_id,
+                    call_key=f"{event.seq}:{call_id}",
+                    provider_call_id=call_id,
                     turn_id=turn_id,
                     name=name,
                     arguments=arguments,
@@ -489,7 +523,9 @@ class SessionReducer:
         if content is not None and not isinstance(content, str):
             raise DomainError("assistant content must be a string or null")
         for call in pending:
-            state.tool_calls[call.call_id] = call
+            if call.call_key in state.tool_calls:
+                raise DomainError(f"duplicate internal tool call key: {call.call_key}")
+            state.tool_calls[call.call_key] = call
         state.assistant_events.append(event)
 
     @staticmethod
@@ -510,7 +546,7 @@ class SessionReducer:
         scope = event.payload.get("scope")
         if scope is not None and (not isinstance(scope, str) or not scope):
             raise DomainError("scope must be a non-empty string or null")
-        state.tool_calls[call.call_id] = replace(
+        state.tool_calls[call.call_key] = replace(
             call, approved=decision, approval_scope=scope
         )
 
@@ -521,7 +557,7 @@ class SessionReducer:
             raise DomainError("only a requested tool call can start")
         if call.approved is False:
             raise DomainError("a denied tool call cannot start")
-        state.tool_calls[call.call_id] = replace(
+        state.tool_calls[call.call_key] = replace(
             call, status=ToolStatus.STARTED, started_seq=event.seq
         )
 
@@ -533,19 +569,11 @@ class SessionReducer:
         status = _tool_status(event.payload.get("status"))
         if status not in _TERMINAL_TOOL_STATUSES:
             raise DomainError("tool_finished requires a terminal status")
-        if call.status is ToolStatus.REQUESTED and status not in {
-            ToolStatus.DENIED,
-            ToolStatus.INVALID_ARGUMENTS,
-            ToolStatus.UNKNOWN_TOOL,
-            ToolStatus.CANCELLED,
-            ToolStatus.NOT_EXECUTED,
-            ToolStatus.FAILED,
-        }:
+        allowed = _TOOL_FINISH_TRANSITIONS.get(call.status, frozenset())
+        if status not in allowed:
             raise DomainError(
-                f"requested tool call cannot finish as {status.value} without starting"
+                f"{call.status.value} tool call cannot finish as {status.value}"
             )
-        if status is ToolStatus.OUTCOME_UNKNOWN and call.status is not ToolStatus.STARTED:
-            raise DomainError("only a started call can have an unknown outcome")
 
         result = event.payload.get("result")
         if result is not None and not isinstance(result, str):
@@ -580,7 +608,7 @@ class SessionReducer:
                 raise DomainError("successful write has no file baseline")
             snapshot_update = (key, replace(snapshot, after_hash=after_hash))
 
-        state.tool_calls[call.call_id] = replace(
+        state.tool_calls[call.call_key] = replace(
             call,
             status=status,
             result=result,
@@ -613,7 +641,7 @@ class SessionReducer:
         note = event.payload.get("note", "")
         if not isinstance(note, str):
             raise DomainError("reconciliation note must be a string")
-        state.tool_calls[call.call_id] = replace(
+        state.tool_calls[call.call_key] = replace(
             call,
             status=statuses[raw_outcome],
             recovery_blocked=False,
@@ -634,7 +662,7 @@ class SessionReducer:
             raise DomainError("turn_finished belongs to another turn")
         status = _turn_status(event.payload.get("status"))
         unfinished = [
-            call.call_id
+            call.call_key
             for call in state.tool_calls.values()
             if call.turn_id == turn_id and not call.is_terminal
         ]
@@ -729,10 +757,34 @@ class SessionReducer:
         state: SessionState, payload: Mapping[str, Any]
     ) -> ToolCall:
         active_turn_id = SessionReducer._require_active_turn(state)
-        call_id = _payload_string(payload, "call_id")
-        call = state.tool_calls.get(call_id)
-        if call is None:
-            raise DomainError(f"unknown tool call: {call_id}")
+        call_key = payload.get("call_key")
+        if call_key is not None:
+            if not isinstance(call_key, str) or not call_key:
+                raise DomainError("call_key must be a non-empty string")
+            call = state.tool_calls.get(call_key)
+            if call is None:
+                raise DomainError(f"unknown tool call key: {call_key}")
+            provider_call_id = payload.get("call_id")
+            if (
+                provider_call_id is not None
+                and provider_call_id != call.provider_call_id
+            ):
+                raise DomainError("call_key and call_id identify different calls")
+        else:
+            provider_call_id = _payload_string(payload, "call_id")
+            matches = [
+                candidate
+                for candidate in state.tool_calls.values()
+                if candidate.turn_id == active_turn_id
+                and candidate.provider_call_id == provider_call_id
+            ]
+            if not matches:
+                raise DomainError(f"unknown tool call: {provider_call_id}")
+            if len(matches) != 1:
+                raise DomainError(
+                    f"ambiguous tool call id {provider_call_id!r}; call_key is required"
+                )
+            call = matches[0]
         if call.turn_id != active_turn_id:
             raise DomainError("tool call does not belong to the active turn")
         return call
@@ -786,7 +838,8 @@ def plan_recovery_events(state: SessionState) -> list[Event]:
         if call.status is ToolStatus.STARTED:
             status = ToolStatus.OUTCOME_UNKNOWN
             payload: dict[str, Any] = {
-                "call_id": call.call_id,
+                "call_key": call.call_key,
+                "call_id": call.provider_call_id,
                 "status": status.value,
                 "result": "execution began but no terminal result was recorded",
                 "recovery_blocked": True,
@@ -794,7 +847,8 @@ def plan_recovery_events(state: SessionState) -> list[Event]:
         elif call.status is ToolStatus.REQUESTED:
             status = ToolStatus.NOT_EXECUTED
             payload = {
-                "call_id": call.call_id,
+                "call_key": call.call_key,
+                "call_id": call.provider_call_id,
                 "status": status.value,
                 "result": "tool call was not started before recovery",
                 "recovery_blocked": False,
@@ -804,7 +858,7 @@ def plan_recovery_events(state: SessionState) -> list[Event]:
         event_id = str(
             uuid.uuid5(
                 namespace,
-                f"recovery:tool_finished:{next_seq}:{call.call_id}:{status.value}",
+                f"recovery:tool_finished:{next_seq}:{call.call_key}:{status.value}",
             )
         )
         planned.append(

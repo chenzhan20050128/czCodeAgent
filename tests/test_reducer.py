@@ -79,7 +79,8 @@ class ReducerTestCase(unittest.TestCase):
 class DomainValueTests(ReducerTestCase):
     def test_required_domain_values_are_enums_or_immutable_dataclasses(self) -> None:
         call = ToolCall(
-            call_id="call-1",
+            call_key="3:call-1",
+            provider_call_id="call-1",
             turn_id=self.turn_id,
             name="read_file",
             arguments="{}",
@@ -179,10 +180,118 @@ class SessionReducerTests(ReducerTestCase):
             },
         )
 
-        self.assertEqual(list(self.state.tool_calls), ["call-1", "call-2"])
-        self.assertEqual(self.state.tool_calls["call-1"].status, ToolStatus.REQUESTED)
-        self.assertEqual(self.state.tool_calls["call-2"].name, "grep")
-        self.assertEqual(self.state.tool_calls["call-2"].turn_id, self.turn_id)
+        self.assertEqual(list(self.state.tool_calls), ["3:call-1", "3:call-2"])
+        self.assertEqual(
+            self.state.tool_calls["3:call-1"].status, ToolStatus.REQUESTED
+        )
+        self.assertEqual(self.state.tool_calls["3:call-2"].name, "grep")
+        self.assertEqual(self.state.tool_calls["3:call-2"].turn_id, self.turn_id)
+
+    def test_provider_call_id_can_be_reused_by_a_later_assistant(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("provider-call", "read_file")]},
+        )
+        first = list(self.state.tool_calls.values())[0]
+        self.apply(
+            "tool_finished",
+            {
+                "call_key": first.call_key,
+                "call_id": "provider-call",
+                "status": "invalid_arguments",
+                "result": "bad arguments",
+            },
+        )
+
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("provider-call", "grep")]},
+        )
+        calls = list(self.state.tool_calls.values())
+        second = calls[1]
+        self.apply(
+            "tool_finished",
+            {
+                "call_key": second.call_key,
+                "call_id": "provider-call",
+                "status": "not_executed",
+                "result": "stopped",
+            },
+        )
+
+        replayed = SessionReducer.replay(self.state.events)
+        replayed_calls = list(replayed.tool_calls.values())
+        self.assertEqual(len(replayed_calls), 2)
+        self.assertNotEqual(replayed_calls[0].call_key, replayed_calls[1].call_key)
+        self.assertEqual(
+            [call.provider_call_id for call in replayed_calls],
+            ["provider-call", "provider-call"],
+        )
+        self.assertEqual(
+            replayed.tool_calls[first.call_key].status,
+            ToolStatus.INVALID_ARGUMENTS,
+        )
+        self.assertEqual(
+            replayed.tool_calls[second.call_key].status,
+            ToolStatus.NOT_EXECUTED,
+        )
+
+    def test_provider_call_id_can_be_reused_in_a_later_turn(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("provider-call", "read_file")]},
+        )
+        first = list(self.state.tool_calls.values())[0]
+        self.apply(
+            "tool_finished",
+            {
+                "call_key": first.call_key,
+                "status": "not_executed",
+                "result": "stopped",
+            },
+        )
+        self.apply(
+            "turn_finished",
+            {"turn_id": self.turn_id, "status": "completed"},
+        )
+
+        second_turn_id = str(uuid.uuid4())
+        self.apply(
+            "turn_started",
+            {"turn_id": second_turn_id, "user_input": "another task"},
+        )
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("provider-call", "grep")]},
+        )
+
+        replayed = SessionReducer.replay(self.state.events)
+        calls = list(replayed.tool_calls.values())
+        self.assertEqual(len(calls), 2)
+        self.assertNotEqual(calls[0].call_key, calls[1].call_key)
+        self.assertEqual(calls[0].turn_id, self.turn_id)
+        self.assertEqual(calls[1].turn_id, second_turn_id)
+        self.assertEqual(calls[1].provider_call_id, "provider-call")
+
+    def test_duplicate_provider_call_ids_in_one_assistant_are_rejected(self) -> None:
+        self.start_turn()
+        duplicate = self.event(
+            "assistant_accepted",
+            {
+                "tool_calls": [
+                    self.tool("duplicate", "read_file"),
+                    self.tool("duplicate", "grep"),
+                ]
+            },
+        )
+
+        with self.assertRaises(DomainError):
+            SessionReducer.apply(self.state, duplicate)
+
+        self.assertEqual(self.state.last_seq, 2)
+        self.assertEqual(self.state.tool_calls, {})
 
     def test_assistant_accepted_rejects_while_a_prior_call_is_unresolved(self) -> None:
         for prior_status in (ToolStatus.REQUESTED, ToolStatus.STARTED):
@@ -252,13 +361,13 @@ class SessionReducerTests(ReducerTestCase):
             "approval_decided",
             {"call_id": "call-1", "scope": "once", "approved": True},
         )
-        approved = self.state.tool_calls["call-1"]
+        approved = self.state.tool_calls["3:call-1"]
         self.assertIs(approved.approved, True)
         self.assertEqual(approved.approval_scope, "once")
 
         self.apply("tool_started", {"call_id": "call-1"})
         self.assertEqual(
-            self.state.tool_calls["call-1"].status, ToolStatus.STARTED
+            self.state.tool_calls["3:call-1"].status, ToolStatus.STARTED
         )
 
         self.apply(
@@ -271,7 +380,7 @@ class SessionReducerTests(ReducerTestCase):
                 "truncated": False,
             },
         )
-        finished = self.state.tool_calls["call-1"]
+        finished = self.state.tool_calls["3:call-1"]
         self.assertEqual(finished.status, ToolStatus.SUCCEEDED)
         self.assertEqual(finished.result, "wrote file")
         self.assertEqual(finished.exit_code, 0)
@@ -486,7 +595,7 @@ class SessionReducerTests(ReducerTestCase):
             },
         )
 
-        call = self.state.tool_calls["call-1"]
+        call = self.state.tool_calls["3:call-1"]
         self.assertEqual(call.status, ToolStatus.USER_CONFIRMED_SUCCESS)
         self.assertEqual(call.reconciliation_note, "verified the generated file")
         self.assertFalse(self.state.recovery_blocked)
@@ -554,20 +663,20 @@ class SessionReducerTests(ReducerTestCase):
             by_call["pending-call"].payload["status"], "not_executed"
         )
         self.assertEqual(
-            self.state.tool_calls["started-call"].status, ToolStatus.STARTED
+            self.state.tool_calls["3:started-call"].status, ToolStatus.STARTED
         )
         self.assertEqual(
-            self.state.tool_calls["pending-call"].status, ToolStatus.REQUESTED
+            self.state.tool_calls["3:pending-call"].status, ToolStatus.REQUESTED
         )
 
         for event in first_plan:
             SessionReducer.apply(self.state, event)
         self.assertEqual(
-            self.state.tool_calls["started-call"].status,
+            self.state.tool_calls["3:started-call"].status,
             ToolStatus.OUTCOME_UNKNOWN,
         )
         self.assertEqual(
-            self.state.tool_calls["pending-call"].status,
+            self.state.tool_calls["3:pending-call"].status,
             ToolStatus.NOT_EXECUTED,
         )
         self.assertTrue(self.state.recovery_blocked)
@@ -666,6 +775,87 @@ class SessionReducerTests(ReducerTestCase):
         )
         with self.assertRaises(DomainError):
             SessionReducer.apply(self.state, duplicate_finish)
+
+    def test_requested_call_transition_matrix(self) -> None:
+        allowed = {
+            "denied",
+            "invalid_arguments",
+            "unknown_tool",
+            "not_executed",
+            "batch_limit_exceeded",
+            "cancelled",
+        }
+        rejected = {
+            "succeeded",
+            "failed",
+            "timed_out",
+            "interrupted",
+            "conflict",
+            "outcome_unknown",
+        }
+
+        for status in sorted(allowed | rejected):
+            with self.subTest(status=status):
+                self.setUp()
+                self.start_turn()
+                self.apply(
+                    "assistant_accepted",
+                    {"tool_calls": [self.tool("call-1", "bash")]},
+                )
+                event = self.event(
+                    "tool_finished",
+                    {"call_id": "call-1", "status": status, "result": status},
+                )
+                if status in allowed:
+                    SessionReducer.apply(self.state, event)
+                    self.assertTrue(
+                        self.state.tool_calls["3:call-1"].is_terminal
+                    )
+                else:
+                    with self.assertRaises(DomainError):
+                        SessionReducer.apply(self.state, event)
+                    self.assertEqual(self.state.last_seq, 3)
+
+    def test_started_call_transition_matrix(self) -> None:
+        allowed = {
+            "succeeded",
+            "failed",
+            "timed_out",
+            "interrupted",
+            "conflict",
+            "cancelled",
+            "outcome_unknown",
+        }
+        rejected = {
+            "denied",
+            "invalid_arguments",
+            "unknown_tool",
+            "not_executed",
+            "batch_limit_exceeded",
+        }
+
+        for status in sorted(allowed | rejected):
+            with self.subTest(status=status):
+                self.setUp()
+                self.start_turn()
+                self.apply(
+                    "assistant_accepted",
+                    {"tool_calls": [self.tool("call-1", "bash")]},
+                )
+                self.apply("tool_started", {"call_id": "call-1"})
+                event = self.event(
+                    "tool_finished",
+                    {"call_id": "call-1", "status": status, "result": status},
+                )
+                if status in allowed:
+                    SessionReducer.apply(self.state, event)
+                    self.assertTrue(
+                        self.state.tool_calls["3:call-1"].is_terminal
+                    )
+                else:
+                    with self.assertRaises(DomainError):
+                        SessionReducer.apply(self.state, event)
+                    self.assertEqual(self.state.last_seq, 4)
 
     def test_reducer_rejects_sequence_gaps_and_session_mismatches(self) -> None:
         self.create_session()

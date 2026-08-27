@@ -22,6 +22,10 @@ class SessionLockedError(RuntimeError):
     """Raised when another writer already owns the session."""
 
 
+class StorePoisonedError(RuntimeError):
+    """Raised after an append may have only partially reached durable storage."""
+
+
 def _validate_session_id(session_id: object) -> str:
     if not isinstance(session_id, str):
         raise ValueError("session_id must be a canonical UUID")
@@ -48,6 +52,7 @@ class RolloutStore:
         self.sessions_root = Path(sessions_root)
         self.path = self.sessions_root / f"{self.session_id}.jsonl"
         self._fd: int | None = None
+        self._poisoned = False
         self._events: list[Event] = []
 
         self._prepare_directory()
@@ -229,9 +234,14 @@ class RolloutStore:
             )
             + "\n"
         ).encode("utf-8")
-        self._write_all(encoded)
-        assert self._fd is not None
-        os.fsync(self._fd)
+        try:
+            self._write_all(encoded)
+            assert self._fd is not None
+            os.fsync(self._fd)
+        except BaseException:
+            self._poisoned = True
+            self.close()
+            raise
         self._events.append(event)
         return event
 
@@ -250,6 +260,10 @@ class RolloutStore:
         return list(self._events)
 
     def _require_open(self) -> None:
+        if self._poisoned:
+            raise StorePoisonedError(
+                "rollout store is poisoned after an append failure"
+            )
         if self._fd is None:
             raise ValueError("rollout store is closed")
 
