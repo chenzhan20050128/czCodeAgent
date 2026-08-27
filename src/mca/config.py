@@ -45,13 +45,25 @@ class Config:
                 "API key is required; set MCA_API_KEY or DEEPSEEK_API_KEY"
             )
 
+        raw_context_window = os.environ.get(
+            "MCA_CONTEXT_WINDOW", str(DEFAULT_CONTEXT_WINDOW)
+        )
+        try:
+            context_window = int(raw_context_window)
+        except ValueError:
+            raise ValueError(
+                "MCA_CONTEXT_WINDOW must be a positive integer"
+            ) from None
+        if context_window <= 0:
+            raise ValueError(
+                "MCA_CONTEXT_WINDOW must be a positive integer"
+            )
+
         return cls(
             base_url=os.environ.get("MCA_BASE_URL", DEFAULT_BASE_URL),
             api_key=api_key,
             model=os.environ.get("MCA_MODEL", DEFAULT_MODEL),
-            context_window=int(
-                os.environ.get("MCA_CONTEXT_WINDOW", DEFAULT_CONTEXT_WINDOW)
-            ),
+            context_window=context_window,
         )
 
     def __repr__(self) -> str:

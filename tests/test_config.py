@@ -75,6 +75,34 @@ class ConfigFromEnvTests(unittest.TestCase):
 
         self.assertEqual(config.context_window, 65_536)
 
+    def test_context_window_rejects_zero(self) -> None:
+        with patch.dict(
+            os.environ, {"MCA_CONTEXT_WINDOW": "0"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "MCA_CONTEXT_WINDOW"):
+                Config.from_env(require_api_key=False)
+
+    def test_context_window_rejects_negative_values(self) -> None:
+        with patch.dict(
+            os.environ, {"MCA_CONTEXT_WINDOW": "-1"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "MCA_CONTEXT_WINDOW"):
+                Config.from_env(require_api_key=False)
+
+    def test_context_window_rejects_an_empty_value(self) -> None:
+        with patch.dict(
+            os.environ, {"MCA_CONTEXT_WINDOW": ""}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "MCA_CONTEXT_WINDOW"):
+                Config.from_env(require_api_key=False)
+
+    def test_context_window_rejects_a_non_integer(self) -> None:
+        with patch.dict(
+            os.environ, {"MCA_CONTEXT_WINDOW": "many"}, clear=True
+        ):
+            with self.assertRaisesRegex(ValueError, "MCA_CONTEXT_WINDOW"):
+                Config.from_env(require_api_key=False)
+
     def test_repr_never_contains_the_api_key(self) -> None:
         secret = "unique-secret-that-must-not-leak"
         with patch.dict(os.environ, {"MCA_API_KEY": secret}, clear=True):
