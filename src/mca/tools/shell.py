@@ -149,6 +149,8 @@ class PreparedShellCommand:
             maxsize=_OUTPUT_QUEUE_CHUNKS
         )
         drain_stop = threading.Event()
+        lifecycle_done = threading.Event()
+        lifecycle_timed_out = threading.Event()
         threads = (
             threading.Thread(
                 target=_drain_pipe,
@@ -174,11 +176,26 @@ class PreparedShellCommand:
             ),
         )
         started_threads: list[threading.Thread] = []
+        watchdog: threading.Thread | None = None
         try:
             for thread in threads:
                 thread.start()
                 started_threads.append(thread)
+            watchdog = threading.Thread(
+                target=_watch_process_deadline,
+                args=(
+                    process,
+                    self.timeout_seconds,
+                    self.termination_grace_seconds,
+                    lifecycle_done,
+                    lifecycle_timed_out,
+                    drain_stop,
+                ),
+                daemon=True,
+            )
+            watchdog.start()
         except BaseException as error:
+            lifecycle_done.set()
             _stop_process_group(
                 process, signal.SIGTERM, self.termination_grace_seconds
             )
@@ -202,6 +219,8 @@ class PreparedShellCommand:
                 callback=callback_gate.emit,
             )
             if timed_out:
+                lifecycle_timed_out.set()
+                drain_stop.set()
                 _stop_process_group(
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
@@ -216,6 +235,8 @@ class PreparedShellCommand:
                 process, signal.SIGINT, self.termination_grace_seconds
             )
         finally:
+            lifecycle_done.set()
+            timed_out = timed_out or lifecycle_timed_out.is_set()
             if process.poll() is None:
                 _stop_process_group(
                     process, signal.SIGTERM, self.termination_grace_seconds
@@ -251,6 +272,12 @@ class PreparedShellCommand:
                     )
             _deliver_output(output_queue, callback_gate.emit)
             callback_gate.disable()
+            if watchdog is not None:
+                watchdog.join(timeout=self.termination_grace_seconds)
+                if watchdog.is_alive():
+                    raise ShellToolError(
+                        "shell lifecycle watchdog did not stop after bounded cleanup"
+                    )
 
         output, rendering_truncated = _render_streams(
             stdout.text(),
@@ -427,6 +454,21 @@ def _wait_process_with_output(
             process.wait(timeout=min(_OUTPUT_POLL_SECONDS, remaining))
         except subprocess.TimeoutExpired:
             continue
+
+
+def _watch_process_deadline(
+    process: subprocess.Popen[bytes],
+    timeout: float,
+    grace: float,
+    done: threading.Event,
+    timed_out: threading.Event,
+    drain_stop: threading.Event,
+) -> None:
+    if done.wait(timeout):
+        return
+    timed_out.set()
+    _stop_process_group(process, signal.SIGTERM, grace)
+    drain_stop.set()
 
 
 def _join_threads_with_output(

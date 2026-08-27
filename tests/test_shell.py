@@ -143,7 +143,7 @@ class ShellRunnerTests(unittest.TestCase):
         callback_entered = threading.Event()
         release_callback = threading.Event()
         real_thread = threading.Thread
-        drain_threads: list[threading.Thread] = []
+        created_threads: list[tuple[object, threading.Thread]] = []
         callback_threads: list[threading.Thread] = []
         outcomes: list[object] = []
         errors: list[BaseException] = []
@@ -156,7 +156,7 @@ class ShellRunnerTests(unittest.TestCase):
 
         def recording_thread(*args: object, **kwargs: object) -> threading.Thread:
             thread = real_thread(*args, **kwargs)
-            drain_threads.append(thread)
+            created_threads.append((kwargs.get("target"), thread))
             return thread
 
         def execute() -> None:
@@ -177,14 +177,21 @@ class ShellRunnerTests(unittest.TestCase):
         try:
             owner.start()
             self.assertTrue(callback_entered.wait(timeout=1))
+            actual_drain_threads = [
+                thread
+                for target, thread in created_threads
+                if getattr(target, "__name__", None) == "_drain_pipe"
+            ]
             deadline = time.monotonic() + 1
             while (
-                any(thread.is_alive() for thread in drain_threads)
+                any(thread.is_alive() for thread in actual_drain_threads)
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.01)
-            self.assertEqual(len(drain_threads), 2)
-            self.assertTrue(all(not thread.is_alive() for thread in drain_threads))
+            self.assertEqual(len(actual_drain_threads), 2)
+            self.assertTrue(
+                all(not thread.is_alive() for thread in actual_drain_threads)
+            )
             self.assertTrue(owner.is_alive())
         finally:
             release_callback.set()
@@ -194,6 +201,92 @@ class ShellRunnerTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(outcomes), 1)
         self.assertTrue(all(thread is owner for thread in callback_threads))
+
+    def test_watchdog_times_out_process_while_owner_callback_is_blocked(self) -> None:
+        callback_entered = threading.Event()
+        release_callback = threading.Event()
+        real_thread = threading.Thread
+        real_popen = subprocess.Popen
+        created_threads: list[tuple[object, threading.Thread]] = []
+        processes: list[subprocess.Popen[bytes]] = []
+        outcomes: list[object] = []
+        errors: list[BaseException] = []
+        thread_errors: list[BaseException] = []
+        original_excepthook = threading.excepthook
+
+        def blocking_callback(stream: str, text: str) -> None:
+            del stream, text
+            callback_entered.set()
+            release_callback.wait()
+
+        def recording_thread(*args: object, **kwargs: object) -> threading.Thread:
+            thread = real_thread(*args, **kwargs)
+            created_threads.append((kwargs.get("target"), thread))
+            return thread
+
+        def recording_popen(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        def execute() -> None:
+            try:
+                with (
+                    patch(
+                        "mca.tools.shell.threading.Thread",
+                        side_effect=recording_thread,
+                    ),
+                    patch(
+                        "mca.tools.shell.subprocess.Popen",
+                        side_effect=recording_popen,
+                    ),
+                ):
+                    outcomes.append(
+                        ShellRunner(
+                            self.workspace, termination_grace_seconds=0.1
+                        )
+                        .prepare(
+                            {"command": "printf ready; sleep 60", "timeout_seconds": 1}
+                        )
+                        .execute(on_output=blocking_callback)
+                    )
+            except BaseException as error:
+                errors.append(error)
+
+        threading.excepthook = lambda args: thread_errors.append(args.exc_value)
+        owner = real_thread(target=execute, daemon=True)
+        try:
+            owner.start()
+            self.assertTrue(callback_entered.wait(timeout=1))
+            time.sleep(1.3)
+            self.assertEqual(len(processes), 1)
+            self.assertIsNotNone(processes[0].poll())
+            drain_threads = [
+                thread
+                for target, thread in created_threads
+                if getattr(target, "__name__", None) == "_drain_pipe"
+            ]
+            self.assertEqual(len(drain_threads), 2)
+            self.assertTrue(all(not thread.is_alive() for thread in drain_threads))
+            self.assertTrue(owner.is_alive())
+        finally:
+            release_callback.set()
+            if processes and processes[0].poll() is None:
+                try:
+                    os.killpg(processes[0].pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            owner.join(timeout=3)
+            threading.excepthook = original_excepthook
+
+        self.assertFalse(owner.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0].status, "timed_out")
+        self.assertTrue(all(not thread.is_alive() for _, thread in created_threads))
+        self.assertEqual(thread_errors, [])
 
     def test_known_model_secrets_are_removed_but_ordinary_environment_remains(self) -> None:
         keys = (
@@ -303,7 +396,7 @@ class ShellRunnerTests(unittest.TestCase):
         )
         real_thread = threading.Thread
         real_popen = subprocess.Popen
-        drain_threads: list[threading.Thread] = []
+        created_threads: list[tuple[object, threading.Thread]] = []
         processes: list[subprocess.Popen[bytes]] = []
         thread_errors: list[BaseException] = []
         original_excepthook = threading.excepthook
@@ -311,7 +404,7 @@ class ShellRunnerTests(unittest.TestCase):
 
         def recording_thread(*args: object, **kwargs: object) -> threading.Thread:
             thread = real_thread(*args, **kwargs)
-            drain_threads.append(thread)
+            created_threads.append((kwargs.get("target"), thread))
             return thread
 
         def recording_popen(
@@ -341,6 +434,11 @@ class ShellRunnerTests(unittest.TestCase):
             escaped_pid = int(pid_path.read_text(encoding="utf-8"))
             self.assertEqual(result.status, "timed_out")
             self.assertIn("escaped descendants may remain", result.output)
+            drain_threads = [
+                thread
+                for target, thread in created_threads
+                if getattr(target, "__name__", None) == "_drain_pipe"
+            ]
             self.assertEqual(len(drain_threads), 2)
             self.assertTrue(all(not thread.is_alive() for thread in drain_threads))
             self.assertEqual(thread_errors, [])
@@ -359,7 +457,7 @@ class ShellRunnerTests(unittest.TestCase):
                     process.stdout.close()
                 if process.stderr is not None:
                     process.stderr.close()
-            for thread in drain_threads:
+            for _, thread in created_threads:
                 thread.join(timeout=1)
             threading.excepthook = original_excepthook
 
