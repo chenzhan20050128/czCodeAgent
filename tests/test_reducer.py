@@ -639,6 +639,91 @@ class SessionReducerTests(ReducerTestCase):
                 with self.assertRaisesRegex(DomainError, "call_key"):
                     SessionReducer.apply(replay, event)
 
+    def test_file_snapshot_rejects_non_managed_write_provenance(self) -> None:
+        for tool_name in ("read_file", "bash"):
+            with self.subTest(tool_name=tool_name):
+                self.setUp()
+                self.start_turn()
+                self.apply(
+                    "assistant_accepted",
+                    {"tool_calls": [self.tool("not-write", tool_name)]},
+                )
+                snapshot = self.event(
+                    "file_snapshot",
+                    {
+                        "turn_id": self.turn_id,
+                        "path": "src/app.py",
+                        "existed_before": True,
+                        "before_bytes": "b2xk",
+                        "before_encoding": "base64",
+                        "before_mode": 0o644,
+                        "call_key": "3:not-write",
+                    },
+                )
+
+                with self.assertRaisesRegex(DomainError, "managed write"):
+                    SessionReducer.apply(self.state, snapshot)
+
+    def test_file_terminal_metadata_rejects_non_managed_write_call(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("read-1", "read_file")]},
+        )
+        self.state.file_snapshots[(self.turn_id, "src/app.py")] = FileSnapshot(
+            turn_id=self.turn_id,
+            path="src/app.py",
+            existed_before=True,
+            before_bytes="b2xk",
+            before_mode=0o644,
+            source_call_key="3:read-1",
+        )
+        self.apply("tool_started", {"call_key": "3:read-1"})
+        terminal = self.event(
+            "tool_finished",
+            {
+                "call_key": "3:read-1",
+                "status": "succeeded",
+                "result": "forged write",
+                "path": "src/app.py",
+                "after_hash": "sha256:new",
+                "after_mode": 0o644,
+            },
+        )
+
+        with self.assertRaisesRegex(DomainError, "managed write"):
+            SessionReducer.apply(self.state, terminal)
+
+    def test_first_file_terminal_metadata_must_match_snapshot_source_call(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("write-1", "write_file")]},
+        )
+        self.state.file_snapshots[(self.turn_id, "src/app.py")] = FileSnapshot(
+            turn_id=self.turn_id,
+            path="src/app.py",
+            existed_before=True,
+            before_bytes="b2xk",
+            before_mode=0o644,
+            source_call_key="different-call",
+        )
+        self.apply("tool_started", {"call_key": "3:write-1"})
+        terminal = self.event(
+            "tool_finished",
+            {
+                "call_key": "3:write-1",
+                "status": "succeeded",
+                "result": "write",
+                "path": "src/app.py",
+                "after_hash": "sha256:new",
+                "after_mode": 0o644,
+            },
+        )
+
+        with self.assertRaisesRegex(DomainError, "snapshot source"):
+            SessionReducer.apply(self.state, terminal)
+
     def test_replay_fails_closed_on_legacy_snapshot_without_provenance(self) -> None:
         self.start_turn()
         self.apply(
@@ -660,7 +745,7 @@ class SessionReducerTests(ReducerTestCase):
         with self.assertRaisesRegex(DomainError, "call_key"):
             SessionReducer.replay([*self.state.events, legacy])
 
-    def test_successful_file_terminal_requires_and_records_after_mode(self) -> None:
+    def test_legacy_successful_file_terminal_without_after_mode_replays_but_is_not_undoable(self) -> None:
         self.start_turn()
         self.apply(
             "assistant_accepted",
@@ -679,7 +764,7 @@ class SessionReducerTests(ReducerTestCase):
             },
         )
         self.apply("tool_started", {"call_key": "3:write-1"})
-        missing_mode = self.event(
+        legacy_terminal = self.event(
             "tool_finished",
             {
                 "call_key": "3:write-1",
@@ -690,8 +775,11 @@ class SessionReducerTests(ReducerTestCase):
             },
         )
 
-        with self.assertRaisesRegex(DomainError, "after_mode"):
-            SessionReducer.apply(self.state, missing_mode)
+        SessionReducer.apply(self.state, legacy_terminal)
+
+        snapshot = self.state.file_snapshots[(self.turn_id, "src/app.py")]
+        self.assertEqual(snapshot.after_hash, "sha256:new")
+        self.assertIsNone(snapshot.after_mode)
 
     def test_undo_finished_validates_file_shapes_statuses_and_success_consistency(self) -> None:
         self.start_turn()
@@ -725,6 +813,54 @@ class SessionReducerTests(ReducerTestCase):
         )
         with self.assertRaisesRegex(DomainError, "succeeded"):
             SessionReducer.apply(self.state, inconsistent)
+
+    def test_undo_finished_status_exactly_matches_file_status_reduction(self) -> None:
+        self.start_turn()
+        cases = (
+            ([], "succeeded"),
+            (["restored", "already_deleted"], "succeeded"),
+            (["conflict"], "conflict"),
+            (["conflict", "conflict"], "conflict"),
+            (["failed"], "partial"),
+            (["conflict", "not_modified"], "conflict"),
+            (["ineligible"], "conflict"),
+        )
+        all_top_statuses = {"succeeded", "conflict", "partial"}
+        for file_statuses, expected in cases:
+            for actual in all_top_statuses - {expected}:
+                with self.subTest(file_statuses=file_statuses, actual=actual):
+                    replay = SessionReducer.replay(self.state.events[:2])
+                    invalid = Event.create(
+                        seq=replay.last_seq + 1,
+                        session_id=self.session_id,
+                        event_type="undo_finished",
+                        payload={
+                            "turn_id": self.turn_id,
+                            "status": actual,
+                            "files": [
+                                {"path": str(index), "status": status, "detail": "x"}
+                                for index, status in enumerate(file_statuses)
+                            ],
+                        },
+                    )
+                    with self.assertRaisesRegex(DomainError, "does not match"):
+                        SessionReducer.apply(replay, invalid)
+
+            replay = SessionReducer.replay(self.state.events[:2])
+            valid = Event.create(
+                seq=replay.last_seq + 1,
+                session_id=self.session_id,
+                event_type="undo_finished",
+                payload={
+                    "turn_id": self.turn_id,
+                    "status": expected,
+                    "files": [
+                        {"path": str(index), "status": status, "detail": "x"}
+                        for index, status in enumerate(file_statuses)
+                    ],
+                },
+            )
+            SessionReducer.apply(replay, valid)
 
     def test_file_snapshot_rejects_non_base64_or_missing_mode(self) -> None:
         self.start_turn()

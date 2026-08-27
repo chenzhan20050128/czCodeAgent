@@ -11,7 +11,13 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from .domain import Event, FileSnapshot, SessionReducer, SessionState
+from .domain import (
+    Event,
+    FileSnapshot,
+    SessionReducer,
+    SessionState,
+    reduce_undo_status,
+)
 from .store import RolloutStore
 from .tools.filesystem import DEFAULT_MAX_FILE_BYTES, sha256_bytes
 
@@ -92,7 +98,13 @@ class ManagedUndo:
                 else UndoFileResult(item.path, "not_modified", "preflight aborted")
                 for item in preflight
             )
-            return self._record(UndoResult(turn_id, "conflict", normalized))
+            return self._record(
+                UndoResult(
+                    turn_id,
+                    reduce_undo_status(item.status for item in normalized),
+                    normalized,
+                )
+            )
 
         completed: list[UndoFileResult] = [
             result
@@ -147,13 +159,7 @@ class ManagedUndo:
                         f"undo failed: {type(error).__name__}: {error}",
                     )
                 )
-        statuses = {item.status for item in completed}
-        if statuses <= {"restored", "deleted", "already_restored", "already_deleted"}:
-            status = "succeeded"
-        elif statuses <= {"conflict"}:
-            status = "conflict"
-        else:
-            status = "partial"
+        status = reduce_undo_status(item.status for item in completed)
         return self._record(UndoResult(turn_id, status, tuple(completed)))
 
     def undo(self, turn_id: str) -> UndoResult:
@@ -214,7 +220,13 @@ class ManagedUndo:
                     baseline_hash = sha256_bytes(before_bytes or b"")
                     if quarantine is not None:
                         quarantine_bytes, quarantine_stat = quarantine
-                        if (
+                        if _is_quarantine_reservation(
+                            quarantine_bytes, quarantine_stat
+                        ) and _matches_state(
+                            current_entry, snapshot.after_hash, snapshot.after_mode
+                        ):
+                            pass
+                        elif (
                             sha256_bytes(quarantine_bytes) != snapshot.after_hash
                             or stat.S_IMODE(quarantine_stat.st_mode) != snapshot.after_mode
                         ):
@@ -340,6 +352,21 @@ def _atomic_restore(
     installed = False
     try:
         if _name_exists(parent_fd, quarantine_name):
+            quarantine = _read_current_at(
+                parent_fd, quarantine_name, max_file_bytes=max_file_bytes
+            )
+            current = _read_optional_at(
+                parent_fd, path.name, max_file_bytes=max_file_bytes
+            )
+            if _is_quarantine_reservation(*quarantine) and _matches_state(
+                current, expected_hash, expected_mode
+            ):
+                _require_same_entry(parent_fd, quarantine_name, quarantine[1])
+                assert current is not None
+                _require_same_entry(parent_fd, path.name, current[1])
+                os.unlink(quarantine_name, dir_fd=parent_fd)
+                _fsync_parent(parent_fd)
+                _quarantine_target(parent_fd, path.name, quarantine_name)
             try:
                 quarantined_stat = _require_current_state(
                     parent_fd,
@@ -460,6 +487,21 @@ def _verified_delete(
     )
     try:
         if _name_exists(parent_fd, quarantine_name):
+            quarantine = _read_current_at(
+                parent_fd, quarantine_name, max_file_bytes=max_file_bytes
+            )
+            current = _read_optional_at(
+                parent_fd, path.name, max_file_bytes=max_file_bytes
+            )
+            if _is_quarantine_reservation(*quarantine) and _matches_state(
+                current, expected_hash, expected_mode
+            ):
+                _require_same_entry(parent_fd, quarantine_name, quarantine[1])
+                assert current is not None
+                _require_same_entry(parent_fd, path.name, current[1])
+                os.unlink(quarantine_name, dir_fd=parent_fd)
+                _fsync_parent(parent_fd)
+                _quarantine_target(parent_fd, path.name, quarantine_name)
             try:
                 quarantined_stat = _require_current_state(
                     parent_fd,
@@ -526,6 +568,24 @@ def _deterministic_quarantine_name(
         )
     ).hexdigest()[:16]
     return f".{target_name}.mca-undo-{digest}"
+
+
+def _is_quarantine_reservation(content: bytes, file_stat: os.stat_result) -> bool:
+    return not content and stat.S_IMODE(file_stat.st_mode) == 0o600
+
+
+def _matches_state(
+    current: tuple[bytes, os.stat_result] | None,
+    expected_hash: str | None,
+    expected_mode: int | None,
+) -> bool:
+    return (
+        current is not None
+        and expected_hash is not None
+        and expected_mode is not None
+        and sha256_bytes(current[0]) == expected_hash
+        and stat.S_IMODE(current[1].st_mode) == expected_mode
+    )
 
 
 def _quarantine_target(parent_fd: int, target_name: str, quarantine_name: str) -> None:

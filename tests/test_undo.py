@@ -7,6 +7,7 @@ import hashlib
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -168,6 +169,46 @@ class ManagedUndoTests(UndoTestCase):
         self.assertEqual(path.read_text(encoding="utf-8"), "before")
         self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
         self.assertEqual(list(self.workspace.glob(".existing-crash.txt.mca-undo-*")), [])
+
+    def test_retry_recovers_after_process_crash_leaves_quarantine_reservation(self) -> None:
+        from mca.undo import _deterministic_quarantine_name
+
+        path = self.workspace / "reservation-crash.txt"
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o640)
+        self.write_call("write", "reservation-crash.txt", "after")
+        snapshot = self.state.file_snapshots[(self.turn_id, str(path.resolve()))]
+        reservation = path.with_name(
+            _deterministic_quarantine_name(
+                path.name, self.turn_id, path.resolve(), snapshot.after_hash
+            )
+        )
+        crashed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import os,sys; "
+                    "fd=os.open(sys.argv[1], os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600); "
+                    "os.fchmod(fd, 0o600); os.close(fd); os._exit(91)"
+                ),
+                str(reservation),
+            ],
+            check=False,
+        )
+        self.assertEqual(crashed.returncode, 91)
+        self.assertTrue(reservation.exists())
+        self.assertEqual(path.read_text(encoding="utf-8"), "after")
+        self.store.close()
+        with RolloutStore.open(self.sessions, self.session_id) as reopened:
+            replayed = SessionReducer.replay(reopened.load())
+            result = ManagedUndo(reopened, replayed, self.workspace).undo_turn(
+                self.turn_id
+            )
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(path.read_text(encoding="utf-8"), "before")
+        self.assertFalse(reservation.exists())
 
     def test_new_file_retry_recovers_after_crash_immediately_after_quarantine(self) -> None:
         class SimulatedCrash(BaseException):

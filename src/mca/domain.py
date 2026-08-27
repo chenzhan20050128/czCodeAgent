@@ -89,6 +89,13 @@ _TERMINAL_TURN_STATUSES = frozenset(
     for status in TurnStatus
     if status not in {TurnStatus.ACTIVE, TurnStatus.RECOVERY_BLOCKED}
 )
+_MANAGED_WRITE_TOOL_NAMES = frozenset({"write_file", "edit_file"})
+_UNDO_SUCCESS_STATUSES = frozenset(
+    {"restored", "deleted", "already_restored", "already_deleted"}
+)
+_UNDO_PREFLIGHT_ABORT_STATUSES = frozenset(
+    {"conflict", "ineligible", "not_modified"}
+)
 _TOOL_FINISH_TRANSITIONS = {
     ToolStatus.REQUESTED: frozenset(
         {
@@ -348,8 +355,8 @@ class FileSnapshot:
             type(self.after_mode) is not int or not 0 <= self.after_mode <= 0o7777
         ):
             raise DomainError("after_mode must be permission bits or null")
-        if (self.after_hash is None) is not (self.after_mode is None):
-            raise DomainError("after_hash and after_mode must be recorded together")
+        if self.after_hash is None and self.after_mode is not None:
+            raise DomainError("after_mode requires after_hash")
 
 
 @dataclass
@@ -411,6 +418,20 @@ def _turn_status(value: object) -> TurnStatus:
     if status not in _TERMINAL_TURN_STATUSES:
         raise DomainError(f"turn_finished cannot use status {value!r}")
     return status
+
+
+def reduce_undo_status(statuses: Iterable[str]) -> str:
+    """Derive the durable undo outcome from per-file outcomes."""
+
+    observed = set(statuses)
+    if observed <= _UNDO_SUCCESS_STATUSES:
+        return "succeeded"
+    if (
+        observed <= _UNDO_PREFLIGHT_ABORT_STATUSES
+        and bool(observed & {"conflict", "ineligible"})
+    ):
+        return "conflict"
+    return "partial"
 
 
 class SessionReducer:
@@ -631,16 +652,25 @@ class SessionReducer:
         if path is not None or after_hash is not None or after_mode is not None:
             if status is not ToolStatus.SUCCEEDED:
                 raise DomainError("after_hash is only valid for a successful tool")
+            if call.name not in _MANAGED_WRITE_TOOL_NAMES:
+                raise DomainError("file result metadata requires a managed write call")
             if not isinstance(path, str) or not path:
                 raise DomainError("path must accompany after_hash")
             if not isinstance(after_hash, str) or not after_hash:
                 raise DomainError("after_hash must accompany path")
-            if type(after_mode) is not int or not 0 <= after_mode <= 0o7777:
-                raise DomainError("after_mode must accompany path and after_hash")
+            if after_mode is not None and (
+                type(after_mode) is not int or not 0 <= after_mode <= 0o7777
+            ):
+                raise DomainError("after_mode must be permission bits or null")
             key = (call.turn_id, path)
             snapshot = state.file_snapshots.get(key)
             if snapshot is None:
                 raise DomainError("successful write has no file baseline")
+            if (
+                snapshot.after_hash is None
+                and snapshot.source_call_key != call.call_key
+            ):
+                raise DomainError("successful write does not match snapshot source call")
             snapshot_update = (
                 key,
                 replace(snapshot, after_hash=after_hash, after_mode=after_mode),
@@ -785,6 +815,8 @@ class SessionReducer:
             raise DomainError("file snapshot call_key is not in the active turn")
         if source_call.status is not ToolStatus.REQUESTED:
             raise DomainError("file snapshot call_key is not an active requested call")
+        if source_call.name not in _MANAGED_WRITE_TOOL_NAMES:
+            raise DomainError("file snapshot call_key must identify a managed write")
         key = (turn_id, path)
         existing = state.file_snapshots.get(key)
         if existing is None:
@@ -831,9 +863,6 @@ class SessionReducer:
             "not_modified",
             "failed",
         }
-        success_statuses = {
-            "restored", "deleted", "already_restored", "already_deleted"
-        }
         observed_statuses: set[str] = set()
         for item in files:
             if not isinstance(item, Mapping) or set(item) != {"path", "status", "detail"}:
@@ -844,8 +873,11 @@ class SessionReducer:
             if item["status"] not in allowed_statuses:
                 raise DomainError(f"unknown undo file status: {item['status']!r}")
             observed_statuses.add(item["status"])
-        if status == "succeeded" and not observed_statuses <= success_statuses:
-            raise DomainError("succeeded undo may contain only successful file statuses")
+        expected_status = reduce_undo_status(observed_statuses)
+        if status != expected_status:
+            raise DomainError(
+                f"undo status {status!r} does not match file results {expected_status!r}"
+            )
         state.undo_results[turn_id] = event
 
     @staticmethod
