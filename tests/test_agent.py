@@ -871,20 +871,20 @@ class AgentLoopTests(AgentLoopTestCase):
         self,
     ) -> None:
         runtime = self.make_runtime(text("durable answer"))
-        real_append = runtime.loop._append
+        real_append = runtime.store.append
         interrupted = False
 
         def append_then_interrupt(
-            event_type: str, payload: Mapping[str, Any]
+            event_or_type: object, payload: Mapping[str, Any] | None = None
         ) -> object:
             nonlocal interrupted
-            event = real_append(event_type, payload)
-            if event_type == "turn_finished" and not interrupted:
+            event = real_append(event_or_type, payload)
+            if event.type == "turn_finished" and not interrupted:
                 interrupted = True
                 raise KeyboardInterrupt
             return event
 
-        with patch.object(runtime.loop, "_append", side_effect=append_then_interrupt):
+        with patch.object(runtime.store, "append", side_effect=append_then_interrupt):
             result = runtime.loop.run_turn("finish once")
 
         self.assertEqual(result.status, TurnStatus.COMPLETED)
@@ -902,30 +902,24 @@ class AgentLoopTests(AgentLoopTestCase):
             text("must not sample"),
             specs=[tool_spec("write", lambda _: ToolResult(title="write", output="ok"))],
         )
+        real_append = runtime.store.append
+        interrupted = False
 
-        def execute_then_interrupt(accepted: object) -> object:
-            runtime.loop._append(
-                "tool_started",
-                {
-                    "call_key": accepted.call_key,
-                    "call_id": accepted.provider_call_id,
-                    "name": accepted.name,
-                    "arguments": {},
-                },
-            )
-            runtime.loop._append(
-                "tool_finished",
-                {
-                    "call_key": accepted.call_key,
-                    "call_id": accepted.provider_call_id,
-                    "status": "succeeded",
-                    "result": "file commit succeeded",
-                    "truncated": False,
-                },
-            )
-            raise KeyboardInterrupt
+        def append_then_interrupt(
+            event_or_type: object, payload: Mapping[str, Any] | None = None
+        ) -> object:
+            nonlocal interrupted
+            event = real_append(event_or_type, payload)
+            if (
+                event.type == "tool_finished"
+                and event.payload.get("call_id") == "committed"
+                and not interrupted
+            ):
+                interrupted = True
+                raise KeyboardInterrupt
+            return event
 
-        with patch.object(runtime.executor, "execute", side_effect=execute_then_interrupt):
+        with patch.object(runtime.store, "append", side_effect=append_then_interrupt):
             result = runtime.loop.run_turn("write files")
 
         self.assertEqual(result.status, TurnStatus.INTERRUPTED)
@@ -939,6 +933,7 @@ class AgentLoopTests(AgentLoopTestCase):
         )
         self.assertEqual(len(self.terminal_events(runtime)), 1)
         self.assertEqual(len(runtime.model.requests), 1)
+        self.assertEqual(SessionReducer.replay(runtime.store.load()), runtime.state)
 
     def test_recovery_blocked_state_refuses_turn_before_append_or_model_call(self) -> None:
         runtime = self.make_runtime(text("must not sample"))

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Any, Protocol
 
 from .config import Config
@@ -376,6 +376,7 @@ class AgentLoop:
             try:
                 result = self.executor.execute(call)
             except KeyboardInterrupt:
+                self._synchronize_state_from_store()
                 self._close_calls(
                     calls[index:],
                     current_call_key=call.call_key,
@@ -538,6 +539,9 @@ class AgentLoop:
             raise AgentLoopError("candidate event could not be reduced") from error
         try:
             event = self.store.append(event_type, payload)
+        except KeyboardInterrupt:
+            self._synchronize_state_from_store()
+            raise
         except Exception as error:
             self._usable = False
             raise AgentLoopError("rollout store append failed") from error
@@ -549,6 +553,19 @@ class AgentLoop:
                 f"durable event {event.seq} could not be applied to state"
             ) from error
         return event
+
+    def _synchronize_state_from_store(self) -> None:
+        """Replay durable facts into the existing shared state object."""
+
+        try:
+            synchronized = SessionReducer.replay(self.store.load())
+        except Exception as error:
+            self._usable = False
+            raise AgentLoopError(
+                "rollout state could not be synchronized after interruption"
+            ) from error
+        for state_field in fields(SessionState):
+            setattr(self.state, state_field.name, getattr(synchronized, state_field.name))
 
 
 __all__ = [
