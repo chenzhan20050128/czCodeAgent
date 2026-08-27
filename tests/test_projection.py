@@ -788,6 +788,12 @@ class ConversationValidationTests(unittest.TestCase):
         self.assertIs(ProjectionError, ConversationError)
         self.assertTrue(issubclass(ProjectionBlockedError, ProjectionError))
 
+    def test_rejects_non_string_roles_with_projection_error(self) -> None:
+        for role in ({}, []):
+            with self.subTest(role=role):
+                with self.assertRaisesRegex(ProjectionError, "invalid role"):
+                    validate_conversation([{"role": role, "content": "x"}])
+
     def test_rejects_more_than_one_system_message(self) -> None:
         messages = [
             {"role": "system", "content": "current environment"},

@@ -74,7 +74,12 @@ def validate_conversation(messages: Sequence[Mapping[str, Any]]) -> None:
         if not isinstance(message, Mapping):
             raise ConversationError(f"message {index} must be an object")
         role = message.get("role")
-        if role not in {"system", "user", "assistant", "tool"}:
+        if not isinstance(role, str) or role not in {
+            "system",
+            "user",
+            "assistant",
+            "tool",
+        }:
             raise ConversationError(
                 f"message {index} has invalid role: {role!r}"
             )

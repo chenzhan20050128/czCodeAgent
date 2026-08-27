@@ -536,6 +536,8 @@ class SessionReducerTests(ReducerTestCase):
                     "unexpected": True,
                 }
             ],
+            "object role": [{"role": {}, "content": "x"}],
+            "array role": [{"role": [], "content": "x"}],
             "unclosed tool batch": [
                 {
                     "role": "assistant",
