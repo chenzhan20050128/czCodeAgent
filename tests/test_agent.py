@@ -645,6 +645,48 @@ class AgentLoopTests(AgentLoopTestCase):
             any(event.type == "assistant_accepted" for event in runtime.store.load())
         )
 
+    def test_keyboard_interrupt_after_bounded_text_append_preserves_finalization(
+        self,
+    ) -> None:
+        invalidated: list[str] = []
+        runtime = self.make_runtime(
+            StreamedSample(text("durable bounded answer")),
+            config=Config(api_key="test", max_steps=0),
+            on_content=lambda _: None,
+            on_invalidate=lambda: invalidated.append("invalid"),
+        )
+        real_append = runtime.store.append
+        interrupted = False
+
+        def append_then_interrupt(
+            event_or_type: object, payload: Mapping[str, Any] | None = None
+        ) -> object:
+            nonlocal interrupted
+            event = real_append(event_or_type, payload)
+            if event.type == "assistant_accepted" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return event
+
+        with patch.object(runtime.store, "append", side_effect=append_then_interrupt):
+            result = runtime.loop.run_turn("bounded")
+
+        self.assertEqual(result.status, TurnStatus.MAX_STEPS_REACHED)
+        self.assertEqual(result.final_text, "durable bounded answer")
+        self.assertEqual(result.error, "maximum tool steps reached")
+        self.assertEqual(invalidated, [])
+        self.assertEqual(
+            [event.type for event in runtime.store.load()],
+            [
+                "session_created",
+                "turn_started",
+                "assistant_accepted",
+                "turn_finished",
+            ],
+        )
+        self.assertEqual(len(self.terminal_events(runtime)), 1)
+        self.assertEqual(SessionReducer.replay(runtime.store.load()), runtime.state)
+
     def test_empty_complete_text_is_a_terminal_protocol_failure(self) -> None:
         runtime = self.make_runtime(text(""), text("must not retry"))
 

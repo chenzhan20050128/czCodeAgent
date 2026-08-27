@@ -502,11 +502,15 @@ class AgentLoop:
             and bool(sampled.content)
             and not sampled.tool_calls
         ):
+            before_accept = self.state.last_seq
             try:
                 self._accept_assistant(turn_id, sampled, include_calls=False)
             except KeyboardInterrupt:
-                observed.discard()
-                raise
+                if self._accepted_assistant_event(
+                    before_accept + 1, turn_id
+                ) is None:
+                    observed.discard()
+                    raise
             except Exception:
                 observed.discard()
                 raise
