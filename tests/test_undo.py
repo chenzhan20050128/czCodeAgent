@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -210,6 +211,85 @@ class ManagedUndoTests(UndoTestCase):
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
         self.assertIn("outside workspace", result.files[1].detail)
 
+    def test_replayed_lexical_parent_escape_cannot_modify_outside_file(self) -> None:
+        outside = self.root / "outside.txt"
+        outside.write_text("external", encoding="utf-8")
+        disguised = self.workspace / ".." / "outside.txt"
+        self.append(
+            "file_snapshot",
+            {
+                "turn_id": self.turn_id,
+                "path": str(disguised),
+                "existed_before": True,
+                "before_bytes": base64.b64encode(b"baseline").decode(),
+                "before_encoding": "base64",
+                "before_mode": 0o644,
+                "after_hash": hashlib.sha256(b"external").hexdigest(),
+            },
+        )
+
+        result = self.undo()
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "ineligible")
+        self.assertIn("canonical", result.files[0].detail)
+        self.assertEqual(outside.read_text(encoding="utf-8"), "external")
+
+    def test_parent_symlink_swap_before_restore_cannot_write_outside(self) -> None:
+        managed_dir = self.workspace / "dir"
+        managed_dir.mkdir()
+        managed = managed_dir / "file.txt"
+        managed.write_text("before", encoding="utf-8")
+        self.write_call("write", "dir/file.txt", "after")
+        outside_dir = self.root / "outside"
+        outside_dir.mkdir()
+        outside = outside_dir / "file.txt"
+        outside.write_text("outside", encoding="utf-8")
+        real_open_parent = __import__("mca.undo", fromlist=["_open_parent_fd"])._open_parent_fd
+        calls = 0
+
+        def swap_then_open(workspace: Path, path: Path) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                shutil.move(managed_dir, self.root / "original-dir")
+                managed_dir.symlink_to(outside_dir, target_is_directory=True)
+            return real_open_parent(workspace, path)
+
+        with patch("mca.undo._open_parent_fd", side_effect=swap_then_open):
+            result = self.undo()
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.files[0].status, "failed")
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
+    def test_parent_symlink_swap_before_delete_cannot_delete_outside(self) -> None:
+        managed_dir = self.workspace / "dir"
+        managed_dir.mkdir()
+        managed = managed_dir / "new.txt"
+        self.write_call("write", "dir/new.txt", "created")
+        outside_dir = self.root / "outside"
+        outside_dir.mkdir()
+        outside = outside_dir / "new.txt"
+        outside.write_text("outside", encoding="utf-8")
+        real_open_parent = __import__("mca.undo", fromlist=["_open_parent_fd"])._open_parent_fd
+        calls = 0
+
+        def swap_then_open(workspace: Path, path: Path) -> int:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                shutil.move(managed_dir, self.root / "original-dir")
+                managed_dir.symlink_to(outside_dir, target_is_directory=True)
+            return real_open_parent(workspace, path)
+
+        with patch("mca.undo._open_parent_fd", side_effect=swap_then_open):
+            result = self.undo()
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.files[0].status, "failed")
+        self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
     def test_resume_reconstructed_state_can_undo(self) -> None:
         path = self.workspace / "resume.txt"
         path.write_text("before", encoding="utf-8")
@@ -235,12 +315,12 @@ class ManagedUndoTests(UndoTestCase):
         real_replace = os.replace
         calls = 0
 
-        def fail_second_replace(source: object, target: object) -> None:
+        def fail_second_replace(*args: object, **kwargs: object) -> None:
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise OSError("disk failure")
-            real_replace(source, target)
+            real_replace(*args, **kwargs)
 
         with patch("mca.undo.os.replace", side_effect=fail_second_replace):
             result = self.undo()
@@ -250,6 +330,86 @@ class ManagedUndoTests(UndoTestCase):
         self.assertEqual(first.read_text(encoding="utf-8"), "a")
         self.assertEqual(second.read_text(encoding="utf-8"), "changed-b")
         self.assertEqual(self.store.load()[-1].payload["status"], "partial")
+
+    def test_partial_undo_retries_only_remaining_file_then_becomes_idempotent(self) -> None:
+        first = self.workspace / "a.txt"
+        second = self.workspace / "b.txt"
+        first.write_text("a", encoding="utf-8")
+        second.write_text("b", encoding="utf-8")
+        self.write_call("one", "a.txt", "changed-a")
+        self.write_call("two", "b.txt", "changed-b")
+        real_replace = os.replace
+        calls = 0
+
+        def fail_second_replace(*args: object, **kwargs: object) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("transient failure")
+            real_replace(*args, **kwargs)
+
+        with patch("mca.undo.os.replace", side_effect=fail_second_replace):
+            first_result = self.undo()
+
+        second_result = self.undo()
+        event_count = len(self.store.load())
+        third_result = self.undo()
+
+        self.assertEqual(first_result.status, "partial")
+        self.assertEqual(second_result.status, "succeeded")
+        self.assertEqual(
+            [item.status for item in second_result.files],
+            ["already_restored", "restored"],
+        )
+        self.assertEqual(first.read_text(encoding="utf-8"), "a")
+        self.assertEqual(second.read_text(encoding="utf-8"), "b")
+        self.assertEqual(third_result, second_result)
+        self.assertEqual(len(self.store.load()), event_count)
+        self.assertEqual(
+            [event.payload["status"] for event in self.store.load() if event.type == "undo_finished"],
+            ["partial", "succeeded"],
+        )
+
+    def test_new_file_deleted_before_fsync_failure_is_completed_on_retry(self) -> None:
+        path = self.workspace / "new.txt"
+        self.write_call("write", "new.txt", "created")
+
+        with patch("mca.undo._fsync_parent", side_effect=OSError("fsync failed")):
+            first = self.undo()
+        second = self.undo()
+
+        self.assertEqual(first.status, "partial")
+        self.assertFalse(path.exists())
+        self.assertEqual(second.status, "succeeded")
+        self.assertEqual(second.files[0].status, "already_deleted")
+
+    def test_oversized_current_file_is_ineligible_without_unbounded_read(self) -> None:
+        path = self.workspace / "large.txt"
+        path.write_text("before", encoding="utf-8")
+        self.write_call("write", "large.txt", "after")
+        path.write_bytes(b"x" * 65)
+
+        result = ManagedUndo(
+            self.store, self.state, self.workspace, max_file_bytes=64
+        ).undo_turn(self.turn_id)
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "ineligible")
+        self.assertIn("size limit", result.files[0].detail)
+
+    def test_baseline_bytes_with_wrong_mode_are_not_treated_as_already_restored(self) -> None:
+        path = self.workspace / "mode.txt"
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o640)
+        self.write_call("write", "mode.txt", "after")
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o600)
+
+        result = self.undo()
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "conflict")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
     def test_double_undo_is_idempotent_without_duplicate_event(self) -> None:
         path = self.workspace / "once.txt"
@@ -264,26 +424,26 @@ class ManagedUndoTests(UndoTestCase):
         self.assertEqual(len(self.store.load()), event_count)
         self.assertEqual(path.read_text(encoding="utf-8"), "before")
 
-    def test_invalid_base64_snapshot_fails_preflight_without_mutation(self) -> None:
+    def test_invalid_base64_snapshot_is_rejected_before_undo(self) -> None:
         path = self.workspace / "bad.txt"
         path.write_text("current", encoding="utf-8")
-        self.append(
-            "file_snapshot",
-            {
-                "turn_id": self.turn_id,
-                "path": str(path),
-                "existed_before": True,
-                "before_bytes": "not-base64!!",
-                "before_encoding": "base64",
-                "before_mode": 0o644,
-                "after_hash": hashlib.sha256(b"current").hexdigest(),
-            },
-        )
+        before_events = len(self.store.load())
 
-        result = self.undo()
+        with self.assertRaisesRegex(ValueError, "valid base64"):
+            self.append(
+                "file_snapshot",
+                {
+                    "turn_id": self.turn_id,
+                    "path": str(path),
+                    "existed_before": True,
+                    "before_bytes": "not-base64!!",
+                    "before_encoding": "base64",
+                    "before_mode": 0o644,
+                    "after_hash": hashlib.sha256(b"current").hexdigest(),
+                },
+            )
 
-        self.assertEqual(result.status, "conflict")
-        self.assertEqual(result.files[0].status, "ineligible")
+        self.assertEqual(len(self.store.load()), before_events + 1)
         self.assertEqual(path.read_text(encoding="utf-8"), "current")
 
     def test_unknown_turn_is_rejected_without_event(self) -> None:

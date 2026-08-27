@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from .approval import ApprovalDecision, ApprovalRequest
+from .approval import ApprovalDecision, ApprovalInterrupted, ApprovalRequest, _escape_terminal_text
 from .domain import SessionReducer, SessionState, ToolCall, ToolStatus
 from .store import RolloutStore
 from .tools.filesystem import (
@@ -85,6 +85,8 @@ class ToolExecutor:
         state: SessionState,
         approver: Approver,
         workspace: str | os.PathLike[str],
+        *,
+        on_output: Any | None = None,
     ) -> None:
         workspace_path = Path(workspace).resolve(strict=True)
         if not workspace_path.is_dir():
@@ -94,8 +96,14 @@ class ToolExecutor:
         self.state = state
         self.approver = approver
         self.workspace = workspace_path
+        self.on_output = on_output
+        self._usable = True
+        if registry.workspace is not None and registry.workspace != workspace_path:
+            raise ValueError("registry workspace does not match executor workspace")
 
     def execute(self, accepted: AcceptedToolCall | ToolCall) -> ToolResult:
+        if not self._usable:
+            raise ToolExecutorError("executor is unusable after reducer divergence")
         call = (
             AcceptedToolCall.from_tool_call(accepted)
             if isinstance(accepted, ToolCall)
@@ -135,7 +143,24 @@ class ToolExecutor:
         if requires_approval:
             assert prepared is not None
             request = self._approval_request(spec.side_effect, call.name, prepared)
-            decision = self._approval_decision(request)
+            try:
+                decision = self._approval_decision(request)
+            except ApprovalInterrupted:
+                self._append_and_reduce(
+                    "approval_decided",
+                    {
+                        "call_key": call.call_key,
+                        "call_id": call.provider_call_id,
+                        "approved": False,
+                        "scope": "once",
+                    },
+                )
+                self._finish_requested_error(
+                    state_call,
+                    ToolStatus.CANCELLED,
+                    "tool approval interrupted",
+                )
+                raise KeyboardInterrupt from None
             approved = decision is ApprovalDecision.ALLOW_ONCE
             self._append_and_reduce(
                 "approval_decided",
@@ -170,7 +195,10 @@ class ToolExecutor:
                 raw_result = spec.handler(arguments)
             else:
                 assert prepared is not None
-                raw_result = prepared.execute()  # type: ignore[attr-defined]
+                if isinstance(prepared, PreparedShellCommand):
+                    raw_result = prepared.execute(on_output=self.on_output)
+                else:
+                    raw_result = prepared.execute()  # type: ignore[attr-defined]
             result = self._normalize_result(call.name, raw_result)
         except (FileConflictError, PathSafetyError) as error:
             result = _error_result(
@@ -191,7 +219,17 @@ class ToolExecutor:
                 _safe_error("tool execution failed", error),
             )
 
-        self._finish_started(state_call, result)
+        try:
+            self._finish_started(state_call, result)
+        except ToolExecutorError:
+            raise
+        except Exception as error:
+            result = _error_result(
+                call.name,
+                ToolStatus.FAILED,
+                _safe_error("tool result handling failed", error),
+            )
+            self._finish_started(state_call, result)
         return result
 
     def execute_call(self, accepted: AcceptedToolCall | ToolCall) -> ToolResult:
@@ -228,7 +266,11 @@ class ToolExecutor:
     def _approval_decision(self, request: ApprovalRequest) -> ApprovalDecision:
         try:
             decision = self.approver.decide(request)
-        except (Exception, KeyboardInterrupt):
+        except ApprovalInterrupted:
+            raise
+        except KeyboardInterrupt:
+            raise ApprovalInterrupted from None
+        except Exception:
             return ApprovalDecision.DENY
         if decision is ApprovalDecision.ALLOW_ONCE:
             return decision
@@ -247,13 +289,24 @@ class ToolExecutor:
             return ApprovalRequest.for_shell(
                 command=prepared.command, cwd=prepared.cwd
             )
+        spec = self.registry.resolve(name)
+        if spec.approval_renderer is not None:
+            rendered = spec.approval_renderer(prepared)
+            if not isinstance(rendered, str):
+                raise ToolExecutorError("approval renderer must return a string")
+            return ApprovalRequest(
+                tool_name=name,
+                target=_escape_terminal_text(rendered),
+                kind="rendered",
+            )
         raise ToolExecutorError(f"tool has no supported approval target: {name}")
 
     def _append_first_snapshot(
         self, call: ToolCall, prepared: PreparedFileChange
     ) -> None:
         path = str(prepared.canonical_path)
-        if (call.turn_id, path) in self.state.file_snapshots:
+        existing = self.state.file_snapshots.get((call.turn_id, path))
+        if existing is not None and existing.after_hash is not None:
             return
         self._append_and_reduce(
             "file_snapshot",
@@ -265,6 +318,7 @@ class ToolExecutor:
                 "before_encoding": "base64",
                 "before_mode": prepared.before_mode,
                 "before_hash": prepared.before_hash,
+                "call_key": call.call_key,
             },
         )
 
@@ -325,6 +379,14 @@ class ToolExecutor:
 
     def _normalize_result(self, name: str, raw_result: object) -> ToolResult:
         if isinstance(raw_result, ToolResult):
+            if (
+                not isinstance(raw_result.title, str)
+                or not raw_result.title
+                or not isinstance(raw_result.output, str)
+                or not isinstance(raw_result.status, str)
+                or not hasattr(raw_result.metadata, "get")
+            ):
+                raise TypeError(f"{name} returned an invalid ToolResult")
             return raw_result
         if isinstance(raw_result, ExecutedFileChange):
             path = str(raw_result.canonical_path)
@@ -335,6 +397,7 @@ class ToolExecutor:
                     "path": path,
                     "before_hash": raw_result.before_hash,
                     "after_hash": raw_result.after_hash,
+                    "durability_warning": raw_result.durability_warning,
                 },
             )
         raise TypeError(f"{name} returned an unsupported result")
@@ -346,6 +409,7 @@ class ToolExecutor:
         try:
             SessionReducer.apply(self.state, event)
         except Exception as error:
+            self._usable = False
             raise ToolExecutorError(
                 f"durable event {event.seq} could not be applied to state"
             ) from error

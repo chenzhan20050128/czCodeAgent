@@ -579,6 +579,7 @@ class SessionReducerTests(ReducerTestCase):
             "path": "src/app.py",
             "existed_before": True,
             "before_bytes": "Zmlyc3Q=",
+            "before_encoding": "base64",
             "before_mode": 0o644,
         }
         self.apply("file_snapshot", first_snapshot)
@@ -602,6 +603,95 @@ class SessionReducerTests(ReducerTestCase):
         self.assertEqual(snapshot.before_bytes, "Zmlyc3Q=")
         self.assertEqual(snapshot.before_mode, 0o644)
         self.assertEqual(snapshot.after_hash, "sha256:new")
+
+    def test_file_snapshot_rejects_non_base64_or_missing_mode(self) -> None:
+        self.start_turn()
+        invalid_payloads = (
+            {
+                "turn_id": self.turn_id,
+                "path": "bad.txt",
+                "existed_before": True,
+                "before_bytes": "not-base64!!",
+                "before_encoding": "base64",
+                "before_mode": 0o644,
+            },
+            {
+                "turn_id": self.turn_id,
+                "path": "missing-encoding.txt",
+                "existed_before": True,
+                "before_bytes": "b2xk",
+                "before_mode": 0o644,
+            },
+            {
+                "turn_id": self.turn_id,
+                "path": "missing-mode.txt",
+                "existed_before": True,
+                "before_bytes": "b2xk",
+                "before_encoding": "base64",
+                "before_mode": None,
+            },
+        )
+        for payload in invalid_payloads:
+            with self.subTest(path=payload["path"]):
+                event = Event.create(
+                    seq=self.state.last_seq + 1,
+                    session_id=self.session_id,
+                    event_type="file_snapshot",
+                    payload=payload,
+                )
+                with self.assertRaises(DomainError):
+                    SessionReducer.apply(self.state, event)
+                self.assertEqual(self.state.last_seq, 2)
+
+    def test_reconciled_success_preserves_original_snapshot_baseline(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("first", "write_file")]},
+        )
+        first_key = "3:first"
+        baseline = {
+            "turn_id": self.turn_id,
+            "path": "/workspace/project/file.txt",
+            "existed_before": True,
+            "before_bytes": "QQ==",
+            "before_encoding": "base64",
+            "before_mode": 0o644,
+            "call_key": first_key,
+        }
+        self.apply("file_snapshot", baseline)
+        self.apply("tool_started", {"call_key": first_key})
+        self.apply(
+            "tool_finished",
+            {
+                "call_key": first_key,
+                "status": "outcome_unknown",
+                "result": "unknown",
+                "recovery_blocked": True,
+            },
+        )
+        self.apply(
+            "tool_reconciled",
+            {"call_key": first_key, "outcome": "succeeded", "note": "verified"},
+        )
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("second", "write_file")]},
+        )
+        self.apply(
+            "file_snapshot",
+            {
+                **baseline,
+                "before_bytes": "Qg==",
+                "call_key": "8:second",
+            },
+        )
+
+        snapshot = self.state.file_snapshots[
+            (self.turn_id, "/workspace/project/file.txt")
+        ]
+        self.assertEqual(snapshot.before_bytes, "QQ==")
+        self.assertEqual(snapshot.source_call_key, first_key)
 
     def test_tool_reconciled_closes_an_unknown_outcome(self) -> None:
         self.start_turn()

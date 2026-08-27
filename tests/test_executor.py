@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+import os
 import sys
 import tempfile
 import unittest
@@ -15,7 +17,7 @@ from unittest.mock import Mock, patch
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from mca.approval import ApprovalDecision
+from mca.approval import ApprovalDecision, ApprovalRequest
 from mca.domain import SessionReducer, SessionState, ToolStatus
 from mca.executor import AcceptedToolCall, ToolExecutor, ToolExecutorError
 from mca.store import RolloutStore
@@ -178,6 +180,73 @@ class ToolExecutorTests(ExecutorTestCase):
         self.assertEqual(len(approver.requests), 1)
         self.assertIn(str(path.resolve()), str(approver.requests[0]))
 
+    def test_approval_keyboard_interrupt_terminalizes_cancelled_then_propagates(self) -> None:
+        path = self.workspace / "notes.txt"
+        path.write_text("old", encoding="utf-8")
+        call = self.accept(
+            "write_file", '{"path":"notes.txt","content":"new"}'
+        )
+        approver = Mock()
+        approver.decide.side_effect = KeyboardInterrupt
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.executor(approver=approver).execute(call)
+
+        events = self.events_after_acceptance()
+        self.assertEqual(
+            [event.type for event in events],
+            ["approval_decided", "tool_finished"],
+        )
+        self.assertIs(events[0].payload["approved"], False)
+        self.assertEqual(events[1].payload["status"], "cancelled")
+        self.assertEqual(path.read_text(encoding="utf-8"), "old")
+
+    def test_custom_side_effect_uses_its_approval_renderer(self) -> None:
+        class Prepared:
+            def execute(self) -> ToolResult:
+                return ToolResult(title="custom", output="ran")
+
+        registry = ToolRegistry(
+            [
+                ToolSpec(
+                    "custom",
+                    "Custom side effect.",
+                    {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                    prepare_handler=lambda _: Prepared(),
+                    side_effect=True,
+                    approval_renderer=lambda _: "Custom target\x1b[31m",
+                )
+            ]
+        )
+        approver = RecordingApprover(ApprovalDecision.ALLOW_ONCE)
+        call = self.accept("custom", "{}")
+
+        result = self.executor(registry=registry, approver=approver).execute(call)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(approver.requests[0].render(), r"Custom target\x1b[31m")
+
+    def test_shell_executor_forwards_live_output_callback(self) -> None:
+        chunks: list[tuple[str, str]] = []
+        call = self.accept("bash", '{"command":"printf live"}')
+        executor = ToolExecutor(
+            create_tool_registry(self.workspace),
+            self.store,
+            self.state,
+            RecordingApprover(ApprovalDecision.ALLOW_ONCE),
+            self.workspace,
+            on_output=lambda stream, text: chunks.append((stream, text)),
+        )
+
+        executor.execute(call)
+
+        self.assertIn(("stdout", "live"), chunks)
+
     def test_write_orders_approval_snapshot_start_effect_and_success(self) -> None:
         path = self.workspace / "notes.txt"
         before = b"old\n"
@@ -265,6 +334,81 @@ class ToolExecutorTests(ExecutorTestCase):
             state_snapshot.after_hash, hashlib.sha256(b"latest").hexdigest()
         )
 
+    def test_failed_first_write_does_not_freeze_a_stale_undo_baseline(self) -> None:
+        path = self.workspace / "notes.txt"
+        path.write_text("v1", encoding="utf-8")
+        first = self.accept(
+            "write_file", '{"path":"notes.txt","content":"first"}', call_id="one"
+        )
+        executor = self.executor()
+        original_execute = PreparedFileChange.execute
+
+        def conflict(prepared: PreparedFileChange):
+            path.write_text("v2", encoding="utf-8")
+            return original_execute(prepared)
+
+        with patch.object(PreparedFileChange, "execute", conflict):
+            result = executor.execute(first)
+        self.assertEqual(result.status, "conflict")
+        self.append(
+            "assistant_accepted",
+            {
+                "tool_calls": [
+                    {
+                        "id": "two",
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": '{"path":"notes.txt","content":"v3"}',
+                        },
+                    }
+                ]
+            },
+        )
+        second = AcceptedToolCall(
+            call_key=f"{self.state.last_seq}:two",
+            provider_call_id="two",
+            name="write_file",
+            raw_arguments='{"path":"notes.txt","content":"v3"}',
+        )
+
+        executor.execute(second)
+
+        snapshot = self.state.file_snapshots[(self.turn_id, str(path.resolve()))]
+        self.assertEqual(snapshot.before_bytes, base64.b64encode(b"v2").decode())
+        self.assertEqual(snapshot.after_hash, hashlib.sha256(b"v3").hexdigest())
+
+    def test_post_replace_fsync_failure_is_recorded_as_committed_success(self) -> None:
+        path = self.workspace / "committed.txt"
+        path.write_text("before", encoding="utf-8")
+        call = self.accept(
+            "write_file", '{"path":"committed.txt","content":"after"}'
+        )
+        real_fsync = os.fsync
+        fsync_calls = 0
+
+        def fail_directory_fsync(descriptor: int) -> None:
+            nonlocal fsync_calls
+            fsync_calls += 1
+            if fsync_calls == 2:
+                raise OSError("directory fsync failed")
+            real_fsync(descriptor)
+
+        with patch(
+            "mca.tools.filesystem._fsync_directory",
+            side_effect=OSError("directory fsync failed"),
+        ):
+            result = self.executor().execute(call)
+
+        self.assertEqual(path.read_text(encoding="utf-8"), "after")
+        self.assertEqual(result.status, "succeeded")
+        self.assertIs(result.metadata["durability_warning"], True)
+        finished = self.events_after_acceptance()[-1]
+        self.assertEqual(finished.payload["status"], "succeeded")
+        self.assertEqual(
+            finished.payload["after_hash"], hashlib.sha256(b"after").hexdigest()
+        )
+
     def test_semantic_prepare_error_is_invalid_before_approval(self) -> None:
         call = self.accept(
             "edit_file", '{"path":"missing.txt","old_text":"a","new_text":"b"}'
@@ -319,6 +463,50 @@ class ToolExecutorTests(ExecutorTestCase):
             "tool execution failed: RuntimeError: boom",
         )
 
+    def test_malformed_tool_result_still_gets_one_terminal_failure(self) -> None:
+        def malformed(_: dict[str, object]) -> object:
+            return object.__new__(ToolResult)
+
+        invalid = malformed({})
+        object.__setattr__(invalid, "title", "x")
+        object.__setattr__(invalid, "output", "x")
+        object.__setattr__(invalid, "status", "succeeded")
+        object.__setattr__(invalid, "metadata", None)
+        registry = ToolRegistry(
+            [
+                ToolSpec(
+                    "malformed",
+                    "Return malformed result.",
+                    {
+                        "type": "object",
+                        "properties": {},
+                        "required": [],
+                        "additionalProperties": False,
+                    },
+                    handler=lambda _: invalid,
+                    side_effect=SideEffect.NONE,
+                )
+            ]
+        )
+        call = self.accept("malformed", "{}")
+
+        result = self.executor(registry=registry).execute(call)
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(
+            [event.type for event in self.events_after_acceptance()],
+            ["tool_started", "tool_finished"],
+        )
+        self.assertEqual(
+            self.state.tool_calls[call.call_key].status, ToolStatus.FAILED
+        )
+
+    def test_executor_rejects_registry_bound_to_another_workspace(self) -> None:
+        other = self.root / "other"
+        other.mkdir()
+        with self.assertRaisesRegex(ValueError, "registry workspace"):
+            self.executor(registry=create_tool_registry(other))
+
     def test_shell_result_status_and_metadata_are_persisted(self) -> None:
         call = self.accept("bash", '{"command":"exit 4"}')
 
@@ -352,15 +540,18 @@ class ToolExecutorTests(ExecutorTestCase):
         (self.workspace / "notes.txt").write_text("hello", encoding="utf-8")
         call = self.accept("read_file", '{"path":"notes.txt"}')
 
+        executor = self.executor()
         with patch(
             "mca.executor.SessionReducer.apply", side_effect=RuntimeError("bad reducer")
         ):
             with self.assertRaisesRegex(ToolExecutorError, "durable event"):
-                self.executor().execute(call)
+                executor.execute(call)
 
         self.assertEqual(
             [event.type for event in self.events_after_acceptance()], ["tool_started"]
         )
+        with self.assertRaisesRegex(ToolExecutorError, "unusable"):
+            executor.execute(call)
 
 
 if __name__ == "__main__":

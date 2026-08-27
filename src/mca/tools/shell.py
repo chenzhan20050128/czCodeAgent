@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -133,8 +134,23 @@ class PreparedShellCommand:
                 daemon=True,
             ),
         )
-        for thread in threads:
-            thread.start()
+        started_threads: list[threading.Thread] = []
+        try:
+            for thread in threads:
+                thread.start()
+                started_threads.append(thread)
+        except BaseException as error:
+            _stop_process_group(
+                process, signal.SIGTERM, self.termination_grace_seconds
+            )
+            _close_pipes(process.stdout, process.stderr)
+            _join_threads(
+                tuple(started_threads), timeout=self.termination_grace_seconds
+            )
+            if process.poll() is None:
+                process.kill()
+            process.wait()
+            raise ShellToolError("failed to start output drain") from error
 
         timed_out = False
         interrupted = False
@@ -156,8 +172,22 @@ class PreparedShellCommand:
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
             process.wait()
-            for thread in threads:
-                thread.join()
+            drains_finished = _join_threads(
+                tuple(started_threads), timeout=self.termination_grace_seconds
+            )
+            if not drains_finished:
+                timed_out = True
+                stderr.append(
+                    b"pipe drain did not finish after shell exit; "
+                    b"descendants were terminated\n"
+                )
+                _stop_process_group(
+                    process, signal.SIGTERM, self.termination_grace_seconds
+                )
+                _close_pipes(process.stdout, process.stderr)
+                _join_threads(
+                    tuple(started_threads), timeout=self.termination_grace_seconds
+                )
 
         output, rendering_truncated = _render_streams(
             stdout.text(),
@@ -261,7 +291,10 @@ def _drain_pipe(
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
     try:
         while True:
-            chunk = os.read(pipe.fileno(), 8192)
+            try:
+                chunk = os.read(pipe.fileno(), 8192)
+            except OSError:
+                break
             if not chunk:
                 break
             capture.append(chunk)
@@ -278,28 +311,78 @@ def _drain_pipe(
             except Exception:
                 pass
     finally:
-        pipe.close()
+        try:
+            pipe.close()
+        except OSError:
+            pass
 
 
 def _stop_process_group(
     process: subprocess.Popen[bytes], first_signal: signal.Signals, grace: float
 ) -> None:
-    if process.poll() is not None:
-        return
+    group_signalled = _signal_process_group(process.pid, first_signal)
+    if not group_signalled and process.poll() is None:
+        try:
+            process.send_signal(first_signal)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + grace
+    while _process_group_exists(process.pid) and time.monotonic() < deadline:
+        if process.poll() is None:
+            try:
+                process.wait(timeout=min(0.02, max(0.001, deadline - time.monotonic())))
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            time.sleep(min(0.02, max(0.001, deadline - time.monotonic())))
+    if _process_group_exists(process.pid):
+        group_killed = _signal_process_group(process.pid, signal.SIGKILL)
+        if not group_killed and process.poll() is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+    if process.poll() is None:
+        process.wait()
+
+
+def _signal_process_group(
+    process_group_id: int, requested_signal: signal.Signals
+) -> bool:
     try:
-        os.killpg(process.pid, first_signal)
+        os.killpg(process_group_id, requested_signal)
     except ProcessLookupError:
-        pass
+        return True
+    except PermissionError:
+        return False
+    return True
+
+
+def _process_group_exists(process_group_id: int) -> bool:
     try:
-        process.wait(timeout=grace)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
+        os.killpg(process_group_id, 0)
     except ProcessLookupError:
-        pass
-    process.wait()
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _join_threads(
+    threads: tuple[threading.Thread, ...], *, timeout: float
+) -> bool:
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        thread.join(timeout=max(0.0, deadline - time.monotonic()))
+    return all(not thread.is_alive() for thread in threads)
+
+
+def _close_pipes(*pipes: BinaryIO) -> None:
+    for pipe in pipes:
+        try:
+            pipe.close()
+        except OSError:
+            pass
 
 
 def _render_streams(

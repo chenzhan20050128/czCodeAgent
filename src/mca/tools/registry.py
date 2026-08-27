@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
@@ -83,6 +85,16 @@ class ToolResult:
     metadata: Mapping[str, object] = field(default_factory=dict)
     status: str = "succeeded"
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.title, str) or not self.title:
+            raise ValueError("tool result title must be a non-empty string")
+        if not isinstance(self.output, str):
+            raise ValueError("tool result output must be a string")
+        if not isinstance(self.metadata, Mapping):
+            raise ValueError("tool result metadata must be an object")
+        if not isinstance(self.status, str) or not self.status:
+            raise ValueError("tool result status must be a non-empty string")
+
     @classmethod
     def bounded(
         cls,
@@ -112,7 +124,17 @@ class ToolResult:
 class ToolRegistry:
     """A fixed, name-addressable set of explicit tool specifications."""
 
-    def __init__(self, specs: Sequence[ToolSpec] = ()) -> None:
+    def __init__(
+        self,
+        specs: Sequence[ToolSpec] = (),
+        *,
+        workspace: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self.workspace = (
+            Path(workspace).resolve(strict=True) if workspace is not None else None
+        )
+        if self.workspace is not None and not self.workspace.is_dir():
+            raise ValueError("registry workspace must be a directory")
         self._specs: dict[str, ToolSpec] = {}
         for spec in specs:
             if spec.name in self._specs:

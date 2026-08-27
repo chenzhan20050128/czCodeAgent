@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from mca.approval import (
     ApprovalDecision,
+    ApprovalInterrupted,
     ApprovalRequest,
     InteractiveApprover,
 )
@@ -76,8 +77,60 @@ class ApprovalRequestTests(unittest.TestCase):
                 f"Cwd: {canonical_workspace}\n"
                 "Command:\n"
                 "printf 'hello world'\n"
+                "Warning: shell commands may start descendant processes; "
+                "MCA does not manage background jobs after command completion.\n"
             ),
         )
+
+    def test_shell_render_escapes_terminal_controls_without_changing_raw_values(self) -> None:
+        command = (
+            "printf '\x1b[31mred\x1b[0m'\rOVER\nnext\t"
+            "\x1b]8;;https://evil.invalid\x07link\x1b]8;;\x07\u202e\u2066"
+        )
+        cwd = "/tmp/work\nlabel\t\x1b]0;owned\x07\u202d"
+        request = ApprovalRequest(
+            tool_name="bash",
+            target=command,
+            kind="shell",
+            cwd=cwd,
+        )
+
+        rendered = request.render()
+
+        self.assertEqual(request.target, command)
+        self.assertEqual(request.cwd, cwd)
+        for unsafe in ("\x1b", "\x07", "\r", "\t", "\u202e", "\u2066", "\u202d"):
+            self.assertNotIn(unsafe, rendered)
+        self.assertIn(r"\x1b[31mred\x1b[0m", rendered)
+        self.assertIn(r"\rOVER\nnext\t", rendered)
+        self.assertIn(r"\x1b]8;;https://evil.invalid\x07link", rendered)
+        self.assertIn(r"\u202e\u2066", rendered)
+        self.assertIn(r"Cwd: /tmp/work\nlabel\t\x1b]0;owned\x07\u202d", rendered)
+
+    def test_file_render_preserves_only_structural_newlines(self) -> None:
+        target = "/tmp/file\nname\t\x1b\u202e.txt"
+        diff = (
+            "--- old\n+++ new\n@@ -1 +1 @@\n"
+            "-safe\rhidden\n+new\t\x1b]8;;x\x07link\b\x85\u2067\n"
+        )
+        request = ApprovalRequest(
+            tool_name="write_file",
+            target=target,
+            kind="file",
+            diff=diff,
+            before_hash="abc",
+        )
+
+        rendered = request.render()
+
+        self.assertEqual(request.target, target)
+        self.assertEqual(request.diff, diff)
+        for unsafe in ("\x1b", "\x07", "\r", "\t", "\b", "\x85", "\u202e", "\u2067"):
+            self.assertNotIn(unsafe, rendered)
+        self.assertIn(r"Path: /tmp/file\nname\t\x1b\u202e.txt", rendered)
+        self.assertIn("Diff:\n--- old\n+++ new\n@@ -1 +1 @@\n", rendered)
+        self.assertIn(r"-safe\rhidden", rendered)
+        self.assertIn(r"+new\t\x1b]8;;x\x07link\b\x85\u2067", rendered)
 
 
 class InteractiveApproverTests(unittest.TestCase):
@@ -117,18 +170,23 @@ class InteractiveApproverTests(unittest.TestCase):
                 ).decide(self.request())
                 self.assertIs(decision, ApprovalDecision.DENY)
 
-    def test_eof_and_keyboard_interrupt_fail_closed(self) -> None:
-        for error in (EOFError(), KeyboardInterrupt()):
-            with self.subTest(error=type(error).__name__):
-                def interrupt(_: str, raised: BaseException = error) -> str:
-                    raise raised
+    def test_eof_fails_closed_as_denial(self) -> None:
+        def eof(_: str) -> str:
+            raise EOFError
 
-                decision = InteractiveApprover(
-                    input_fn=interrupt, output_fn=lambda _: None
-                ).decide(
-                    self.request()
-                )
-                self.assertIs(decision, ApprovalDecision.DENY)
+        decision = InteractiveApprover(
+            input_fn=eof, output_fn=lambda _: None
+        ).decide(self.request())
+        self.assertIs(decision, ApprovalDecision.DENY)
+
+    def test_keyboard_interrupt_fails_closed_and_remains_distinguishable(self) -> None:
+        def interrupt(_: str) -> str:
+            raise KeyboardInterrupt
+
+        with self.assertRaises(ApprovalInterrupted):
+            InteractiveApprover(
+                input_fn=interrupt, output_fn=lambda _: None
+            ).decide(self.request())
 
     def test_yolo_bypasses_interaction_but_returns_allow_once(self) -> None:
         input_fn = Mock(side_effect=AssertionError("input must not be called"))

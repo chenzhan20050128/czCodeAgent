@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING
+import unicodedata
 
 if TYPE_CHECKING:
     from .tools.filesystem import PreparedFileChange
@@ -17,6 +18,10 @@ class ApprovalDecision(str, Enum):
 
     ALLOW_ONCE = "allow_once"
     DENY = "deny"
+
+
+class ApprovalInterrupted(KeyboardInterrupt):
+    """The operator cancelled approval; callers must stop the remaining batch."""
 
 
 @dataclass(frozen=True)
@@ -57,21 +62,52 @@ class ApprovalRequest:
         if self.kind == "file":
             before = self.before_hash if self.before_hash is not None else "<absent>"
             return (
-                f"Tool: {self.tool_name}\n"
-                f"Path: {self.target}\n"
+                f"Tool: {_escape_terminal_text(self.tool_name)}\n"
+                f"Path: {_escape_terminal_text(self.target)}\n"
                 f"Before SHA-256: {before}\n"
                 "Diff:\n"
-                f"{self.diff or ''}"
+                f"{_escape_terminal_text(self.diff or '', preserve_newlines=True)}"
             )
         if self.kind == "shell":
             return (
                 "Tool: bash\n"
                 "Shell: /bin/sh -lc\n"
-                f"Cwd: {self.cwd}\n"
+                f"Cwd: {_escape_terminal_text(self.cwd or '')}\n"
                 "Command:\n"
-                f"{self.target}\n"
+                f"{_escape_terminal_text(self.target)}\n"
+                "Warning: shell commands may start descendant processes; "
+                "MCA does not manage background jobs after command completion.\n"
             )
+        if self.kind == "rendered":
+            return self.target
         raise ValueError(f"unknown approval request kind: {self.kind}")
+
+
+def _escape_terminal_text(value: str, *, preserve_newlines: bool = False) -> str:
+    """Make untrusted text inert while retaining readable diff line structure."""
+
+    rendered: list[str] = []
+    for character in value:
+        codepoint = ord(character)
+        if character == "\n" and preserve_newlines:
+            rendered.append(character)
+        elif character == "\n":
+            rendered.append(r"\n")
+        elif character == "\r":
+            rendered.append(r"\r")
+        elif character == "\t":
+            rendered.append(r"\t")
+        elif character == "\b":
+            rendered.append(r"\b")
+        elif codepoint <= 0xFF and (
+            codepoint < 0x20 or 0x7F <= codepoint <= 0x9F
+        ):
+            rendered.append(f"\\x{codepoint:02x}")
+        elif unicodedata.category(character) == "Cf":
+            rendered.append(f"\\u{codepoint:04x}")
+        else:
+            rendered.append(character)
+    return "".join(rendered)
 
 
 class InteractiveApprover:
@@ -94,11 +130,18 @@ class InteractiveApprover:
         self._output(request.render())
         try:
             answer = self._input("Allow once? [y/N] ")
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             return ApprovalDecision.DENY
+        except KeyboardInterrupt:
+            raise ApprovalInterrupted from None
         if answer.strip().lower() in {"y", "yes"}:
             return ApprovalDecision.ALLOW_ONCE
         return ApprovalDecision.DENY
 
 
-__all__ = ["ApprovalDecision", "ApprovalRequest", "InteractiveApprover"]
+__all__ = [
+    "ApprovalDecision",
+    "ApprovalInterrupted",
+    "ApprovalRequest",
+    "InteractiveApprover",
+]

@@ -163,7 +163,7 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             ).render(),
         ),
     ]
-    return ToolRegistry(specs)
+    return ToolRegistry(specs, workspace=Path(workspace))
 
 __all__ = [
     "SideEffect",

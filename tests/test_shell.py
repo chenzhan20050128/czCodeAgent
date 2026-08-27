@@ -5,6 +5,7 @@ from __future__ import annotations
 import _thread
 import os
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
@@ -180,6 +181,82 @@ class ShellRunnerTests(unittest.TestCase):
             time.sleep(0.02)
         else:
             self.fail(f"child process {child_pid} survived timeout cleanup")
+
+    def test_parent_exit_with_descendant_holding_pipes_is_bounded_and_cleaned(self) -> None:
+        command = (
+            "(trap '' TERM; sleep 60) & child=$!; "
+            "printf '%s' \"$child\" > detached.pid; "
+            "exit 0"
+        )
+        outcome: list[object] = []
+
+        def execute() -> None:
+            outcome.append(
+                ShellRunner(self.workspace, termination_grace_seconds=0.1)
+                .prepare({"command": command, "timeout_seconds": 1})
+                .execute()
+            )
+
+        worker = threading.Thread(target=execute, daemon=True)
+        worker.start()
+        worker.join(timeout=2)
+        child_pid = int((self.workspace / "detached.pid").read_text(encoding="utf-8"))
+        if worker.is_alive():
+            os.kill(child_pid, signal.SIGKILL)
+            worker.join(timeout=2)
+            self.fail("shell execution hung while a descendant held its pipes")
+        result = outcome[0]
+        self.assertEqual(result.status, "timed_out")
+        self.assertIs(result.metadata["timed_out"], True)
+        self.assertIn("pipe drain", result.output)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.02)
+        else:
+            self.fail(f"descendant process {child_pid} survived pipe cleanup")
+
+    def test_group_signal_permission_error_falls_back_to_parent_cleanup(self) -> None:
+        started = time.monotonic()
+        with patch("mca.tools.shell.os.killpg", side_effect=PermissionError):
+            result = ShellRunner(
+                self.workspace, termination_grace_seconds=0.05
+            ).prepare(
+                {"command": "sleep 60", "timeout_seconds": 1}
+            ).execute()
+
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(result.status, "timed_out")
+        self.assertIsNotNone(result.metadata["exit_code"])
+
+    def test_thread_start_failure_reaps_started_shell(self) -> None:
+        real_popen = subprocess.Popen
+        processes: list[subprocess.Popen[bytes]] = []
+
+        def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("mca.tools.shell.subprocess.Popen", side_effect=recording_popen),
+            patch(
+                "mca.tools.shell.threading.Thread.start",
+                side_effect=RuntimeError("cannot start drain"),
+            ),
+        ):
+            with self.assertRaisesRegex(ShellToolError, "output drain"):
+                ShellRunner(
+                    self.workspace, termination_grace_seconds=0.05
+                ).prepare(
+                    {"command": "sleep 60", "timeout_seconds": 10}
+                ).execute()
+
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
 
     def test_keyboard_interrupt_interrupts_group_and_returns_terminal_result(self) -> None:
         runner = ShellRunner(self.workspace, termination_grace_seconds=0.1)

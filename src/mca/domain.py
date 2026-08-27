@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import math
 import uuid
+import base64
+import binascii
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -308,6 +310,7 @@ class FileSnapshot:
     before_bytes: str
     before_mode: int | None
     after_hash: str | None = None
+    source_call_key: str | None = None
 
     def __post_init__(self) -> None:
         _canonical_uuid(self.turn_id, field_name="turn_id")
@@ -317,14 +320,30 @@ class FileSnapshot:
             raise DomainError("existed_before must be a boolean")
         if not isinstance(self.before_bytes, str):
             raise DomainError("before_bytes must be a string")
+        try:
+            decoded_before = base64.b64decode(
+                self.before_bytes.encode("ascii"), validate=True
+            )
+        except (UnicodeEncodeError, binascii.Error):
+            raise DomainError("before_bytes must be valid base64") from None
+        if self.existed_before and self.before_mode is None:
+            raise DomainError("before_mode is required for an existing file")
+        if not self.existed_before and self.before_mode is not None:
+            raise DomainError("before_mode must be null for a new file")
+        if not self.existed_before and decoded_before:
+            raise DomainError("a new file must have an empty baseline")
         if self.before_mode is not None and (
-            type(self.before_mode) is not int or self.before_mode < 0
+            type(self.before_mode) is not int or not 0 <= self.before_mode <= 0o7777
         ):
-            raise DomainError("before_mode must be a non-negative integer or null")
+            raise DomainError("before_mode must be permission bits or null")
         if self.after_hash is not None and (
             not isinstance(self.after_hash, str) or not self.after_hash
         ):
             raise DomainError("after_hash must be a non-empty string or null")
+        if self.source_call_key is not None and (
+            not isinstance(self.source_call_key, str) or not self.source_call_key
+        ):
+            raise DomainError("source_call_key must be a non-empty string or null")
 
 
 @dataclass
@@ -732,7 +751,7 @@ class SessionReducer:
         before_bytes = event.payload.get("before_bytes", "")
         if not isinstance(before_bytes, str):
             raise DomainError("before_bytes must be a string")
-        before_encoding = event.payload.get("before_encoding", "base64")
+        before_encoding = event.payload.get("before_encoding")
         if before_encoding != "base64":
             raise DomainError("before_encoding must be base64")
         before_mode = event.payload.get("before_mode")
@@ -743,8 +762,25 @@ class SessionReducer:
             before_bytes=before_bytes,
             before_mode=before_mode,
             after_hash=event.payload.get("after_hash"),
+            source_call_key=event.payload.get("call_key"),
         )
-        state.file_snapshots.setdefault((turn_id, path), snapshot)
+        key = (turn_id, path)
+        existing = state.file_snapshots.get(key)
+        if existing is None:
+            state.file_snapshots[key] = snapshot
+        elif existing.after_hash is None and existing.source_call_key is not None:
+            source_call = state.tool_calls.get(existing.source_call_key)
+            known_no_effect = {
+                ToolStatus.FAILED,
+                ToolStatus.CONFLICT,
+                ToolStatus.INTERRUPTED,
+                ToolStatus.CANCELLED,
+                ToolStatus.DENIED,
+                ToolStatus.INVALID_ARGUMENTS,
+                ToolStatus.NOT_EXECUTED,
+            }
+            if source_call is not None and source_call.status in known_no_effect:
+                state.file_snapshots[key] = snapshot
 
     @staticmethod
     def _apply_sampling_failed(state: SessionState, event: Event) -> None:
@@ -755,7 +791,8 @@ class SessionReducer:
         turn_id = _payload_uuid(event.payload, "turn_id")
         if turn_id not in state.turns:
             raise DomainError("undo references an unknown turn")
-        if turn_id in state.undo_results:
+        previous = state.undo_results.get(turn_id)
+        if previous is not None and previous.payload.get("status") == "succeeded":
             raise DomainError("turn has already been undone")
         status = event.payload.get("status")
         if status not in {"succeeded", "conflict", "partial"}:

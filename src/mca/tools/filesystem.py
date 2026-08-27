@@ -115,6 +115,7 @@ class ExecutedFileChange:
     canonical_path: Path
     before_hash: str | None
     after_hash: str
+    durability_warning: bool = False
 
 
 @dataclass(frozen=True)
@@ -154,12 +155,12 @@ class PreparedFileChange:
             target = self._assert_unchanged()
             os.replace(temp_path, target)
             temp_path = None
-            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            parent_descriptor = os.open(parent, flags)
             try:
-                os.fsync(parent_descriptor)
-            finally:
-                os.close(parent_descriptor)
+                _fsync_directory(parent)
+            except BaseException:
+                durability_warning = True
+            else:
+                durability_warning = False
         finally:
             if temp_path is not None:
                 try:
@@ -170,6 +171,7 @@ class PreparedFileChange:
             canonical_path=target,
             before_hash=self.before_hash,
             after_hash=sha256_bytes(self.proposed_bytes),
+            durability_warning=durability_warning,
         )
 
     def _assert_unchanged(self) -> Path:
@@ -455,3 +457,12 @@ def _unified_diff(
         ):
             rendered.append("\\ No newline at end of file\n")
     return "".join(rendered)
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
