@@ -48,13 +48,29 @@ class FileSystemToolTests(unittest.TestCase):
 
         self.assertEqual(resolver.resolve_read("src/main.py"), path.resolve())
 
-    def test_resolver_rejects_empty_absolute_nul_and_escape_paths(self) -> None:
+    def test_resolver_accepts_a_workspace_internal_absolute_path(self) -> None:
+        path = self.write_bytes("src/main.py", b"pass\n")
+        resolver = WorkspaceResolver(self.workspace)
+
+        absolute = str(self.workspace / "src" / "main.py")
+        self.assertEqual(resolver.resolve_read(absolute), path.resolve())
+
+    def test_resolver_accepts_the_workspace_root_as_an_absolute_path(self) -> None:
+        resolver = WorkspaceResolver(self.workspace)
+
+        self.assertEqual(
+            resolver.resolve_read(str(self.workspace)), self.workspace.resolve()
+        )
+
+    def test_resolver_rejects_empty_nul_and_escaping_paths(self) -> None:
         resolver = WorkspaceResolver(self.workspace)
         sibling = self.workspace.with_name(self.workspace.name + "-sibling")
         sibling.mkdir()
         cases = [
             "",
-            str(self.workspace / "file.txt"),
+            str(sibling / "file.txt"),
+            "/etc/hosts",
+            "C:\\Windows\\system32",
             "bad\0name",
             "../outside.txt",
             f"../{sibling.name}/file.txt",
@@ -63,6 +79,14 @@ class FileSystemToolTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(PathSafetyError):
                     resolver.resolve_read(value, must_exist=False)
+
+    def test_write_accepts_a_workspace_internal_absolute_path(self) -> None:
+        change = self.tools.prepare_write_file(
+            {"path": str(self.workspace / "out.txt"), "content": "hi\n"}
+        )
+        change.execute()
+
+        self.assertEqual((self.workspace / "out.txt").read_text(encoding="utf-8"), "hi\n")
 
     def test_read_can_follow_an_internal_symlink_but_not_an_external_one(self) -> None:
         target = self.write_bytes("real.txt", b"inside")

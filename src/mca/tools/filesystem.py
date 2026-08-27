@@ -96,12 +96,33 @@ class WorkspaceResolver:
             raise PathSafetyError("path must be a non-empty relative path")
         if "\0" in requested:
             raise PathSafetyError("path must not contain NUL")
-        path = Path(requested)
-        if path.is_absolute() or PureWindowsPath(requested).is_absolute():
+        if PureWindowsPath(requested).is_absolute() and not requested.startswith(
+            "/"
+        ):
+            # Drive-letter or UNC absolute paths can never be workspace-internal.
             raise PathSafetyError("absolute paths are not allowed")
+        path = Path(requested)
+        if path.is_absolute():
+            return self._relativize_absolute(requested)
         if any(part == ".." for part in path.parts):
             raise PathSafetyError("parent path components are not allowed")
         return path
+
+    def _relativize_absolute(self, requested: str) -> Path:
+        """Accept an absolute path only if it names a location inside the tree.
+
+        The workspace is stored in canonical form, so the request is
+        canonicalized the same way before comparison; this maps the ``/var``
+        vs ``/private/var`` style aliases and collapses ``..`` while still
+        rejecting anything that resolves outside the workspace.
+        """
+
+        normalized = Path(os.path.realpath(requested))
+        try:
+            relative = normalized.relative_to(self.workspace)
+        except ValueError:
+            raise PathSafetyError("absolute path escapes workspace") from None
+        return relative if relative.parts else Path(".")
 
     def _require_inside(self, path: Path) -> None:
         try:

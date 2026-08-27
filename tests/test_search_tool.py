@@ -255,11 +255,21 @@ class SearchToolTests(unittest.TestCase):
         self.assertNotIn("os.walk", source)
         self.assertNotIn("_python_search", source)
 
-    def test_path_must_remain_in_workspace(self) -> None:
-        for path in ("../outside", str(self.workspace)):
+    def test_path_outside_workspace_is_rejected(self) -> None:
+        for path in ("../outside", "/etc"):
             with self.subTest(path=path):
                 with self.assertRaises(PathSafetyError):
                     self.search.grep({"pattern": "x", "path": path})
+
+    def test_grep_accepts_a_workspace_internal_absolute_path(self) -> None:
+        self.write_text("pkg/mod.py", "needle here\n")
+        process = FakeProcess(stdout_chunks=["pkg/mod.py:1:needle here\n"])
+        with patch("mca.tools.search.subprocess.Popen", return_value=process):
+            result = self.search.grep(
+                {"pattern": "needle", "path": str(self.workspace / "pkg")}
+            )
+        self.assertEqual(result.status, "succeeded")
+        self.assertIn("needle", result.output)
 
 
 if __name__ == "__main__":

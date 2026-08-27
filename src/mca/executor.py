@@ -226,11 +226,22 @@ class ToolExecutor:
                     raw_result = prepared.execute()  # type: ignore[attr-defined]
             result = self._normalize_result(call.name, raw_result)
         except (FileConflictError, PathSafetyError) as error:
-            result = _error_result(
-                call.name,
-                ToolStatus.CONFLICT,
-                _safe_error("tool execution conflict", error),
+            # A side-effecting prepared write that fails path/hash revalidation at
+            # commit time is a genuine time-of-check/time-of-use conflict. A
+            # read-only handler has no prepare step, so the same exception there
+            # is just a bad-argument failure and must not borrow conflict's
+            # undo/TOCTOU meaning.
+            status = (
+                ToolStatus.CONFLICT
+                if spec.prepare_handler is not None
+                else ToolStatus.FAILED
             )
+            label = (
+                "tool execution conflict"
+                if status is ToolStatus.CONFLICT
+                else "tool execution failed"
+            )
+            result = _error_result(call.name, status, _safe_error(label, error))
         except KeyboardInterrupt:
             result = _error_result(
                 call.name,

@@ -647,6 +647,32 @@ class ToolExecutorTests(ExecutorTestCase):
         self.assertEqual(events[-1].payload["exit_code"], 4)
         self.assertIs(events[-1].payload["truncated"], False)
 
+    def test_read_tool_path_safety_error_is_failed_not_conflict(self) -> None:
+        outside = self.root / "outside.txt"
+        outside.write_text("secret", encoding="utf-8")
+        call = self.accept("read_file", '{"path":"../outside.txt"}')
+
+        result = self.executor().execute(call)
+
+        events = self.events_after_acceptance()
+        self.assertEqual(
+            [event.type for event in events], ["tool_started", "tool_finished"]
+        )
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(events[-1].payload["status"], "failed")
+        self.assertIn("tool execution failed", events[-1].payload["result"])
+
+    def test_list_dir_accepts_a_workspace_internal_absolute_path(self) -> None:
+        (self.workspace / "child.txt").write_text("x", encoding="utf-8")
+        call = self.accept(
+            "list_dir", f'{{"path": {json.dumps(str(self.workspace))}}}'
+        )
+
+        result = self.executor().execute(call)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertIn("child.txt", result.output)
+
     def test_identity_mismatch_fails_loudly_before_any_new_event(self) -> None:
         call = self.accept("read_file", '{"path":"missing"}')
         mismatched = AcceptedToolCall(
