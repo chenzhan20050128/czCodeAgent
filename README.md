@@ -38,6 +38,7 @@ user input ──> AgentLoop ──> ModelClient (SSE, bounded retry)
 - **executor.py / approval.py / undo.py** — approval, atomic writes, managed undo.
 - **compact.py** — checkpoint generation at a complete sampling boundary.
 - **session.py** — resume, crash recovery, and reconciliation of uncertain outcomes.
+- **inspect.py** — read-only summaries and transcript rendering over the fact log.
 - **cli.py** — the CLI/REPL glue that assembles the above.
 
 ## Install
@@ -66,13 +67,18 @@ export MCA_MODEL=deepseek-v4-flash
 mca "fix the failing test in calculator.py"   # one-shot task
 mca                                            # interactive REPL
 mca --resume <session-id>                      # resume a session
+mca --list                                     # list sessions (read-only)
+mca --show <session-id>                        # print a session transcript (read-only)
 mca --verbose                                  # stream output + show turn status
 mca --yolo                                     # skip approval (checks still apply)
 ```
 
-REPL commands: `/help`, `/compact`, `/undo`, `/exit`.
+REPL commands: `/help`, `/status`, `/compact`, `/undo`, `/exit`.
 
 Sessions are stored under `<workspace>/.mca/sessions/` (gitignored).
+`--list`, `--show`, and `/status` are pure read-only projections of the same
+fact log the agent runs on; they need no API key, take no lock, and never
+modify the rollout — a live session can be inspected while it is still running.
 
 ## Safety boundaries
 

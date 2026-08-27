@@ -23,8 +23,9 @@ from .compact import CompactionError, SessionCompactor
 from .config import Config
 from .domain import SessionReducer, SessionState, ToolStatus, TurnStatus
 from .executor import ToolExecutor
+from .inspect import list_session_ids, render_transcript, summarize
 from .model import ModelClient
-from .projection import ProjectionEnvironment
+from .projection import ProjectionEnvironment, PromptProjector, estimate_request_tokens
 from .session import (
     ReconciliationError,
     ResumeError,
@@ -33,7 +34,7 @@ from .session import (
     reconcile_tool,
     resume_session,
 )
-from .store import RolloutStore, SessionLockedError
+from .store import RolloutCorruptionError, RolloutStore, SessionLockedError
 from .tools import create_tool_registry
 from .undo import ManagedUndo, UndoError
 
@@ -43,6 +44,7 @@ _SUCCESS_STATUSES = {TurnStatus.COMPLETED, TurnStatus.MAX_STEPS_REACHED}
 _REPL_HELP = (
     "Commands:\n"
     "  /help     show this help\n"
+    "  /status   show session summary and context budget\n"
     "  /compact  compact the conversation into a checkpoint\n"
     "  /undo     undo the managed file writes of the last finished turn\n"
     "  /exit     leave the REPL\n"
@@ -178,6 +180,21 @@ class _Runtime:
             return
         self.console.line("[compacted conversation into a checkpoint]")
 
+    def status(self) -> None:
+        summary = summarize(self.state)
+        self.console.line(summary.render_line())
+        try:
+            messages = PromptProjector.project(
+                self.store.load(), self.state, _live_environment(self.workspace)
+            )
+            schemas = self.executor.registry.provider_schemas()
+            tokens = estimate_request_tokens(messages, schemas)
+            self.console.line(
+                f"[context ~{tokens} tokens / {self.config.context_window} window]"
+            )
+        except Exception:
+            self.console.line("[context estimate unavailable at this boundary]")
+
 
 def _last_finished_turn(state: SessionState) -> str | None:
     for event in reversed(state.events):
@@ -303,6 +320,9 @@ def _repl(runtime: _Runtime) -> int:
         if command == "/help":
             console.line(_REPL_HELP)
             continue
+        if command == "/status":
+            runtime.status()
+            continue
         if command == "/compact":
             runtime.compact_now()
             continue
@@ -319,6 +339,45 @@ def _repl(runtime: _Runtime) -> int:
             _reconcile_if_blocked(runtime)
 
 
+def _list_sessions(workspace: Path, console: _Console) -> int:
+    """Print a one-line digest per session without taking any lock."""
+
+    sessions_root = _sessions_root(workspace)
+    session_ids = list_session_ids(sessions_root)
+    if not session_ids:
+        console.line("[no sessions in this workspace]")
+        return 0
+    for session_id in session_ids:
+        try:
+            events = RolloutStore.read_session_snapshot(sessions_root, session_id)
+            state = SessionReducer.replay(events)
+            console.line(summarize(state).render_line())
+        except (RolloutCorruptionError, ValueError) as error:
+            console.line(f"{session_id}  [unreadable: {error}]")
+    return 0
+
+
+def _show_session(workspace: Path, session_id: str, console: _Console) -> int:
+    """Print a session transcript without taking any lock."""
+
+    sessions_root = _sessions_root(workspace)
+    try:
+        events = RolloutStore.read_session_snapshot(sessions_root, session_id)
+    except FileNotFoundError:
+        console.line(f"[error: session {session_id!r} does not exist]")
+        return 1
+    except ValueError as error:
+        console.line(f"[error: {error}]")
+        return 1
+    try:
+        state = SessionReducer.replay(events)
+    except Exception as error:
+        console.line(f"[error: session is corrupt: {error}]")
+        return 1
+    console.line(render_transcript(state))
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mca",
@@ -333,6 +392,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--resume",
         metavar="SESSION_ID",
         help="resume a previous session by its UUID",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="list sessions in the workspace and exit (read-only)",
+    )
+    parser.add_argument(
+        "--show",
+        metavar="SESSION_ID",
+        help="print a session transcript and exit (read-only)",
     )
     parser.add_argument(
         "--workspace",
@@ -366,6 +435,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not workspace.is_dir():
         console.line("[error: workspace must be a directory]")
         return 1
+
+    if args.list:
+        return _list_sessions(workspace, console)
+    if args.show is not None:
+        return _show_session(workspace, args.show, console)
 
     try:
         base_config = Config.from_env()

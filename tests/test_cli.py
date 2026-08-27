@@ -172,6 +172,67 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("resumed session", output)
 
+    def test_list_reports_no_sessions_without_api_key(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                code = cli.main(["--list", "--workspace", str(self.workspace)])
+        self.assertEqual(code, 0)
+        self.assertIn("no sessions", captured.getvalue())
+
+    def test_list_summarizes_an_existing_session(self) -> None:
+        code, _ = self._run(["remember this"], ScriptedModel(_text("stored")))
+        self.assertEqual(code, 0)
+        session_id = next(
+            (self.workspace / ".mca" / "sessions").glob("*.jsonl")
+        ).stem
+
+        code, output = self._run(["--list"], ScriptedModel())
+        self.assertEqual(code, 0)
+        self.assertIn(session_id, output)
+        self.assertIn("last=completed", output)
+
+    def test_show_prints_a_transcript_without_api_key(self) -> None:
+        code, _ = self._run(["fix the bug"], ScriptedModel(_text("all done")))
+        self.assertEqual(code, 0)
+        session_id = next(
+            (self.workspace / ".mca" / "sessions").glob("*.jsonl")
+        ).stem
+
+        with patch.dict(os.environ, {}, clear=True):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                code = cli.main(
+                    ["--show", session_id, "--workspace", str(self.workspace)]
+                )
+        self.assertEqual(code, 0)
+        transcript = captured.getvalue()
+        self.assertIn("fix the bug", transcript)
+        self.assertIn("all done", transcript)
+
+    def test_show_rejects_unknown_session(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                code = cli.main(
+                    [
+                        "--show",
+                        str(uuid.uuid4()),
+                        "--workspace",
+                        str(self.workspace),
+                    ]
+                )
+        self.assertEqual(code, 1)
+        self.assertIn("does not exist", captured.getvalue())
+
+    def test_repl_status_reports_summary_and_budget(self) -> None:
+        code, output = self._run(
+            [], ScriptedModel(_text("done")), stdin="do it\n/status\n/exit\n"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("tokens", output)
+        self.assertIn("last=completed", output)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -367,5 +367,85 @@ class RolloutStoreTests(unittest.TestCase):
             store.append("example", {"number": 1})
 
 
+class ReadSessionSnapshotTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.sessions_root = Path(self.temporary_directory.name) / "sessions"
+        self.session_id = str(uuid.uuid4())
+
+    @property
+    def rollout_path(self) -> Path:
+        return self.sessions_root / f"{self.session_id}.jsonl"
+
+    def _event_line(self, seq: int, *, session_id: str | None = None) -> bytes:
+        document = Event.create(
+            seq=seq,
+            session_id=session_id or self.session_id,
+            event_type="example",
+            payload={"seq": seq},
+        ).to_dict()
+        return (
+            json.dumps(document, separators=(",", ":"), sort_keys=True) + "\n"
+        ).encode("utf-8")
+
+    def _write_raw(self, data: bytes) -> None:
+        self.sessions_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.rollout_path.write_bytes(data)
+        os.chmod(self.rollout_path, 0o600)
+
+    def test_snapshot_reads_committed_events_from_a_closed_session(self) -> None:
+        with RolloutStore.create(self.sessions_root, self.session_id) as store:
+            store.append("session_created", {"cwd": "/work"})
+            store.append("turn_started", {"turn_id": "t"})
+
+        events = RolloutStore.read_session_snapshot(
+            self.sessions_root, self.session_id
+        )
+        self.assertEqual([event.seq for event in events], [1, 2])
+
+    def test_snapshot_reads_a_session_locked_by_a_live_writer(self) -> None:
+        store = RolloutStore.create(self.sessions_root, self.session_id)
+        self.addCleanup(store.close)
+        store.append("session_created", {"cwd": "/work"})
+
+        events = RolloutStore.read_session_snapshot(
+            self.sessions_root, self.session_id
+        )
+        self.assertEqual([event.seq for event in events], [1])
+
+    def test_snapshot_tolerates_one_partial_final_line_without_repair(self) -> None:
+        self._write_raw(self._event_line(1) + b'{"version":1,"seq":2')
+        before = self.rollout_path.read_bytes()
+
+        events = RolloutStore.read_session_snapshot(
+            self.sessions_root, self.session_id
+        )
+        self.assertEqual([event.seq for event in events], [1])
+        self.assertEqual(self.rollout_path.read_bytes(), before)
+
+    def test_snapshot_rejects_middle_corruption(self) -> None:
+        self._write_raw(
+            self._event_line(1) + b"not-json\n" + self._event_line(3)
+        )
+        with self.assertRaisesRegex(RolloutCorruptionError, "line 2"):
+            RolloutStore.read_session_snapshot(self.sessions_root, self.session_id)
+
+    def test_snapshot_rejects_sequence_gaps(self) -> None:
+        self._write_raw(self._event_line(1) + self._event_line(3))
+        with self.assertRaisesRegex(RolloutCorruptionError, "sequence"):
+            RolloutStore.read_session_snapshot(self.sessions_root, self.session_id)
+
+    def test_snapshot_rejects_a_non_canonical_session_id(self) -> None:
+        with self.assertRaises(ValueError):
+            RolloutStore.read_session_snapshot(self.sessions_root, "../escape")
+
+    def test_snapshot_raises_file_not_found_for_missing_session(self) -> None:
+        with self.assertRaises(FileNotFoundError):
+            RolloutStore.read_session_snapshot(
+                self.sessions_root, str(uuid.uuid4())
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

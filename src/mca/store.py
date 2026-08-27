@@ -8,6 +8,7 @@ import json
 import os
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,81 @@ class SessionLockedError(RuntimeError):
 
 class StorePoisonedError(RuntimeError):
     """Raised after an append may have only partially reached durable storage."""
+
+
+@dataclass(frozen=True)
+class _ParsedRollout:
+    """Result of parsing raw rollout bytes without touching the filesystem."""
+
+    events: list[Event]
+    committed_length: int
+    final_needs_newline: bool
+    dropped_partial: bool
+
+
+def _parse_rollout(data: bytes, session_id: str) -> _ParsedRollout:
+    """Parse rollout bytes into events and describe any repairable tail.
+
+    This is the single source of truth for rollout validation, shared by the
+    writer (which repairs the file on disk) and read-only readers (which only
+    interpret the committed prefix). It never performs I/O.
+    """
+
+    records = data.splitlines(keepends=True)
+    events: list[Event] = []
+    committed_length = 0
+    final_needs_newline = False
+    dropped_partial = False
+
+    for index, record in enumerate(records):
+        line_number = index + 1
+        is_final = index == len(records) - 1
+        has_newline = record.endswith((b"\n", b"\r"))
+        body = record.rstrip(b"\r\n")
+        try:
+            document = json.loads(body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            if is_final and not has_newline:
+                dropped_partial = True
+                break
+            raise RolloutCorruptionError(
+                f"invalid JSON at line {line_number}: {error}"
+            ) from error
+
+        try:
+            event = Event.from_dict(document)
+        except DomainError as error:
+            if (
+                is_final
+                and not has_newline
+                and isinstance(document, dict)
+                and not EVENT_FIELDS.issubset(document)
+            ):
+                dropped_partial = True
+                break
+            raise RolloutCorruptionError(
+                f"invalid event at line {line_number}: {error}"
+            ) from error
+
+        if event.session_id != session_id:
+            raise RolloutCorruptionError(f"session mismatch at line {line_number}")
+        expected_seq = len(events) + 1
+        if event.seq != expected_seq:
+            raise RolloutCorruptionError(
+                f"invalid sequence at line {line_number}: "
+                f"expected {expected_seq}, got {event.seq}"
+            )
+        events.append(event)
+        committed_length += len(record)
+        if is_final and not has_newline:
+            final_needs_newline = True
+
+    return _ParsedRollout(
+        events=events,
+        committed_length=committed_length,
+        final_needs_newline=final_needs_newline,
+        dropped_partial=dropped_partial,
+    )
 
 
 def _validate_session_id(session_id: object) -> str:
@@ -134,68 +210,50 @@ class RolloutStore:
     def _read_and_repair_tail(self) -> list[Event]:
         assert self._fd is not None
         data = self._read_all()
-        records = data.splitlines(keepends=True)
-        events: list[Event] = []
-        offset = 0
+        parsed = _parse_rollout(data, self.session_id)
+        if parsed.dropped_partial:
+            os.ftruncate(self._fd, parsed.committed_length)
+            os.fsync(self._fd)
+        elif parsed.final_needs_newline:
+            self._write_all(b"\n")
+            os.fsync(self._fd)
+        return parsed.events
 
-        for index, record in enumerate(records):
-            line_number = index + 1
-            is_final = index == len(records) - 1
-            has_newline = record.endswith((b"\n", b"\r"))
-            body = record.rstrip(b"\r\n")
-            try:
-                document = json.loads(body.decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                if is_final and not has_newline:
-                    os.ftruncate(self._fd, offset)
-                    os.fsync(self._fd)
-                    break
-                raise RolloutCorruptionError(
-                    f"invalid JSON at line {line_number}: {error}"
-                ) from error
+    @classmethod
+    def read_session_snapshot(
+        cls, sessions_root: str | os.PathLike[str], session_id: str
+    ) -> list[Event]:
+        """Return committed events for a session without taking the write lock.
 
-            try:
-                event = Event.from_dict(document)
-            except DomainError as error:
-                if self._is_incomplete_unterminated_event(
-                    document, is_final=is_final, has_newline=has_newline
-                ):
-                    os.ftruncate(self._fd, offset)
-                    os.fsync(self._fd)
-                    break
-                raise RolloutCorruptionError(
-                    f"invalid event at line {line_number}: {error}"
-                ) from error
+        The rollout is append-only, so a reader that only interprets the
+        committed prefix is safe even while another process holds the writer
+        lock: a half-written final line is dropped in memory and the file on
+        disk is never modified.
+        """
 
-            if event.session_id != self.session_id:
-                raise RolloutCorruptionError(
-                    f"session mismatch at line {line_number}"
-                )
-            expected_seq = len(events) + 1
-            if event.seq != expected_seq:
-                raise RolloutCorruptionError(
-                    f"invalid sequence at line {line_number}: "
-                    f"expected {expected_seq}, got {event.seq}"
-                )
-            events.append(event)
-            offset += len(record)
-
-            if is_final and not has_newline:
-                self._write_all(b"\n")
-                os.fsync(self._fd)
-
-        return events
-
-    @staticmethod
-    def _is_incomplete_unterminated_event(
-        document: object, *, is_final: bool, has_newline: bool
-    ) -> bool:
-        return (
-            is_final
-            and not has_newline
-            and isinstance(document, dict)
-            and not EVENT_FIELDS.issubset(document)
+        valid_id = _validate_session_id(session_id)
+        path = Path(sessions_root) / f"{valid_id}.jsonl"
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(
+            os, "O_NOFOLLOW", 0
         )
+        try:
+            fd = os.open(path, flags)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError(
+                    "rollout path must not be a symbolic link"
+                ) from None
+            raise
+        try:
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(fd, 64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+        return _parse_rollout(b"".join(chunks), valid_id).events
 
     def append(
         self,
