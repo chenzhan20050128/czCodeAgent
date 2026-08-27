@@ -584,13 +584,13 @@ class SessionReducer:
         truncated = event.payload.get("truncated", False)
         if type(truncated) is not bool:
             raise DomainError("truncated must be a boolean")
-        recovery_blocked = event.payload.get(
-            "recovery_blocked", status is ToolStatus.OUTCOME_UNKNOWN
-        )
+        recovery_blocked = event.payload.get("recovery_blocked", False)
         if type(recovery_blocked) is not bool:
             raise DomainError("recovery_blocked must be a boolean")
-        if status is ToolStatus.OUTCOME_UNKNOWN and not recovery_blocked:
-            raise DomainError("unknown outcomes must block recovery")
+        if recovery_blocked is not (status is ToolStatus.OUTCOME_UNKNOWN):
+            raise DomainError(
+                "recovery_blocked must be true exactly for outcome_unknown"
+            )
 
         path = event.payload.get("path")
         after_hash = event.payload.get("after_hash")

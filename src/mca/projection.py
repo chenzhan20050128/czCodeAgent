@@ -474,7 +474,6 @@ class PromptProjector:
 
         if state.recovery_blocked or any(
             call.status is ToolStatus.OUTCOME_UNKNOWN
-            or call.recovery_blocked
             for call in state.tool_calls.values()
         ):
             raise ProjectionBlockedError(

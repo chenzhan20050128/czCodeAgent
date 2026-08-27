@@ -845,7 +845,16 @@ class SessionReducerTests(ReducerTestCase):
                 self.apply("tool_started", {"call_id": "call-1"})
                 event = self.event(
                     "tool_finished",
-                    {"call_id": "call-1", "status": status, "result": status},
+                    {
+                        "call_id": "call-1",
+                        "status": status,
+                        "result": status,
+                        **(
+                            {"recovery_blocked": True}
+                            if status == "outcome_unknown"
+                            else {}
+                        ),
+                    },
                 )
                 if status in allowed:
                     SessionReducer.apply(self.state, event)
@@ -856,6 +865,37 @@ class SessionReducerTests(ReducerTestCase):
                     with self.assertRaises(DomainError):
                         SessionReducer.apply(self.state, event)
                     self.assertEqual(self.state.last_seq, 4)
+
+    def test_recovery_blocked_matches_only_unknown_outcomes(self) -> None:
+        invalid_cases = (
+            {"status": "succeeded", "recovery_blocked": True},
+            {"status": "failed", "recovery_blocked": True},
+            {"status": "outcome_unknown", "recovery_blocked": False},
+            {"status": "outcome_unknown"},
+        )
+        for terminal_fields in invalid_cases:
+            with self.subTest(terminal_fields=terminal_fields):
+                self.setUp()
+                self.start_turn()
+                self.apply(
+                    "assistant_accepted",
+                    {"tool_calls": [self.tool("call-1", "bash")]},
+                )
+                self.apply("tool_started", {"call_id": "call-1"})
+                before = SessionReducer.replay(self.state.events)
+                invalid = self.event(
+                    "tool_finished",
+                    {
+                        "call_id": "call-1",
+                        "result": terminal_fields["status"],
+                        **terminal_fields,
+                    },
+                )
+
+                with self.assertRaisesRegex(DomainError, "recovery_blocked"):
+                    SessionReducer.apply(self.state, invalid)
+
+                self.assertEqual(self.state, before)
 
     def test_reducer_rejects_sequence_gaps_and_session_mismatches(self) -> None:
         self.create_session()

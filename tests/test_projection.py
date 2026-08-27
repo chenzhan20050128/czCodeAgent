@@ -200,6 +200,34 @@ class PromptProjectionTests(ProjectionTestCase):
         self.assertNotIn("approval_decided", serialized)
         self.assertNotIn("tool_started", serialized)
 
+    def test_valid_succeeded_result_is_not_recovery_blocked(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool_call("call-1", "bash", "{}")]},
+        )
+        self.apply("tool_started", {"call_id": "call-1"})
+        self.apply(
+            "tool_finished",
+            {
+                "call_id": "call-1",
+                "status": "succeeded",
+                "result": "command completed",
+            },
+        )
+
+        messages = self.project()
+
+        self.assertFalse(self.state.recovery_blocked)
+        self.assertEqual(
+            messages[-1],
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "command completed",
+            },
+        )
+
     def test_provider_call_id_may_be_reused_after_its_result(self) -> None:
         self.start_turn()
         for name, status in (
