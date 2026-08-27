@@ -23,7 +23,7 @@
 | src/mca/model.py | one Chat Completions sample and bounded retry policy |
 | src/mca/tools/registry.py | explicit ToolSpec, schema validation, result truncation |
 | src/mca/tools/filesystem.py | read/list/write/edit preparation and atomic writes |
-| src/mca/tools/search.py | rg search with Python fallback |
+| src/mca/tools/search.py | bounded ripgrep search; reports a stable error when rg is missing |
 | src/mca/tools/shell.py | approved shell execution, output drain, process-group cleanup |
 | src/mca/executor.py | validation, approval, snapshot, execution, event pipeline |
 | src/mca/undo.py | hash-checked managed-file undo |
@@ -88,7 +88,7 @@
 - [ ] Write failing filesystem tests for read pagination and line numbers, bounded list, atomic write, unique edit, zero or multiple edit matches, absolute path rejection, .., common-prefix traps, and symlink escape.
 - [ ] Implement a workspace resolver accepting only relative paths, using canonical/commonpath checks, rejecting symlinks for write/edit, and rechecking path plus before-hash before os.replace.
 - [ ] Implement write/edit preparation objects with exact diff, optional first snapshot, and execution closure; use same-directory temp file, flush, fsync, mode preservation, and atomic replace.
-- [ ] Write and pass grep tests for rg argv mode and deterministic Python fallback.
+- [ ] Write and pass grep tests for bounded rg argv mode and a stable missing-ripgrep error.
 - [ ] Run all Task 5 tests and commit: feat: add bounded workspace file and search tools.
 
 ## Task 6: Approval, shell, executor, and managed undo

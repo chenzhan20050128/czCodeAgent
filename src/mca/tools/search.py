@@ -1,19 +1,14 @@
-"""Bounded workspace content search using rg with a Python fallback."""
+"""Bounded workspace content search backed exclusively by ripgrep."""
 
 from __future__ import annotations
 
-import fnmatch
 import os
-import re
 import subprocess
 import threading
-from collections.abc import Iterator
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, TextIO
 
 from .filesystem import (
-    DEFAULT_MAX_FILE_BYTES,
     FileToolError,
     WorkspaceResolver,
     _nonempty_string,
@@ -100,7 +95,6 @@ class SearchTools:
         self,
         workspace: str | os.PathLike[str],
         *,
-        max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
         max_output_bytes: int = 64 * 1024,
         max_output_lines: int = DEFAULT_MAX_SEARCH_LINES,
     ) -> None:
@@ -109,7 +103,6 @@ class SearchTools:
         if type(max_output_lines) is not int or max_output_lines < 1:
             raise ValueError("max_output_lines must be a positive integer")
         self.resolver = WorkspaceResolver(workspace)
-        self.max_file_bytes = max_file_bytes
         self.max_output_bytes = max_output_bytes
         self.max_output_lines = max_output_lines
 
@@ -121,18 +114,14 @@ class SearchTools:
         glob = arguments.get("glob")
         if glob is not None:
             glob = _nonempty_string(glob, "glob")
-        try:
-            compiled = re.compile(pattern)
-        except re.error as error:
-            raise FileToolError(f"invalid regular expression: {error}") from None
         path = self.resolver.resolve_read(requested_path)
         relative = self.resolver.relative_display(path)
         try:
             collected = self._run_rg(pattern, relative, glob)
-            engine = "rg"
         except FileNotFoundError:
-            collected = self._python_search(compiled, path, glob)
-            engine = "python"
+            raise FileToolError(
+                "ripgrep is required for grep; install it so rg is available"
+            ) from None
         return ToolResult.bounded(
             title=f"Search {relative}",
             output=collected.output,
@@ -140,7 +129,7 @@ class SearchTools:
                 "path": str(path),
                 "pattern": pattern,
                 "glob": glob,
-                "engine": engine,
+                "engine": "rg",
                 "matches": collected.matches_stored,
                 "matches_seen": collected.matches_seen,
                 "matches_stored": collected.matches_stored,
@@ -214,68 +203,6 @@ class SearchTools:
             suffix = f": {detail}" if detail else ""
             raise FileToolError(f"rg failed with exit code {return_code}{suffix}")
         return collector.finish(complete=not stopped_early)
-
-    def _python_search(
-        self, compiled: re.Pattern[str], path: Path, glob: str | None
-    ) -> _SearchOutput:
-        collector = _PreviewCollector(
-            max_bytes=self.max_output_bytes, max_lines=self.max_output_lines
-        )
-        for file_path in self._candidate_files(path, glob):
-            try:
-                file_stat = file_path.stat()
-                if file_stat.st_size > self.max_file_bytes:
-                    continue
-                content = file_path.read_bytes()
-            except OSError:
-                continue
-            if len(content) > self.max_file_bytes or b"\0" in content:
-                continue
-            try:
-                text = content.decode("utf-8")
-            except UnicodeDecodeError:
-                continue
-            relative = self.resolver.relative_display(file_path.resolve())
-            for line_number, line in enumerate(text.splitlines(), start=1):
-                if compiled.search(line) and not collector.add(
-                    f"{relative}:{line_number}:{line}"
-                ):
-                    return collector.finish(complete=False)
-        return collector.finish(complete=True)
-
-    def _candidate_files(
-        self, path: Path, glob: str | None
-    ) -> Iterator[Path]:
-        if path.is_file():
-            if not path.is_symlink() and _matches_glob(path, path.parent, glob):
-                yield path
-            return
-        if not path.is_dir():
-            raise FileToolError("search path is not a regular file or directory")
-        yield from self._walk_directory(path, path, glob)
-
-    def _walk_directory(
-        self, directory: Path, search_root: Path, glob: str | None
-    ) -> Iterator[Path]:
-        try:
-            entries = sorted(directory.iterdir(), key=lambda entry: entry.name)
-        except OSError:
-            return
-        for entry in entries:
-            if entry.name.startswith(".") or entry.is_symlink():
-                continue
-            if entry.is_dir():
-                yield from self._walk_directory(entry, search_root, glob)
-            elif entry.is_file() and _matches_glob(entry, search_root, glob):
-                yield entry
-
-
-def _matches_glob(candidate: Path, root: Path, glob: str | None) -> bool:
-    if glob is None:
-        return True
-    relative = candidate.relative_to(root).as_posix()
-    return fnmatch.fnmatch(relative, glob) or fnmatch.fnmatch(candidate.name, glob)
-
 
 def _drain_text_stream(stream: TextIO, destination: _BoundedTextBuffer) -> None:
     while True:

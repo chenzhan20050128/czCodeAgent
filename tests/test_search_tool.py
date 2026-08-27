@@ -1,4 +1,4 @@
-"""Tests for bounded workspace grep with an rg-first fallback."""
+"""Tests for bounded workspace grep backed exclusively by ripgrep."""
 
 from __future__ import annotations
 
@@ -178,44 +178,27 @@ class SearchToolTests(unittest.TestCase):
 
         self.assertLessEqual(len(str(raised.exception).encode()), 600)
 
-    def test_invalid_regex_is_rejected_before_running_rg(self) -> None:
-        with patch("mca.tools.search.subprocess.Popen") as popen:
-            with self.assertRaisesRegex(FileToolError, "invalid regular expression"):
-                self.search.grep({"pattern": "["})
-        popen.assert_not_called()
-
-    def test_fallback_searches_real_files_in_deterministic_order(self) -> None:
-        self.write_text("z.txt", "none\nneedle z\n")
-        self.write_text("a.txt", "needle a\n")
-        self.write_text("sub/b.txt", "first\nneedle b\n")
-
-        with patch("mca.tools.search.subprocess.Popen", side_effect=FileNotFoundError):
-            result = self.search.grep({"pattern": "needle", "path": "."})
-
-        self.assertEqual(
-            result.output.splitlines(),
-            ["a.txt:1:needle a", "sub/b.txt:2:needle b", "z.txt:2:needle z"],
+    def test_invalid_regex_is_reported_from_bounded_rg_stderr(self) -> None:
+        process = FakeProcess(
+            stdout_chunks=[],
+            stderr_chunks=["regex parse error: unclosed character class\n"],
+            returncode=2,
         )
-        self.assertEqual(result.metadata["engine"], "python")
-        self.assertEqual(result.metadata["matches"], 3)
+        with patch("mca.tools.search.subprocess.Popen", return_value=process) as popen:
+            with self.assertRaisesRegex(FileToolError, "regex parse error"):
+                self.search.grep({"pattern": "["})
 
-    def test_fallback_honors_glob_and_skips_hidden_symlink_binary_and_invalid_utf8(self) -> None:
-        self.write_text("keep.py", "needle")
-        self.write_text("skip.txt", "needle")
-        self.write_text(".hidden.py", "needle")
-        hidden = self.workspace / ".hidden-dir"
-        hidden.mkdir()
-        (hidden / "inside.py").write_text("needle", encoding="utf-8")
-        (self.workspace / "binary.py").write_bytes(b"needle\0data")
-        (self.workspace / "invalid.py").write_bytes(b"needle\xff")
-        (self.workspace / "linked.py").symlink_to(self.workspace / "keep.py")
+        popen.assert_called_once()
 
-        with patch("mca.tools.search.subprocess.Popen", side_effect=FileNotFoundError):
-            result = self.search.grep(
-                {"pattern": "needle", "path": ".", "glob": "*.py"}
-            )
-
-        self.assertEqual(result.output, "keep.py:1:needle")
+    def test_missing_ripgrep_returns_stable_installation_error(self) -> None:
+        with patch(
+            "mca.tools.search.subprocess.Popen", side_effect=FileNotFoundError
+        ):
+            with self.assertRaisesRegex(
+                FileToolError,
+                "ripgrep.*required.*install.*rg",
+            ):
+                self.search.grep({"pattern": "needle"})
 
     def test_result_is_bounded_by_lines_and_utf8_bytes(self) -> None:
         bounded = SearchTools(
@@ -263,34 +246,14 @@ class SearchToolTests(unittest.TestCase):
         self.assertIs(result.metadata["truncated"], True)
         self.assertIs(result.metadata["matches_complete"], False)
 
-    def test_python_fallback_stops_candidate_iteration_at_the_preview_cap(self) -> None:
-        bounded = SearchTools(
-            self.workspace, max_output_bytes=256, max_output_lines=2
-        )
-        paths = [
-            self.write_text(f"{index:04d}.txt", "needle\n").resolve()
-            for index in range(20)
-        ]
-        visited: list[Path] = []
+    def test_search_module_has_no_python_regex_or_filesystem_fallback(self) -> None:
+        import mca.tools.search as search_module
 
-        def candidates() -> object:
-            for path in paths:
-                visited.append(path)
-                yield path
-
-        with (
-            patch("mca.tools.search.subprocess.Popen", side_effect=FileNotFoundError),
-            patch.object(bounded, "_candidate_files", return_value=candidates()),
-        ):
-            result = bounded.grep({"pattern": "needle"})
-
-        self.assertLess(len(visited), len(paths))
-        self.assertLessEqual(len(visited), 4)
-        self.assertIs(result.metadata["truncated"], True)
-        self.assertIs(result.metadata["matches_complete"], False)
-        self.assertGreaterEqual(
-            result.metadata["matches_seen"], result.metadata["matches_stored"]
-        )
+        source = Path(search_module.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("import re", source)
+        self.assertNotIn("re.compile", source)
+        self.assertNotIn("os.walk", source)
+        self.assertNotIn("_python_search", source)
 
     def test_path_must_remain_in_workspace(self) -> None:
         for path in ("../outside", str(self.workspace)):

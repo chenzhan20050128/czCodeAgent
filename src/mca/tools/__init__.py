@@ -77,8 +77,8 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
         ToolSpec(
             name="grep",
             description=(
-                "Search UTF-8 workspace files with a regular expression and "
-                "optional file glob; results include file and line number."
+                "Search workspace files using ripgrep regular expressions and "
+                "an optional file glob; ripgrep must be installed."
             ),
             schema={
                 "type": "object",
