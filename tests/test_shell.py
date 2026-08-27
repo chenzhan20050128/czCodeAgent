@@ -21,7 +21,14 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from mca.tools import create_tool_registry
 from mca.tools.registry import ToolValidationError
-from mca.tools.shell import ShellRunner, ShellToolError, _CallbackGate, _stop_process_group
+from mca.tools.shell import (
+    ShellRunner,
+    ShellToolError,
+    _BoundedCapture,
+    _CallbackGate,
+    _drain_pipe,
+    _stop_process_group,
+)
 
 
 class ShellRunnerTests(unittest.TestCase):
@@ -197,9 +204,15 @@ class ShellRunnerTests(unittest.TestCase):
                 .execute()
             )
 
+        thread_errors: list[BaseException] = []
+        original_excepthook = threading.excepthook
+        threading.excepthook = lambda args: thread_errors.append(args.exc_value)
         worker = threading.Thread(target=execute, daemon=True)
-        worker.start()
-        worker.join(timeout=2)
+        try:
+            worker.start()
+            worker.join(timeout=2)
+        finally:
+            threading.excepthook = original_excepthook
         child_pid = int((self.workspace / "detached.pid").read_text(encoding="utf-8"))
         if worker.is_alive():
             os.kill(child_pid, signal.SIGKILL)
@@ -219,6 +232,29 @@ class ShellRunnerTests(unittest.TestCase):
             time.sleep(0.02)
         else:
             self.fail(f"descendant process {child_pid} survived pipe cleanup")
+        self.assertEqual(thread_errors, [])
+
+    def test_drain_pipe_closed_before_fileno_has_no_background_exception(self) -> None:
+        read_fd, write_fd = os.pipe()
+        pipe = os.fdopen(read_fd, "rb", buffering=0)
+        pipe.close()
+        os.close(write_fd)
+        thread_errors: list[BaseException] = []
+        original_excepthook = threading.excepthook
+        threading.excepthook = lambda args: thread_errors.append(args.exc_value)
+        worker = threading.Thread(
+            target=_drain_pipe,
+            args=(pipe, "stdout", _BoundedCapture(64), None),
+            daemon=True,
+        )
+        try:
+            worker.start()
+            worker.join(timeout=1)
+        finally:
+            threading.excepthook = original_excepthook
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(thread_errors, [])
 
     def test_group_signal_permission_error_falls_back_to_parent_cleanup(self) -> None:
         started = time.monotonic()

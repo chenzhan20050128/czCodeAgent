@@ -204,10 +204,16 @@ class PreparedShellCommand:
                 _stop_process_group(
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
+                callback_gate.disable()
                 _close_pipes(process.stdout, process.stderr)
-                _join_threads(
+                drains_finished = _join_threads(
                     tuple(started_threads), timeout=self.termination_grace_seconds
                 )
+                if not drains_finished:
+                    stderr.append(
+                        b"pipe drain threads did not exit after pipes were closed; "
+                        b"escaped descendants may remain\n"
+                    )
             callback_gate.disable()
 
         output, rendering_truncated = _render_streams(
@@ -314,7 +320,7 @@ def _drain_pipe(
         while True:
             try:
                 chunk = os.read(pipe.fileno(), 8192)
-            except OSError:
+            except (OSError, ValueError):
                 break
             if not chunk:
                 break
