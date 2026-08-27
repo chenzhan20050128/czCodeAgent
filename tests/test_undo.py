@@ -324,6 +324,30 @@ class ManagedUndoTests(UndoTestCase):
         self.assertFalse(path.exists())
         self.assertEqual(result.files[0].status, "deleted")
 
+    def test_undo_removes_directories_the_write_created(self) -> None:
+        path = self.workspace / "pkg" / "sub" / "module.py"
+        self.write_call("write", "pkg/sub/module.py", "created")
+        self.assertTrue(path.exists())
+
+        result = self.undo()
+
+        self.assertEqual(result.files[0].status, "deleted")
+        self.assertFalse(path.exists())
+        self.assertFalse((self.workspace / "pkg").exists())
+        self.assertIn("created director", result.files[0].detail)
+
+    def test_undo_keeps_created_directory_that_holds_other_files(self) -> None:
+        self.write_call("write", "pkg/module.py", "created")
+        sibling = self.workspace / "pkg" / "keep.py"
+        sibling.write_text("keep", encoding="utf-8")
+
+        result = self.undo()
+
+        self.assertEqual(result.files[0].status, "deleted")
+        self.assertFalse((self.workspace / "pkg" / "module.py").exists())
+        self.assertTrue((self.workspace / "pkg").exists())
+        self.assertEqual(sibling.read_text(encoding="utf-8"), "keep")
+
     def test_multiple_edits_restore_first_baseline(self) -> None:
         path = self.workspace / "many.txt"
         path.write_text("first", encoding="utf-8")

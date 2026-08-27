@@ -238,6 +238,27 @@ class BuiltinToolSpecTests(unittest.TestCase):
         prepared = registry.resolve("bash").prepare_handler({"command": "pwd"})
         self.assertEqual(prepared.command, "pwd")
 
+    def test_required_path_arguments_reject_empty_strings(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = create_tool_registry(temporary)
+
+        for tool, payload in (
+            ("read_file", '{"path": ""}'),
+            ("write_file", '{"path": "", "content": "x"}'),
+            ("edit_file", '{"path": "", "old_text": "a", "new_text": "b"}'),
+            ("grep", '{"pattern": ""}'),
+        ):
+            with self.subTest(tool=tool):
+                with self.assertRaises(ToolValidationError):
+                    registry.parse_and_validate(tool, payload)
+
+    def test_write_file_description_discourages_manual_mkdir(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = create_tool_registry(temporary)
+
+        description = registry.resolve("write_file").description
+        self.assertIn("parent directories are created", description)
+
 
 if __name__ == "__main__":
     unittest.main()

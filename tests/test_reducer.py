@@ -681,6 +681,83 @@ class SessionReducerTests(ReducerTestCase):
         self.assertEqual(snapshot.after_hash, "sha256:new")
         self.assertEqual(snapshot.after_mode, 0o640)
 
+    def test_successful_new_file_records_created_directories(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("write-1", "write_file")]},
+        )
+        self.apply(
+            "file_snapshot",
+            {
+                "turn_id": self.turn_id,
+                "path": "/workspace/pkg/sub/app.py",
+                "existed_before": False,
+                "before_bytes": "",
+                "before_encoding": "base64",
+                "before_mode": None,
+                "call_key": "3:write-1",
+            },
+        )
+        self.apply("tool_started", {"call_id": "write-1"})
+        self.apply(
+            "tool_finished",
+            {
+                "call_id": "write-1",
+                "status": "succeeded",
+                "result": "ok",
+                "path": "/workspace/pkg/sub/app.py",
+                "after_hash": "sha256:new",
+                "after_mode": 0o644,
+                "created_directories": ["/workspace/pkg", "/workspace/pkg/sub"],
+            },
+        )
+
+        snapshot = self.state.file_snapshots[
+            (self.turn_id, "/workspace/pkg/sub/app.py")
+        ]
+        self.assertEqual(
+            snapshot.created_directories,
+            ("/workspace/pkg", "/workspace/pkg/sub"),
+        )
+
+    def test_created_directories_require_a_successful_new_file(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool("write-1", "write_file")]},
+        )
+        self.apply(
+            "file_snapshot",
+            {
+                "turn_id": self.turn_id,
+                "path": "src/app.py",
+                "existed_before": True,
+                "before_bytes": "Zmlyc3Q=",
+                "before_encoding": "base64",
+                "before_mode": 0o644,
+                "call_key": "3:write-1",
+            },
+        )
+        self.apply("tool_started", {"call_id": "write-1"})
+        replay = SessionReducer.replay(self.state.events)
+        event = Event.create(
+            seq=replay.last_seq + 1,
+            session_id=self.session_id,
+            event_type="tool_finished",
+            payload={
+                "call_id": "write-1",
+                "status": "succeeded",
+                "result": "ok",
+                "path": "src/app.py",
+                "after_hash": "sha256:new",
+                "after_mode": 0o644,
+                "created_directories": ["/workspace/pkg"],
+            },
+        )
+        with self.assertRaisesRegex(DomainError, "created_directories requires a new file"):
+            SessionReducer.apply(replay, event)
+
     def test_file_snapshot_requires_provenance_for_active_current_call(self) -> None:
         self.start_turn()
         self.apply(

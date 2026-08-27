@@ -404,6 +404,9 @@ class ToolExecutor:
             payload["path"] = path
             payload["after_hash"] = after_hash
             payload["after_mode"] = after_mode
+            created = result.metadata.get("created_directories")
+            if isinstance(created, tuple) and created:
+                payload["created_directories"] = list(created)
         self._append_and_reduce("tool_finished", payload)
 
     def _normalize_result(self, name: str, raw_result: object) -> ToolResult:
@@ -427,6 +430,7 @@ class ToolExecutor:
                     "before_hash": raw_result.before_hash,
                     "after_hash": raw_result.after_hash,
                     "after_mode": raw_result.after_mode,
+                    "created_directories": raw_result.created_directories,
                     "durability_warning": raw_result.durability_warning,
                     "interruption_warning": raw_result.interruption_warning,
                 },

@@ -118,6 +118,7 @@ class ExecutedFileChange:
     before_hash: str | None
     after_hash: str
     after_mode: int
+    created_directories: tuple[str, ...] = ()
     durability_warning: bool = False
     interruption_warning: bool = False
 
@@ -141,9 +142,8 @@ class PreparedFileChange:
         """Atomically apply the approved bytes if path and hash still match."""
 
         target = self._assert_unchanged()
+        created_directories = self._ensure_parent_directories(target)
         parent = target.parent
-        if not parent.exists() or not parent.is_dir():
-            raise FileToolError(f"parent directory does not exist: {parent}")
         temp_path: Path | None = None
         committed = False
         durability_warning = False
@@ -205,14 +205,50 @@ class PreparedFileChange:
                     temp_path.unlink()
                 except FileNotFoundError:
                     pass
+            if not committed:
+                _remove_created_directories(created_directories)
         return ExecutedFileChange(
             canonical_path=target,
             before_hash=self.before_hash,
             after_hash=sha256_bytes(self.proposed_bytes),
             after_mode=mode,
+            created_directories=created_directories,
             durability_warning=durability_warning,
             interruption_warning=interruption_warning,
         )
+
+    def _ensure_parent_directories(self, target: Path) -> tuple[str, ...]:
+        """Create missing parent directories without following symlinks."""
+
+        workspace = self._resolver.workspace
+        try:
+            parts = target.relative_to(workspace).parts
+        except ValueError:
+            raise PathSafetyError("path escapes workspace") from None
+        created: list[str] = []
+        current = workspace
+        for part in parts[:-1]:
+            current = current / part
+            try:
+                entry_stat = current.lstat()
+            except FileNotFoundError:
+                try:
+                    os.mkdir(current, 0o755)
+                    os.chmod(current, 0o755)
+                except BaseException:
+                    _remove_created_directories(tuple(created))
+                    raise
+                created.append(str(current.resolve()))
+                continue
+            if stat.S_ISLNK(entry_stat.st_mode):
+                _remove_created_directories(tuple(created))
+                raise PathSafetyError(
+                    f"write path contains a symbolic link: {self.requested_path}"
+                )
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                _remove_created_directories(tuple(created))
+                raise FileToolError(f"parent path is not a directory: {current}")
+        return tuple(created)
 
     def _assert_unchanged(self) -> Path:
         target = self._resolver.resolve_write(self.requested_path)
@@ -296,8 +332,10 @@ class FileSystemTools:
         )
 
     def list_dir(self, arguments: dict[str, Any]) -> ToolResult:
-        requested = arguments.get("path", ".")
-        path = self.resolver.resolve_read(_nonempty_string(requested, "path"))
+        if not isinstance(arguments, dict):
+            raise FileToolError("arguments must be an object")
+        requested = _optional_path(arguments.get("path"))
+        path = self.resolver.resolve_read(requested)
         if not path.is_dir():
             raise FileToolError("path is not a directory")
         limit = _positive_integer(
@@ -358,9 +396,6 @@ class FileSystemTools:
         *,
         known_before_bytes: bytes | None = None,
     ) -> PreparedFileChange:
-        parent = path.parent
-        if not parent.exists() or not parent.is_dir():
-            raise FileToolError(f"parent directory does not exist: {parent}")
         existed = path.exists()
         before_mode: int | None = None
         if existed:
@@ -459,6 +494,16 @@ def _nonempty_string(value: object, name: str, *, allow_empty: bool = False) -> 
     return value
 
 
+def _optional_path(value: object) -> str:
+    """Treat a missing, empty, or whitespace-only path as the workspace root."""
+
+    if value is None:
+        return "."
+    if not isinstance(value, str):
+        raise FileToolError("path must be a string")
+    return value.strip() or "."
+
+
 def _positive_integer(
     arguments: dict[str, Any],
     key: str,
@@ -506,3 +551,13 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _remove_created_directories(created: tuple[str, ...]) -> None:
+    """Remove directories this write created, deepest first, if still empty."""
+
+    for path in reversed(created):
+        try:
+            os.rmdir(path)
+        except OSError:
+            break

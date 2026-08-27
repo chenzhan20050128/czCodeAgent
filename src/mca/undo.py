@@ -142,10 +142,16 @@ class ManagedUndo:
                         operation_key=turn_id,
                         max_file_bytes=self.max_file_bytes,
                     )
-                    completed.append(
-                        UndoFileResult(
-                            str(item.path), file_status, "created file removed"
+                    removed_dirs = _remove_created_directories(
+                        self.workspace, item.snapshot.created_directories
+                    )
+                    detail = "created file removed"
+                    if removed_dirs:
+                        detail += f"; removed {removed_dirs} created director" + (
+                            "y" if removed_dirs == 1 else "ies"
                         )
+                    completed.append(
+                        UndoFileResult(str(item.path), file_status, detail)
                     )
             except _UndoConflict as error:
                 completed.append(
@@ -721,6 +727,43 @@ def _open_parent_fd(workspace: Path, path: Path) -> int:
 
 def _fsync_parent(parent_fd: int) -> None:
     os.fsync(parent_fd)
+
+
+def _remove_created_directories(
+    workspace: Path, created: tuple[str, ...]
+) -> int:
+    """Remove directories a managed write created, deepest first, if empty.
+
+    Only directories that are canonical, inside the workspace, and still empty
+    are removed. Any external tampering (a non-empty dir, a symlink, an escape)
+    stops the walk and leaves the remaining directories untouched.
+    """
+
+    removed = 0
+    for raw in sorted(created, key=len, reverse=True):
+        path = Path(raw)
+        try:
+            relative = path.relative_to(workspace)
+        except ValueError:
+            break
+        if not relative.parts or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            break
+        try:
+            entry = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            break
+        if not stat.S_ISDIR(entry.st_mode):
+            break
+        try:
+            os.rmdir(path)
+        except OSError:
+            break
+        removed += 1
+    return removed
 
 
 def _read_current(

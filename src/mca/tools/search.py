@@ -12,6 +12,7 @@ from .filesystem import (
     FileToolError,
     WorkspaceResolver,
     _nonempty_string,
+    _optional_path,
 )
 from .registry import TRUNCATION_MARKER, ToolResult, truncate_output
 
@@ -110,7 +111,7 @@ class SearchTools:
         if not isinstance(arguments, dict):
             raise FileToolError("arguments must be an object")
         pattern = _nonempty_string(arguments.get("pattern"), "pattern")
-        requested_path = _nonempty_string(arguments.get("path", "."), "path")
+        requested_path = _optional_path(arguments.get("path"))
         glob = arguments.get("glob")
         if glob is not None:
             glob = _nonempty_string(glob, "glob")

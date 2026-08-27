@@ -323,6 +323,7 @@ class FileSnapshot:
     after_hash: str | None = None
     source_call_key: str | None = None
     after_mode: int | None = None
+    created_directories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         _canonical_uuid(self.turn_id, field_name="turn_id")
@@ -360,6 +361,15 @@ class FileSnapshot:
             raise DomainError("after_mode must be permission bits or null")
         if self.after_hash is None and self.after_mode is not None:
             raise DomainError("after_mode requires after_hash")
+        if not isinstance(self.created_directories, tuple) or any(
+            not isinstance(item, str) or not item
+            for item in self.created_directories
+        ):
+            raise DomainError("created_directories must be non-empty strings")
+        if self.created_directories and self.after_hash is None:
+            raise DomainError("created_directories requires a successful write")
+        if self.created_directories and self.existed_before:
+            raise DomainError("created_directories requires a new file")
 
 
 @dataclass
@@ -422,6 +432,16 @@ def _turn_status(value: object) -> TurnStatus:
     if status not in _TERMINAL_TURN_STATUSES:
         raise DomainError(f"turn_finished cannot use status {value!r}")
     return status
+
+
+def _normalized_created_directories(value: object) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or any(
+        not isinstance(item, str) or not item for item in value
+    ):
+        raise DomainError("created_directories must be an array of non-empty strings")
+    return tuple(value)
 
 
 def reduce_undo_status(statuses: Iterable[str]) -> str:
@@ -669,8 +689,14 @@ class SessionReducer:
         path = event.payload.get("path")
         after_hash = event.payload.get("after_hash")
         after_mode = event.payload.get("after_mode")
+        created_directories = event.payload.get("created_directories")
         snapshot_update: tuple[tuple[str, str], FileSnapshot] | None = None
-        if path is not None or after_hash is not None or after_mode is not None:
+        if (
+            path is not None
+            or after_hash is not None
+            or after_mode is not None
+            or created_directories is not None
+        ):
             if status is not ToolStatus.SUCCEEDED:
                 raise DomainError("after_hash is only valid for a successful tool")
             if call.name not in _MANAGED_WRITE_TOOL_NAMES:
@@ -683,6 +709,7 @@ class SessionReducer:
                 type(after_mode) is not int or not 0 <= after_mode <= 0o7777
             ):
                 raise DomainError("after_mode must be permission bits or null")
+            directories = _normalized_created_directories(created_directories)
             key = (call.turn_id, path)
             snapshot = state.file_snapshots.get(key)
             if snapshot is None:
@@ -694,7 +721,12 @@ class SessionReducer:
                 raise DomainError("successful write does not match snapshot source call")
             snapshot_update = (
                 key,
-                replace(snapshot, after_hash=after_hash, after_mode=after_mode),
+                replace(
+                    snapshot,
+                    after_hash=after_hash,
+                    after_mode=after_mode,
+                    created_directories=directories,
+                ),
             )
 
         state.tool_calls[call.call_key] = replace(

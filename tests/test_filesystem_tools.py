@@ -147,6 +147,15 @@ class FileSystemToolTests(unittest.TestCase):
         self.assertIs(result.metadata["truncated"], True)
         self.assertEqual(result.metadata["total_entries"], 3)
 
+    def test_list_dir_defaults_missing_or_blank_path_to_workspace_root(self) -> None:
+        self.write_bytes("a.txt", b"a")
+
+        for arguments in ({}, {"path": ""}, {"path": "   "}):
+            with self.subTest(arguments=arguments):
+                result = self.tools.list_dir(dict(arguments))
+                self.assertEqual(result.output.splitlines(), ["a.txt"])
+                self.assertEqual(result.metadata["path"], str(self.workspace.resolve()))
+
     def test_prepare_write_captures_snapshot_hash_and_diff_without_writing(self) -> None:
         path = self.write_bytes("file.txt", b"old\n")
         path.chmod(0o640)
@@ -175,6 +184,52 @@ class FileSystemToolTests(unittest.TestCase):
         self.assertIsNone(change.before_hash)
         self.assertIsNone(change.before_mode)
         self.assertIn("--- /dev/null", change.diff)
+
+    def test_prepare_write_accepts_a_missing_parent_directory(self) -> None:
+        change = self.tools.prepare_write_file(
+            {"path": "pkg/sub/module.py", "content": "x = 1\n"}
+        )
+
+        self.assertFalse((self.workspace / "pkg").exists())
+        self.assertFalse(change.existed_before)
+
+    def test_execute_creates_missing_parent_directories_and_reports_them(self) -> None:
+        change = self.tools.prepare_write_file(
+            {"path": "pkg/sub/module.py", "content": "x = 1\n"}
+        )
+
+        result = change.execute()
+
+        target = self.workspace / "pkg" / "sub" / "module.py"
+        self.assertEqual(target.read_text(encoding="utf-8"), "x = 1\n")
+        self.assertEqual(stat.S_IMODE((self.workspace / "pkg").stat().st_mode), 0o755)
+        self.assertEqual(
+            result.created_directories,
+            (str((self.workspace / "pkg").resolve()), str(target.parent.resolve())),
+        )
+
+    def test_execute_into_existing_directory_reports_no_created_directories(self) -> None:
+        (self.workspace / "pkg").mkdir()
+        change = self.tools.prepare_write_file(
+            {"path": "pkg/module.py", "content": "x = 1\n"}
+        )
+
+        result = change.execute()
+
+        self.assertEqual(result.created_directories, ())
+
+    def test_failed_write_rolls_back_directories_it_created(self) -> None:
+        change = self.tools.prepare_write_file(
+            {"path": "pkg/sub/module.py", "content": "x = 1\n"}
+        )
+
+        with patch(
+            "mca.tools.filesystem.os.replace", side_effect=OSError("disk full")
+        ):
+            with self.assertRaises(OSError):
+                change.execute()
+
+        self.assertFalse((self.workspace / "pkg").exists())
 
     def test_prepare_diff_exposes_removed_trailing_newline(self) -> None:
         self.write_bytes("newline.txt", b"same\n")

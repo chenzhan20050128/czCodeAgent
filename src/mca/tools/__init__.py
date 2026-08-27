@@ -39,7 +39,7 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
                     "offset": {"type": "integer", "minimum": 1},
                     "limit": {
                         "type": "integer",
@@ -57,7 +57,8 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             name="list_dir",
             description=(
                 "List a workspace directory in deterministic name order; "
-                "directories end in / and symbolic links in @."
+                "directories end in / and symbolic links in @. Omit path to "
+                "list the workspace root."
             ),
             schema={
                 "type": "object",
@@ -79,14 +80,15 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             name="grep",
             description=(
                 "Search workspace files using ripgrep regular expressions and "
-                "an optional file glob; ripgrep must be installed."
+                "an optional file glob; ripgrep must be installed. Omit path to "
+                "search the workspace root."
             ),
             schema={
                 "type": "object",
                 "properties": {
-                    "pattern": {"type": "string"},
+                    "pattern": {"type": "string", "minLength": 1},
                     "path": {"type": "string"},
-                    "glob": {"type": "string"},
+                    "glob": {"type": "string", "minLength": 1},
                 },
                 "required": ["pattern"],
                 "additionalProperties": False,
@@ -98,12 +100,14 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             name="write_file",
             description=(
                 "Prepare a complete UTF-8 file replacement inside the "
-                "workspace for approval and conflict-checked atomic execution."
+                "workspace for approval and conflict-checked atomic execution. "
+                "Missing parent directories are created automatically, so do "
+                "not call bash mkdir first."
             ),
             schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
@@ -118,14 +122,15 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
         ToolSpec(
             name="edit_file",
             description=(
-                "Prepare replacement of exactly one old_text occurrence in a "
-                "UTF-8 workspace file for approval and atomic execution."
+                "Prepare replacement of exactly one old_text occurrence in an "
+                "existing UTF-8 workspace file for approval and atomic "
+                "execution; use write_file to create a new file."
             ),
             schema={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "old_text": {"type": "string"},
+                    "path": {"type": "string", "minLength": 1},
+                    "old_text": {"type": "string", "minLength": 1},
                     "new_text": {"type": "string"},
                 },
                 "required": ["path", "old_text", "new_text"],
