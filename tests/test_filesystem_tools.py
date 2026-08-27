@@ -175,7 +175,7 @@ class FileSystemToolTests(unittest.TestCase):
         self.assertIsNone(change.before_mode)
         self.assertIn("--- /dev/null", change.diff)
 
-    def test_prepare_diff_exposes_a_trailing_newline_change(self) -> None:
+    def test_prepare_diff_exposes_removed_trailing_newline(self) -> None:
         self.write_bytes("newline.txt", b"same\n")
 
         change = self.tools.prepare_write_file(
@@ -183,7 +183,27 @@ class FileSystemToolTests(unittest.TestCase):
         )
 
         self.assertNotEqual(change.diff, "")
-        self.assertIn("\ No newline at end of file", change.diff)
+        self.assertIn("+same\n\\ No newline at end of file\n", change.diff)
+
+    def test_prepare_diff_exposes_added_trailing_newline(self) -> None:
+        self.write_bytes("newline.txt", b"same")
+
+        change = self.tools.prepare_write_file(
+            {"path": "newline.txt", "content": "same\n"}
+        )
+
+        self.assertIn("-same\n\\ No newline at end of file\n", change.diff)
+        self.assertTrue(change.diff.endswith("+same\n"))
+
+    def test_prepare_diff_renders_ordinary_line_replacement_without_marker(self) -> None:
+        self.write_bytes("ordinary.txt", b"old\n")
+
+        change = self.tools.prepare_write_file(
+            {"path": "ordinary.txt", "content": "new\n"}
+        )
+
+        self.assertIn("-old\n+new\n", change.diff)
+        self.assertNotIn("No newline at end of file", change.diff)
 
     def test_prepare_edit_replaces_exactly_one_match_without_writing(self) -> None:
         path = self.write_bytes("edit.txt", b"before old after\n")

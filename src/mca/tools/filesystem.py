@@ -438,10 +438,20 @@ def _unified_diff(
     if before == after:
         return ""
     lines = difflib.unified_diff(
-        before.splitlines(),
-        after.splitlines(),
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
         fromfile=from_file,
         tofile=to_file,
-        lineterm="",
+        lineterm="\n",
     )
-    return "\n".join(lines) + "\n"
+    rendered: list[str] = []
+    for line in lines:
+        if line.endswith("\n"):
+            rendered.append(line)
+            continue
+        rendered.append(line + "\n")
+        if line.startswith(("+", "-", " ")) and not line.startswith(
+            ("+++", "---")
+        ):
+            rendered.append("\\ No newline at end of file\n")
+    return "".join(rendered)
