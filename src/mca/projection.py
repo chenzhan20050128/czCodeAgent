@@ -19,7 +19,6 @@ from .domain import (
     Event,
     SessionReducer,
     SessionState,
-    ToolCall,
     ToolStatus,
 )
 
@@ -55,13 +54,69 @@ class ProjectionEnvironment:
 
 
 _ENVIRONMENT_FIELDS = frozenset({"cwd", "platform", "date", "is_git"})
-_TERMINAL_RECONCILED_STATUSES = frozenset(
-    {
-        ToolStatus.USER_CONFIRMED_SUCCESS,
-        ToolStatus.USER_CONFIRMED_FAILURE,
-        ToolStatus.ABANDONED,
-    }
-)
+@dataclass(frozen=True)
+class _CallOccurrence:
+    call_key: str
+    provider_call_id: str
+
+
+class _EventCallTracker:
+    """Resolve call references against their state at each event boundary."""
+
+    def __init__(self) -> None:
+        self._by_key: dict[str, _CallOccurrence] = {}
+        self._by_provider_id: dict[str, _CallOccurrence] = {}
+
+    def add_assistant_calls(
+        self, event: Event, calls: Sequence[Mapping[str, Any]]
+    ) -> None:
+        for call in calls:
+            provider_call_id = call["id"]
+            if provider_call_id in self._by_provider_id:
+                raise ProjectionError(
+                    f"tool call ID is already unresolved: {provider_call_id!r}"
+                )
+            occurrence = _CallOccurrence(
+                call_key=f"{event.seq}:{provider_call_id}",
+                provider_call_id=provider_call_id,
+            )
+            self._by_key[occurrence.call_key] = occurrence
+            self._by_provider_id[provider_call_id] = occurrence
+
+    def resolve(self, event: Event) -> _CallOccurrence:
+        call_key = event.payload.get("call_key")
+        provider_call_id = event.payload.get("call_id")
+        if call_key is not None:
+            if not isinstance(call_key, str) or not call_key:
+                raise ProjectionError(
+                    "tool event call_key must be a non-empty string"
+                )
+            occurrence = self._by_key.get(call_key)
+            if occurrence is None:
+                raise ProjectionError(f"tool event has no active call: {call_key}")
+            if (
+                provider_call_id is not None
+                and provider_call_id != occurrence.provider_call_id
+            ):
+                raise ProjectionError(
+                    "tool event call_key and call_id identify different calls"
+                )
+            return occurrence
+
+        if not isinstance(provider_call_id, str) or not provider_call_id:
+            raise ProjectionError(
+                "tool event must identify a provider call ID or call_key"
+            )
+        occurrence = self._by_provider_id.get(provider_call_id)
+        if occurrence is None:
+            raise ProjectionError(
+                f"tool event has no active call ID: {provider_call_id!r}"
+            )
+        return occurrence
+
+    def close(self, occurrence: _CallOccurrence) -> None:
+        self._by_key.pop(occurrence.call_key, None)
+        self._by_provider_id.pop(occurrence.provider_call_id, None)
 
 
 def _plain_json(value: Any) -> Any:
@@ -164,6 +219,31 @@ def _normalize_tool_call(document: object) -> dict[str, Any]:
     }
 
 
+def _validate_canonical_tool_call(document: object) -> str:
+    if not isinstance(document, Mapping):
+        raise ProjectionError("assistant tool call must be an object")
+    _validate_message_fields(
+        document, frozenset({"id", "type", "function"}), role="tool call"
+    )
+    if document["type"] != "function":
+        raise ProjectionError("only function tool calls are canonical")
+    call_id = document["id"]
+    if not isinstance(call_id, str) or not call_id:
+        raise ProjectionError("assistant tool call id must be a non-empty string")
+
+    function = document["function"]
+    if not isinstance(function, Mapping):
+        raise ProjectionError("assistant tool function must be an object")
+    _validate_message_fields(
+        function, frozenset({"name", "arguments"}), role="tool function"
+    )
+    if not isinstance(function["name"], str) or not function["name"]:
+        raise ProjectionError("assistant tool name must be a non-empty string")
+    if not isinstance(function["arguments"], str):
+        raise ProjectionError("canonical tool arguments must be a string")
+    return call_id
+
+
 def _assistant_message(event: Event) -> dict[str, Any]:
     content = event.payload.get("content")
     if content is not None and not isinstance(content, str):
@@ -183,36 +263,9 @@ def _assistant_message(event: Event) -> dict[str, Any]:
     return message
 
 
-def _call_for_result(event: Event, state: SessionState) -> ToolCall:
-    call_key = event.payload.get("call_key")
-    if call_key is not None:
-        if not isinstance(call_key, str) or not call_key:
-            raise ProjectionError("tool result call_key must be a non-empty string")
-        call = state.tool_calls.get(call_key)
-        if call is None:
-            raise ProjectionError(f"tool result has unknown call_key: {call_key}")
-        return call
-
-    provider_call_id = event.payload.get("call_id")
-    if not isinstance(provider_call_id, str) or not provider_call_id:
-        raise ProjectionError(
-            "tool result must identify a provider call ID or call_key"
-        )
-    candidates = [
-        call
-        for call in state.tool_calls.values()
-        if call.provider_call_id == provider_call_id
-        and call.finished_seq == event.seq
-    ]
-    if len(candidates) != 1:
-        raise ProjectionError(
-            f"tool result cannot be resolved uniquely: {provider_call_id!r}"
-        )
-    return candidates[0]
-
-
-def _tool_result_message(event: Event, state: SessionState) -> dict[str, str] | None:
-    call = _call_for_result(event, state)
+def _tool_result_message(
+    event: Event, occurrence: _CallOccurrence
+) -> dict[str, str] | None:
     raw_status = event.payload.get("status")
     aliases = {"success": "succeeded", "timeout": "timed_out"}
     try:
@@ -221,11 +274,7 @@ def _tool_result_message(event: Event, state: SessionState) -> dict[str, str] | 
         raise ProjectionError(f"unknown projected tool status: {raw_status!r}") from None
 
     if status is ToolStatus.OUTCOME_UNKNOWN:
-        if call.status in _TERMINAL_RECONCILED_STATUSES:
-            return None
-        raise ProjectionBlockedError(
-            f"tool outcome is unknown; recovery is blocked for {call.call_key}"
-        )
+        return None
     if status in {ToolStatus.REQUESTED, ToolStatus.STARTED}:
         raise ProjectionError("tool_finished does not contain a terminal result")
     result = event.payload.get("result")
@@ -235,13 +284,14 @@ def _tool_result_message(event: Event, state: SessionState) -> dict[str, str] | 
         raise ProjectionError("tool result content must be a string or null")
     return {
         "role": "tool",
-        "tool_call_id": call.provider_call_id,
+        "tool_call_id": occurrence.provider_call_id,
         "content": result,
     }
 
 
-def _reconciled_result_message(event: Event, state: SessionState) -> dict[str, str]:
-    call = _call_for_result(event, state)
+def _reconciled_result_message(
+    event: Event, occurrence: _CallOccurrence
+) -> dict[str, str]:
     descriptions = {
         "succeeded": "User confirmed after recovery that the tool succeeded.",
         "user_confirmed_success": "User confirmed after recovery that the tool succeeded.",
@@ -260,23 +310,34 @@ def _reconciled_result_message(event: Event, state: SessionState) -> dict[str, s
         content += f" Note: {note}"
     return {
         "role": "tool",
-        "tool_call_id": call.provider_call_id,
+        "tool_call_id": occurrence.provider_call_id,
         "content": content,
     }
 
 
-def _project_event(event: Event, state: SessionState) -> dict[str, Any] | None:
+def _project_event(
+    event: Event, call_tracker: _EventCallTracker
+) -> dict[str, Any] | None:
     if event.type == "turn_started":
         user_input = event.payload.get("user_input", event.payload.get("input", ""))
         if not isinstance(user_input, str):
             raise ProjectionError("turn input must be a string")
         return {"role": "user", "content": user_input}
     if event.type == "assistant_accepted":
-        return _assistant_message(event)
+        message = _assistant_message(event)
+        call_tracker.add_assistant_calls(event, message.get("tool_calls", ()))
+        return message
     if event.type == "tool_finished":
-        return _tool_result_message(event, state)
+        occurrence = call_tracker.resolve(event)
+        message = _tool_result_message(event, occurrence)
+        if message is not None:
+            call_tracker.close(occurrence)
+        return message
     if event.type == "tool_reconciled":
-        return _reconciled_result_message(event, state)
+        occurrence = call_tracker.resolve(event)
+        message = _reconciled_result_message(event, occurrence)
+        call_tracker.close(occurrence)
+        return message
     return None
 
 
@@ -355,13 +416,12 @@ def validate_conversation(messages: Sequence[Mapping[str, Any]]) -> None:
             raw_calls = message.get("tool_calls", ())
             if not isinstance(raw_calls, (list, tuple)):
                 raise ProjectionError("assistant tool_calls must be an array")
-            calls = [_normalize_tool_call(call) for call in raw_calls]
-            call_ids = [call["id"] for call in calls]
+            call_ids = [_validate_canonical_tool_call(call) for call in raw_calls]
             if len(call_ids) != len(set(call_ids)):
                 raise ProjectionError(
                     "assistant message contains a duplicate tool call ID"
                 )
-            if content is None and not calls:
+            if content is None and not call_ids:
                 raise ProjectionError(
                     "assistant message must contain text or tool calls"
                 )
@@ -465,11 +525,10 @@ class PromptProjector:
             _system_message(current_environment, checkpoint_summary=summary)
         ]
         messages.extend(baseline)
+        call_tracker = _EventCallTracker()
         for event in ordered_events:
-            if event.seq <= through_seq:
-                continue
-            projected = _project_event(event, state)
-            if projected is not None:
+            projected = _project_event(event, call_tracker)
+            if event.seq > through_seq and projected is not None:
                 messages.append(projected)
 
         validate_conversation(messages)

@@ -334,6 +334,50 @@ class PromptProjectionTests(ProjectionTestCase):
             sum(message.get("role") == "tool" for message in messages), 1
         )
 
+    def test_call_id_only_recovery_projects_one_reconciled_result(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {"tool_calls": [self.tool_call("c", "bash", "{}")]},
+        )
+        self.apply("tool_started", {"call_id": "c"})
+        self.apply(
+            "tool_finished",
+            {
+                "call_id": "c",
+                "status": "outcome_unknown",
+                "result": "execution outcome is unknown",
+                "recovery_blocked": True,
+            },
+        )
+        self.apply(
+            "tool_reconciled",
+            {
+                "call_id": "c",
+                "outcome": "succeeded",
+                "note": "verified after restart",
+            },
+        )
+
+        replayed = SessionReducer.replay(self.events)
+        messages = PromptProjector.project(
+            self.events, replayed, self.environment
+        )
+
+        self.assertEqual(
+            [message for message in messages if message["role"] == "tool"],
+            [
+                {
+                    "role": "tool",
+                    "tool_call_id": "c",
+                    "content": (
+                        "User confirmed after recovery that the tool succeeded. "
+                        "Note: verified after restart"
+                    ),
+                }
+            ],
+        )
+
     def test_invalid_event_facts_raise_projection_error(self) -> None:
         self.start_turn()
 
@@ -509,6 +553,39 @@ class CheckpointProjectionTests(ProjectionTestCase):
         )
 
         with self.assertRaisesRegex(ProjectionError, "result"):
+            self.project()
+
+    def test_checkpoint_rejects_noncanonical_flat_tool_call(self) -> None:
+        self.start_turn()
+        self.apply("assistant_accepted", {"content": "boundary", "tool_calls": []})
+        self.apply(
+            "compaction_checkpoint",
+            {
+                "through_seq": 3,
+                "summary": "summary",
+                "replacement_conversation": [
+                    {"role": "user", "content": "compressed task"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "flat-call",
+                                "name": "read_file",
+                                "arguments": "{}",
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "flat-call",
+                        "content": "contents",
+                    },
+                ],
+            },
+        )
+
+        with self.assertRaisesRegex(ProjectionError, "canonical|fields"):
             self.project()
 
 
