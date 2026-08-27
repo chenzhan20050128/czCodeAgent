@@ -345,6 +345,7 @@ class SessionState:
     file_snapshots: dict[tuple[str, str], FileSnapshot] = field(
         default_factory=dict
     )
+    undo_results: dict[str, Event] = field(default_factory=dict)
     latest_checkpoint: Event | None = None
     assistant_events: list[Event] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
@@ -731,6 +732,9 @@ class SessionReducer:
         before_bytes = event.payload.get("before_bytes", "")
         if not isinstance(before_bytes, str):
             raise DomainError("before_bytes must be a string")
+        before_encoding = event.payload.get("before_encoding", "base64")
+        if before_encoding != "base64":
+            raise DomainError("before_encoding must be base64")
         before_mode = event.payload.get("before_mode")
         snapshot = FileSnapshot(
             turn_id=turn_id,
@@ -751,6 +755,15 @@ class SessionReducer:
         turn_id = _payload_uuid(event.payload, "turn_id")
         if turn_id not in state.turns:
             raise DomainError("undo references an unknown turn")
+        if turn_id in state.undo_results:
+            raise DomainError("turn has already been undone")
+        status = event.payload.get("status")
+        if status not in {"succeeded", "conflict", "partial"}:
+            raise DomainError("undo status must be succeeded, conflict, or partial")
+        files = event.payload.get("files")
+        if not isinstance(files, (list, tuple)):
+            raise DomainError("undo files must be an array")
+        state.undo_results[turn_id] = event
 
     @staticmethod
     def _require_active_turn(state: SessionState) -> str:
@@ -819,6 +832,7 @@ def reduce_event(state: SessionState, event: Event) -> SessionState:
         turn_inputs=dict(state.turn_inputs),
         tool_calls=dict(state.tool_calls),
         file_snapshots=dict(state.file_snapshots),
+        undo_results=dict(state.undo_results),
         assistant_events=list(state.assistant_events),
         events=list(state.events),
     )

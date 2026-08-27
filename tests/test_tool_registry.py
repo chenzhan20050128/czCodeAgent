@@ -229,14 +229,14 @@ class BuiltinToolSpecTests(unittest.TestCase):
             self.assertEqual(function["parameters"]["type"], "object")
             self.assertIs(function["parameters"]["additionalProperties"], False)
 
-    def test_file_handlers_are_bound_and_shell_is_only_a_task6_placeholder(self) -> None:
+    def test_file_and_shell_handlers_are_bound(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             registry = create_tool_registry(temporary)
 
         self.assertIsNotNone(registry.resolve("read_file").handler)
         self.assertIsNotNone(registry.resolve("write_file").prepare_handler)
-        with self.assertRaisesRegex(NotImplementedError, "Task 6"):
-            registry.resolve("bash").prepare_handler({"command": "pwd"})
+        prepared = registry.resolve("bash").prepare_handler({"command": "pwd"})
+        self.assertEqual(prepared.command, "pwd")
 
 
 if __name__ == "__main__":

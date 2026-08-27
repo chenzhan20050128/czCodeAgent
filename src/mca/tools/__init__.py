@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
 
+from ..approval import ApprovalRequest
+from .filesystem import FileSystemTools
 from .registry import (
     SideEffect,
     ToolRegistry,
@@ -15,19 +16,19 @@ from .registry import (
     UnknownToolError,
     truncate_output,
 )
-from .filesystem import FileSystemTools
 from .search import SearchTools
+from .shell import ShellRunner
 
 
 def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
     """Build the fixed six-tool contract for one workspace.
 
-    Shell preparation intentionally remains a fail-fast placeholder until the
-    approval and process lifecycle are implemented in Task 6.
+    Stateful handlers are bound to the canonical workspace at construction.
     """
 
     filesystem = FileSystemTools(Path(workspace))
     search = SearchTools(Path(workspace))
+    shell = ShellRunner(Path(workspace))
     specs = [
         ToolSpec(
             name="read_file",
@@ -110,6 +111,9 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             },
             prepare_handler=filesystem.prepare_write_file,
             side_effect=SideEffect.WORKSPACE_WRITE,
+            approval_renderer=lambda prepared: ApprovalRequest.for_file(
+                "write_file", prepared
+            ).render(),
         ),
         ToolSpec(
             name="edit_file",
@@ -129,36 +133,37 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             },
             prepare_handler=filesystem.prepare_edit_file,
             side_effect=SideEffect.WORKSPACE_WRITE,
+            approval_renderer=lambda prepared: ApprovalRequest.for_file(
+                "edit_file", prepared
+            ).render(),
         ),
         ToolSpec(
             name="bash",
             description=(
-                "Prepare a command for approved execution by the Task 6 shell "
-                "runner in the workspace."
+                "Execute an approved foreground command with /bin/sh -lc in "
+                "the workspace, bounded output, and a timeout."
             ),
             schema={
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string"},
+                    "command": {"type": "string", "minLength": 1},
                     "timeout_seconds": {
-                        "type": "number",
-                        "minimum": 0.1,
-                        "maximum": 600.0,
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 600,
                     },
                 },
                 "required": ["command"],
                 "additionalProperties": False,
             },
-            prepare_handler=_prepare_bash_placeholder,
+            prepare_handler=shell.prepare,
             side_effect=SideEffect.SHELL,
+            approval_renderer=lambda prepared: ApprovalRequest.for_shell(
+                command=prepared.command, cwd=prepared.cwd
+            ).render(),
         ),
     ]
     return ToolRegistry(specs)
-
-
-def _prepare_bash_placeholder(arguments: dict[str, Any]) -> object:
-    del arguments
-    raise NotImplementedError("bash execution is implemented in Task 6")
 
 __all__ = [
     "SideEffect",

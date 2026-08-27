@@ -171,6 +171,12 @@ def _check_schema(schema: object, *, path: str) -> None:
     enum = schema.get("enum")
     if enum is not None and (not isinstance(enum, list) or not enum):
         raise ValueError(f"{path}.enum must be a non-empty array")
+    if "minLength" in schema and (
+        schema_type != "string"
+        or type(schema["minLength"]) is not int
+        or schema["minLength"] < 0
+    ):
+        raise ValueError(f"{path}.minLength must be a non-negative integer")
     for bound in ("minimum", "maximum"):
         if bound in schema and (
             isinstance(schema[bound], bool)
@@ -229,6 +235,9 @@ def _validate_value(schema: Mapping[str, Any], value: object, *, path: str) -> N
     article = "an" if schema_type in {"object", "integer", "array"} else "a"
     if not valid(value):
         raise ToolValidationError(f"{label} must be {article} {schema_type}")
+
+    if schema_type == "string" and len(value) < schema.get("minLength", 0):
+        raise ToolValidationError(f"{label} must not be empty")
 
     enum = schema.get("enum")
     if enum is not None and not any(
