@@ -19,6 +19,10 @@ class UndoError(RuntimeError):
     """Raised when an undo request itself is invalid or cannot be recorded."""
 
 
+class _UndoConflict(UndoError):
+    """Raised when mutation-time compare-and-swap detects interference."""
+
+
 @dataclass(frozen=True)
 class UndoFileResult:
     path: str
@@ -118,6 +122,10 @@ class ManagedUndo:
                     completed.append(
                         UndoFileResult(str(item.path), "deleted", "created file removed")
                     )
+            except _UndoConflict as error:
+                completed.append(
+                    UndoFileResult(str(item.path), "conflict", str(error))
+                )
             except Exception as error:
                 completed.append(
                     UndoFileResult(
@@ -126,15 +134,13 @@ class ManagedUndo:
                         f"undo failed: {type(error).__name__}: {error}",
                     )
                 )
-        status = (
-            "succeeded"
-            if all(
-                item.status
-                in {"restored", "deleted", "already_restored", "already_deleted"}
-                for item in completed
-            )
-            else "partial"
-        )
+        statuses = {item.status for item in completed}
+        if statuses <= {"restored", "deleted", "already_restored", "already_deleted"}:
+            status = "succeeded"
+        elif statuses <= {"conflict"}:
+            status = "conflict"
+        else:
+            status = "partial"
         return self._record(UndoResult(turn_id, status, tuple(completed)))
 
     def undo(self, turn_id: str) -> UndoResult:
@@ -263,46 +269,72 @@ def _atomic_restore(
         raise UndoError("original file snapshot has no mode")
     if expected_hash is None:
         raise UndoError("snapshot has no successful after_hash")
-    parent_fd = _open_parent_fd(workspace, path)
-    temp_name: str | None = None
     try:
-        _require_current_hash(
-            parent_fd, path.name, expected_hash, max_file_bytes=max_file_bytes
+        parent_fd = _open_parent_fd(workspace, path)
+    except OSError as error:
+        raise _UndoConflict("managed parent changed during undo") from error
+    temp_name: str | None = None
+    quarantine_name: str | None = None
+    try:
+        quarantine_name = _quarantine_target(parent_fd, path.name)
+        try:
+            quarantined_stat = _require_current_hash(
+                parent_fd,
+                quarantine_name,
+                expected_hash,
+                max_file_bytes=max_file_bytes,
+            )
+            _require_same_entry(parent_fd, quarantine_name, quarantined_stat)
+        except Exception as error:
+            detail, removed = _restore_quarantine(
+                parent_fd, quarantine_name, path.name
+            )
+            if removed:
+                quarantine_name = None
+            raise _UndoConflict(f"managed file changed during undo; {detail}") from error
+
+        temp_name, descriptor = _create_exclusive_file(
+            parent_fd, path.name, "restore", mode
         )
-        for _ in range(128):
-            candidate = f".{path.name}.mca-undo-{secrets.token_hex(8)}"
-            try:
-                descriptor = os.open(
-                    candidate,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | getattr(os, "O_NOFOLLOW", 0),
-                    mode,
-                    dir_fd=parent_fd,
-                )
-            except FileExistsError:
-                continue
-            temp_name = candidate
-            break
-        else:
-            raise UndoError("could not allocate undo temporary file")
         with os.fdopen(descriptor, "wb") as stream:
             os.fchmod(stream.fileno(), mode)
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        _require_current_hash(
-            parent_fd, path.name, expected_hash, max_file_bytes=max_file_bytes
-        )
-        os.replace(
-            temp_name,
-            path.name,
-            src_dir_fd=parent_fd,
-            dst_dir_fd=parent_fd,
-        )
+        _require_same_entry(parent_fd, quarantine_name, quarantined_stat)
+        try:
+            os.link(
+                temp_name,
+                path.name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as error:
+            detail, removed = _restore_quarantine(
+                parent_fd, quarantine_name, path.name
+            )
+            if removed:
+                quarantine_name = None
+            raise _UndoConflict(
+                f"target was recreated during undo; {detail}"
+            ) from error
+        os.unlink(temp_name, dir_fd=parent_fd)
         temp_name = None
+        os.unlink(quarantine_name, dir_fd=parent_fd)
+        quarantine_name = None
         _fsync_parent(parent_fd)
+    except _UndoConflict:
+        raise
+    except Exception as error:
+        if quarantine_name is not None:
+            detail, removed = _restore_quarantine(
+                parent_fd, quarantine_name, path.name
+            )
+            if removed:
+                quarantine_name = None
+            raise UndoError(f"{error}; {detail}") from error
+        raise
     finally:
         if temp_name is not None:
             try:
@@ -321,18 +353,134 @@ def _verified_delete(
 ) -> None:
     if expected_hash is None:
         raise UndoError("snapshot has no successful after_hash")
-    parent_fd = _open_parent_fd(workspace, path)
     try:
-        inspected = _require_current_hash(
-            parent_fd, path.name, expected_hash, max_file_bytes=max_file_bytes
-        )
-        current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        if (current.st_dev, current.st_ino) != (inspected.st_dev, inspected.st_ino):
-            raise UndoError("managed file changed during undo")
-        os.unlink(path.name, dir_fd=parent_fd)
+        parent_fd = _open_parent_fd(workspace, path)
+    except OSError as error:
+        raise _UndoConflict("managed parent changed during undo") from error
+    quarantine_name: str | None = None
+    try:
+        quarantine_name = _quarantine_target(parent_fd, path.name)
+        try:
+            quarantined_stat = _require_current_hash(
+                parent_fd,
+                quarantine_name,
+                expected_hash,
+                max_file_bytes=max_file_bytes,
+            )
+            _require_same_entry(parent_fd, quarantine_name, quarantined_stat)
+        except Exception as error:
+            detail, removed = _restore_quarantine(
+                parent_fd, quarantine_name, path.name
+            )
+            if removed:
+                quarantine_name = None
+            raise _UndoConflict(f"managed file changed during undo; {detail}") from error
+        if _name_exists(parent_fd, path.name):
+            raise _UndoConflict(
+                "target was recreated during undo; concurrent target was preserved; "
+                f"recover managed content from {quarantine_name}"
+            )
+        os.unlink(quarantine_name, dir_fd=parent_fd)
+        quarantine_name = None
         _fsync_parent(parent_fd)
     finally:
         os.close(parent_fd)
+
+
+def _quarantine_target(parent_fd: int, target_name: str) -> str:
+    quarantine_name, descriptor = _create_exclusive_file(
+        parent_fd, target_name, "quarantine", 0o600
+    )
+    os.close(descriptor)
+    try:
+        os.rename(
+            target_name,
+            quarantine_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+    except BaseException:
+        try:
+            os.unlink(quarantine_name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        raise
+    return quarantine_name
+
+
+def _restore_quarantine(
+    parent_fd: int, quarantine_name: str, target_name: str
+) -> tuple[str, bool]:
+    try:
+        os.link(
+            quarantine_name,
+            target_name,
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        return (
+            "concurrent target was preserved; recover managed content from "
+            f"{quarantine_name}",
+            False,
+        )
+    except OSError as error:
+        return (
+            f"recover managed content from {quarantine_name}; "
+            f"link-back failed: {error}",
+            False,
+        )
+    os.unlink(quarantine_name, dir_fd=parent_fd)
+    _fsync_parent(parent_fd)
+    return "original managed path was restored", True
+
+
+def _create_exclusive_file(
+    parent_fd: int, target_name: str, purpose: str, mode: int
+) -> tuple[str, int]:
+    for _ in range(128):
+        candidate = _unused_name(parent_fd, target_name, purpose)
+        try:
+            descriptor = os.open(
+                candidate,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                mode,
+                dir_fd=parent_fd,
+            )
+        except FileExistsError:
+            continue
+        return candidate, descriptor
+    raise UndoError("could not allocate undo temporary file")
+
+
+def _unused_name(parent_fd: int, target_name: str, purpose: str) -> str:
+    for _ in range(128):
+        candidate = f".{target_name}.mca-{purpose}-{secrets.token_hex(16)}"
+        try:
+            os.stat(candidate, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return candidate
+    raise UndoError(f"could not allocate undo {purpose} name")
+
+
+def _name_exists(parent_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _require_same_entry(
+    parent_fd: int, name: str, expected: os.stat_result
+) -> None:
+    current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino):
+        raise _UndoConflict("quarantined file changed during undo")
 
 
 def _open_parent_fd(workspace: Path, path: Path) -> int:

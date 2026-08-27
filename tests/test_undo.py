@@ -259,8 +259,8 @@ class ManagedUndoTests(UndoTestCase):
         with patch("mca.undo._open_parent_fd", side_effect=swap_then_open):
             result = self.undo()
 
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(result.files[0].status, "failed")
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "conflict")
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
 
     def test_parent_symlink_swap_before_delete_cannot_delete_outside(self) -> None:
@@ -286,9 +286,56 @@ class ManagedUndoTests(UndoTestCase):
         with patch("mca.undo._open_parent_fd", side_effect=swap_then_open):
             result = self.undo()
 
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(result.files[0].status, "failed")
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "conflict")
         self.assertEqual(outside.read_text(encoding="utf-8"), "outside")
+
+    def test_concurrent_replacement_after_quarantine_is_never_overwritten(self) -> None:
+        managed_dir = self.workspace / "dir"
+        managed_dir.mkdir()
+        path = managed_dir / "file.txt"
+        path.write_text("baseline", encoding="utf-8")
+        self.write_call("write", "dir/file.txt", "managed")
+        real_rename = os.rename
+        quarantine_names: list[str] = []
+
+        def rename_then_replace(*args: object, **kwargs: object) -> None:
+            real_rename(*args, **kwargs)
+            if not quarantine_names:
+                quarantine_names.append(str(args[1]))
+                path.write_text("concurrent", encoding="utf-8")
+
+        with patch("mca.undo.os.rename", side_effect=rename_then_replace):
+            result = self.undo()
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "conflict")
+        self.assertIn(quarantine_names[0], result.files[0].detail)
+        self.assertEqual(path.read_text(encoding="utf-8"), "concurrent")
+        quarantine = managed_dir / quarantine_names[0]
+        self.assertEqual(quarantine.read_text(encoding="utf-8"), "managed")
+
+    def test_concurrent_replacement_during_new_file_undo_is_not_deleted(self) -> None:
+        managed_dir = self.workspace / "dir"
+        managed_dir.mkdir()
+        path = managed_dir / "new.txt"
+        self.write_call("write", "dir/new.txt", "managed")
+        real_rename = os.rename
+
+        def rename_then_replace(*args: object, **kwargs: object) -> None:
+            real_rename(*args, **kwargs)
+            path.write_text("concurrent", encoding="utf-8")
+
+        with patch("mca.undo.os.rename", side_effect=rename_then_replace):
+            result = self.undo()
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "conflict")
+        self.assertEqual(path.read_text(encoding="utf-8"), "concurrent")
+        quarantine = list(managed_dir.glob(".new.txt.mca-quarantine-*"))
+        self.assertEqual(len(quarantine), 1)
+        self.assertEqual(quarantine[0].read_text(encoding="utf-8"), "managed")
+        self.assertIn(quarantine[0].name, result.files[0].detail)
 
     def test_resume_reconstructed_state_can_undo(self) -> None:
         path = self.workspace / "resume.txt"
@@ -312,17 +359,17 @@ class ManagedUndoTests(UndoTestCase):
         second.write_text("b", encoding="utf-8")
         self.write_call("one", "a.txt", "changed-a")
         self.write_call("two", "b.txt", "changed-b")
-        real_replace = os.replace
+        real_link = os.link
         calls = 0
 
-        def fail_second_replace(*args: object, **kwargs: object) -> None:
+        def fail_second_install(*args: object, **kwargs: object) -> None:
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise OSError("disk failure")
-            real_replace(*args, **kwargs)
+            real_link(*args, **kwargs)
 
-        with patch("mca.undo.os.replace", side_effect=fail_second_replace):
+        with patch("mca.undo.os.link", side_effect=fail_second_install):
             result = self.undo()
 
         self.assertEqual(result.status, "partial")
@@ -338,17 +385,17 @@ class ManagedUndoTests(UndoTestCase):
         second.write_text("b", encoding="utf-8")
         self.write_call("one", "a.txt", "changed-a")
         self.write_call("two", "b.txt", "changed-b")
-        real_replace = os.replace
+        real_link = os.link
         calls = 0
 
-        def fail_second_replace(*args: object, **kwargs: object) -> None:
+        def fail_second_install(*args: object, **kwargs: object) -> None:
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise OSError("transient failure")
-            real_replace(*args, **kwargs)
+            real_link(*args, **kwargs)
 
-        with patch("mca.undo.os.replace", side_effect=fail_second_replace):
+        with patch("mca.undo.os.link", side_effect=fail_second_install):
             first_result = self.undo()
 
         second_result = self.undo()

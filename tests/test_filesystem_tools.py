@@ -274,6 +274,38 @@ class FileSystemToolTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 2)
 
+    def test_keyboard_interrupt_immediately_after_replace_reports_committed_change(self) -> None:
+        path = self.write_bytes("committed.txt", b"old")
+        change = self.tools.prepare_write_file(
+            {"path": "committed.txt", "content": "new"}
+        )
+        real_replace = os.replace
+
+        def replace_then_interrupt(source: object, target: object) -> None:
+            real_replace(source, target)
+            raise KeyboardInterrupt
+
+        with patch(
+            "mca.tools.filesystem.os.replace", side_effect=replace_then_interrupt
+        ):
+            result = change.execute()
+
+        self.assertEqual(path.read_bytes(), b"new")
+        self.assertEqual(result.after_hash, hashlib.sha256(b"new").hexdigest())
+        self.assertIs(result.interruption_warning, True)
+
+    def test_keyboard_interrupt_before_replace_propagates_without_committing(self) -> None:
+        path = self.write_bytes("uncommitted.txt", b"old")
+        change = self.tools.prepare_write_file(
+            {"path": "uncommitted.txt", "content": "new"}
+        )
+
+        with patch("mca.tools.filesystem.os.replace", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                change.execute()
+
+        self.assertEqual(path.read_bytes(), b"old")
+
     def test_execute_rejects_approval_time_hash_conflict(self) -> None:
         path = self.write_bytes("file.txt", b"old")
         change = self.tools.prepare_write_file({"path": "file.txt", "content": "approved"})

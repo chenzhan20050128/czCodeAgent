@@ -5,8 +5,10 @@ from __future__ import annotations
 import difflib
 import hashlib
 import os
+import signal
 import stat
 import tempfile
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -116,6 +118,7 @@ class ExecutedFileChange:
     before_hash: str | None
     after_hash: str
     durability_warning: bool = False
+    interruption_warning: bool = False
 
 
 @dataclass(frozen=True)
@@ -141,6 +144,9 @@ class PreparedFileChange:
         if not parent.exists() or not parent.is_dir():
             raise FileToolError(f"parent directory does not exist: {parent}")
         temp_path: Path | None = None
+        committed = False
+        durability_warning = False
+        interruption_warning = False
         try:
             descriptor, raw_temp_path = tempfile.mkstemp(
                 prefix=f".{target.name}.mca-", dir=parent
@@ -153,14 +159,42 @@ class PreparedFileChange:
                 stream.flush()
                 os.fsync(stream.fileno())
             target = self._assert_unchanged()
-            os.replace(temp_path, target)
-            temp_path = None
+            previous_mask: set[signal.Signals] | None = None
             try:
-                _fsync_directory(parent)
-            except BaseException:
-                durability_warning = True
-            else:
-                durability_warning = False
+                if threading.current_thread() is threading.main_thread() and hasattr(
+                    signal, "pthread_sigmask"
+                ):
+                    previous_mask = signal.pthread_sigmask(
+                        signal.SIG_BLOCK, {signal.SIGINT}
+                    )
+                try:
+                    os.replace(temp_path, target)
+                except KeyboardInterrupt:
+                    if target.exists() and sha256_bytes(target.read_bytes()) == sha256_bytes(
+                        self.proposed_bytes
+                    ):
+                        committed = True
+                        temp_path = None
+                        interruption_warning = True
+                    else:
+                        raise
+                else:
+                    committed = True
+                    temp_path = None
+                if committed:
+                    try:
+                        _fsync_directory(parent)
+                    except (OSError, KeyboardInterrupt):
+                        durability_warning = True
+            finally:
+                if previous_mask is not None:
+                    try:
+                        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                    except KeyboardInterrupt:
+                        if committed:
+                            interruption_warning = True
+                        else:
+                            raise
         finally:
             if temp_path is not None:
                 try:
@@ -172,6 +206,7 @@ class PreparedFileChange:
             before_hash=self.before_hash,
             after_hash=sha256_bytes(self.proposed_bytes),
             durability_warning=durability_warning,
+            interruption_warning=interruption_warning,
         )
 
     def _assert_unchanged(self) -> Path:
