@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 from .config import Config
 from .domain import (
+    DomainError,
     Event,
     SamplingOutcome,
     SessionReducer,
@@ -16,6 +17,7 @@ from .domain import (
     ToolCall,
     ToolStatus,
     TurnStatus,
+    reduce_event,
 )
 from .executor import AcceptedToolCall, ToolExecutor, ToolExecutorError
 from .model import SamplingResult
@@ -85,6 +87,55 @@ class TurnResult:
     error: str | None
 
 
+class _StreamObservation:
+    """Track whether one logical sample left unaccepted text on screen."""
+
+    def __init__(
+        self,
+        on_content: Callable[[str], None] | None,
+        on_invalidate: Callable[[], None] | None,
+    ) -> None:
+        self._on_content = on_content
+        self._on_invalidate = on_invalidate
+        self._needs_invalidation = False
+
+    def content(self, delta: str) -> None:
+        if delta:
+            self._needs_invalidation = True
+        if self._on_content is not None:
+            try:
+                self._on_content(delta)
+            except Exception:
+                pass
+
+    def invalidate(self) -> None:
+        self._needs_invalidation = False
+        if self._on_invalidate is not None:
+            try:
+                self._on_invalidate()
+            except Exception:
+                pass
+
+    def discard(self) -> None:
+        if not self._needs_invalidation:
+            return
+        self._needs_invalidation = False
+        if self._on_invalidate is not None:
+            try:
+                self._on_invalidate()
+            except Exception:
+                pass
+
+
+@dataclass(frozen=True)
+class _ObservedSample:
+    result: SamplingResult
+    stream: _StreamObservation
+
+    def discard(self) -> None:
+        self.stream.discard()
+
+
 class AgentLoop:
     """Own one active turn and drive sampling and tools to a terminal fact."""
 
@@ -131,18 +182,21 @@ class AgentLoop:
             "turn_started", {"turn_id": turn_id, "user_input": user_input}
         )
         tool_steps = 0
+        observed: _ObservedSample | None = None
 
         try:
             while tool_steps < self.config.max_steps:
-                sampled = self._sample_with_one_compaction(allow_tools=True)
-                if sampled is None:
+                observed = self._sample_with_one_compaction(allow_tools=True)
+                if observed is None:
                     return self._finish(
                         turn_id,
                         TurnStatus.FAILED,
                         tool_steps,
                         error="context compaction failed",
                     )
+                sampled = observed.result
                 if sampled.outcome is SamplingOutcome.CONTEXT_OVERFLOW:
+                    observed.discard()
                     return self._finish(
                         turn_id,
                         TurnStatus.FAILED,
@@ -151,6 +205,7 @@ class AgentLoop:
                     )
                 if sampled.outcome is SamplingOutcome.COMPLETE_TEXT:
                     if not sampled.content or sampled.tool_calls:
+                        observed.discard()
                         return self._finish(
                             turn_id,
                             TurnStatus.FAILED,
@@ -158,6 +213,7 @@ class AgentLoop:
                             error="model returned an empty text response",
                         )
                     self._accept_assistant(turn_id, sampled, include_calls=False)
+                    observed = None
                     return self._finish(
                         turn_id,
                         TurnStatus.COMPLETED,
@@ -166,6 +222,7 @@ class AgentLoop:
                     )
                 if sampled.outcome is SamplingOutcome.VALID_TOOL_BATCH:
                     if not sampled.tool_calls:
+                        observed.discard()
                         return self._finish(
                             turn_id,
                             TurnStatus.FAILED,
@@ -175,6 +232,7 @@ class AgentLoop:
                     accepted = self._accept_assistant(
                         turn_id, sampled, include_calls=True
                     )
+                    observed = None
                     tool_steps += 1
                     interrupted = self._execute_batch(accepted)
                     if interrupted:
@@ -187,10 +245,12 @@ class AgentLoop:
                     continue
                 terminal = _FAILURE_MESSAGES.get(sampled.outcome)
                 if terminal is not None:
+                    observed.discard()
                     status, message = terminal
                     return self._finish(
                         turn_id, status, tool_steps, error=message
                     )
+                observed.discard()
                 return self._finish(
                     turn_id,
                     TurnStatus.FAILED,
@@ -200,12 +260,26 @@ class AgentLoop:
 
             return self._finalize_after_limit(turn_id, tool_steps)
         except KeyboardInterrupt:
+            if observed is not None:
+                observed.discard()
             self._close_open_calls_after_interrupt(turn_id)
             return self._finish(
                 turn_id,
                 TurnStatus.INTERRUPTED,
                 tool_steps,
                 error="turn interrupted by user",
+            )
+        except AgentLoopError:
+            raise
+        except Exception:
+            if observed is not None:
+                observed.discard()
+            self._close_open_calls_after_interrupt(turn_id)
+            return self._finish(
+                turn_id,
+                TurnStatus.FAILED,
+                tool_steps,
+                error="agent turn failed",
             )
 
     def _require_ready(self, user_input: str) -> None:
@@ -222,25 +296,35 @@ class AgentLoop:
         if self.state.session_id is None:
             raise AgentLoopError("session has not been created")
 
-    def _sample(self, *, allow_tools: bool) -> SamplingResult:
+    def _sample(self, *, allow_tools: bool) -> _ObservedSample:
         messages = PromptProjector.project(
             self.store.load(), self.state, self.environment()
         )
         schemas = self.registry.provider_schemas() if allow_tools else []
-        return self.model.sample(
-            messages,
-            schemas,
-            allow_tools,
-            on_content=self.on_content,
-            on_invalidate=self.on_invalidate,
-        )
+        stream = _StreamObservation(self.on_content, self.on_invalidate)
+        try:
+            sampled = self.model.sample(
+                messages,
+                schemas,
+                allow_tools,
+                on_content=stream.content,
+                on_invalidate=stream.invalidate,
+            )
+        except KeyboardInterrupt:
+            stream.discard()
+            raise
+        except Exception:
+            stream.discard()
+            raise
+        return _ObservedSample(sampled, stream)
 
     def _sample_with_one_compaction(
         self, *, allow_tools: bool
-    ) -> SamplingResult | None:
-        sampled = self._sample(allow_tools=allow_tools)
-        if sampled.outcome is not SamplingOutcome.CONTEXT_OVERFLOW:
-            return sampled
+    ) -> _ObservedSample | None:
+        observed = self._sample(allow_tools=allow_tools)
+        if observed.result.outcome is not SamplingOutcome.CONTEXT_OVERFLOW:
+            return observed
+        observed.discard()
         if self.compactor is None:
             return None
         try:
@@ -359,23 +443,25 @@ class AgentLoop:
         )
 
     def _finalize_after_limit(self, turn_id: str, tool_steps: int) -> TurnResult:
-        try:
-            sampled = self._sample(allow_tools=False)
-        except KeyboardInterrupt:
-            return self._finish(
-                turn_id,
-                TurnStatus.INTERRUPTED,
-                tool_steps,
-                error="turn interrupted by user",
-            )
+        observed = self._sample(allow_tools=False)
+        sampled = observed.result
         final_text = MAX_STEPS_FALLBACK
         if (
             sampled.outcome is SamplingOutcome.COMPLETE_TEXT
             and bool(sampled.content)
             and not sampled.tool_calls
         ):
-            self._accept_assistant(turn_id, sampled, include_calls=False)
+            try:
+                self._accept_assistant(turn_id, sampled, include_calls=False)
+            except KeyboardInterrupt:
+                observed.discard()
+                raise
+            except Exception:
+                observed.discard()
+                raise
             final_text = sampled.content
+        else:
+            observed.discard()
         return self._finish(
             turn_id,
             TurnStatus.MAX_STEPS_REACHED,
@@ -393,6 +479,9 @@ class AgentLoop:
         final_text: str = "",
         error: str | None = None,
     ) -> TurnResult:
+        persisted = self._persisted_turn_result(turn_id, tool_steps)
+        if persisted is not None:
+            return persisted
         payload: dict[str, Any] = {
             "turn_id": turn_id,
             "status": status.value,
@@ -404,10 +493,54 @@ class AgentLoop:
         self._append("turn_finished", payload)
         return TurnResult(status, final_text, turn_id, tool_steps, error)
 
+    def _persisted_turn_result(
+        self, turn_id: str, tool_steps: int
+    ) -> TurnResult | None:
+        if self.state.active_turn_id == turn_id:
+            return None
+        status = self.state.turns.get(turn_id)
+        if status is None or status in {TurnStatus.ACTIVE, TurnStatus.RECOVERY_BLOCKED}:
+            return None
+        terminal = next(
+            (
+                event
+                for event in reversed(self.state.events)
+                if event.type == "turn_finished"
+                and event.payload.get("turn_id") == turn_id
+            ),
+            None,
+        )
+        if terminal is None:
+            raise AgentLoopError("terminal turn has no durable finish event")
+        final_text = terminal.payload.get("final_text", "")
+        error = terminal.payload.get("error")
+        if not isinstance(final_text, str) or (
+            error is not None and not isinstance(error, str)
+        ):
+            raise AgentLoopError("terminal turn has an invalid durable result")
+        return TurnResult(status, final_text, turn_id, tool_steps, error)
+
     def _append(self, event_type: str, payload: Mapping[str, Any]) -> Event:
         if not self._usable:
             raise AgentLoopError("agent loop is unusable after reducer divergence")
-        event = self.store.append(event_type, payload)
+        candidate = Event.create(
+            seq=self.state.last_seq + 1,
+            session_id=self.store.session_id,
+            event_type=event_type,
+            payload=payload,
+        )
+        try:
+            reduce_event(self.state, candidate)
+        except DomainError:
+            raise
+        except Exception as error:
+            self._usable = False
+            raise AgentLoopError("candidate event could not be reduced") from error
+        try:
+            event = self.store.append(event_type, payload)
+        except Exception as error:
+            self._usable = False
+            raise AgentLoopError("rollout store append failed") from error
         try:
             SessionReducer.apply(self.state, event)
         except Exception as error:

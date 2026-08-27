@@ -34,7 +34,7 @@ from mca.domain import (
 )
 from mca.executor import ToolExecutor
 from mca.model import SampledToolCall, SamplingResult
-from mca.projection import ProjectionEnvironment
+from mca.projection import ProjectionEnvironment, PromptProjector
 from mca.store import RolloutStore
 from mca.tools.registry import SideEffect, ToolRegistry, ToolResult, ToolSpec
 
@@ -48,10 +48,21 @@ EMPTY_SCHEMA = {
 MAX_STEPS_FALLBACK = "Maximum tool steps reached before completion."
 
 
+@dataclasses.dataclass(frozen=True)
+class StreamedSample:
+    result: SamplingResult | BaseException
+    model_invalidates: bool = False
+
+
 class ScriptedModel:
     def __init__(
         self,
-        *results: SamplingResult | BaseException | Callable[[], SamplingResult],
+        *results: (
+            SamplingResult
+            | StreamedSample
+            | BaseException
+            | Callable[[], SamplingResult]
+        ),
     ) -> None:
         self.results = list(results)
         self.requests: list[
@@ -73,6 +84,13 @@ class ScriptedModel:
         if not self.results:
             raise AssertionError("unexpected model sample")
         result = self.results.pop(0)
+        if isinstance(result, StreamedSample):
+            assert callable(on_content)
+            on_content("partial")
+            if result.model_invalidates:
+                assert callable(on_invalidate)
+                on_invalidate()
+            result = result.result
         if isinstance(result, BaseException):
             raise result
         if callable(result):
@@ -144,7 +162,12 @@ def tool_spec(
 class AgentLoopTestCase(unittest.TestCase):
     def make_runtime(
         self,
-        *results: SamplingResult | BaseException | Callable[[], SamplingResult],
+        *results: (
+            SamplingResult
+            | StreamedSample
+            | BaseException
+            | Callable[[], SamplingResult]
+        ),
         specs: Sequence[ToolSpec] = (),
         config: Config | None = None,
         approver: object | None = None,
@@ -233,13 +256,39 @@ class AgentLoopTestCase(unittest.TestCase):
 
 
 class AgentLoopTests(AgentLoopTestCase):
+    def test_duplicate_provider_call_ids_fail_without_persisting_invalid_assistant(
+        self,
+    ) -> None:
+        runtime = self.make_runtime(
+            tool_batch(call("duplicate", "ok"), call("duplicate", "ok")),
+            text("recovered"),
+            specs=[tool_spec("ok", lambda _: ToolResult(title="ok", output="ok"))],
+        )
+
+        failed = runtime.loop.run_turn("invalid provider batch")
+
+        self.assertEqual(failed.status, TurnStatus.FAILED)
+        self.assertEqual(failed.error, "agent turn failed")
+        self.assertEqual(
+            [event.type for event in runtime.store.load()],
+            ["session_created", "turn_started", "turn_finished"],
+        )
+        self.assertEqual(SessionReducer.replay(runtime.store.load()), runtime.state)
+        self.assertIsNone(runtime.state.active_turn_id)
+
+        recovered = runtime.loop.run_turn("try again")
+
+        self.assertEqual(recovered.status, TurnStatus.COMPLETED)
+        self.assertEqual(recovered.final_text, "recovered")
+        self.assertEqual(len(self.terminal_events(runtime)), 2)
+
     def test_text_completion_closes_the_turn_and_forwards_ui_callbacks(self) -> None:
         displayed: list[str] = []
         invalidated: list[str] = []
         on_content = displayed.append
         on_invalidate = lambda: invalidated.append("invalid")
         runtime = self.make_runtime(
-            text("done", reasoning="checked"),
+            StreamedSample(text("done", reasoning="checked")),
             on_content=on_content,
             on_invalidate=on_invalidate,
         )
@@ -274,8 +323,73 @@ class AgentLoopTests(AgentLoopTestCase):
         self.assertEqual(events[2].payload["tool_calls"], ())
         self.assertEqual(events[-1].payload["status"], "completed")
         self.assertIsNone(runtime.state.active_turn_id)
-        self.assertIs(runtime.model.callbacks[0][0], on_content)
-        self.assertIs(runtime.model.callbacks[0][1], on_invalidate)
+        self.assertEqual(displayed, ["partial"])
+        self.assertEqual(invalidated, [])
+        self.assertIsNot(runtime.model.callbacks[0][0], on_content)
+        self.assertIsNot(runtime.model.callbacks[0][1], on_invalidate)
+
+    def test_environment_exception_safely_fails_turn_and_allows_next_turn(self) -> None:
+        calls = 0
+
+        def environment() -> ProjectionEnvironment:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("sensitive environment detail")
+            return ProjectionEnvironment(
+                cwd="/safe", platform="test", date="2026-08-27", is_git=False
+            )
+
+        runtime = self.make_runtime(text("recovered"), environment=environment)
+
+        failed = runtime.loop.run_turn("first")
+        recovered = runtime.loop.run_turn("second")
+
+        self.assertEqual((failed.status, failed.error), (TurnStatus.FAILED, "agent turn failed"))
+        self.assertEqual(recovered.status, TurnStatus.COMPLETED)
+        self.assertEqual(len(self.terminal_events(runtime)), 2)
+        self.assertIsNone(runtime.state.active_turn_id)
+
+    def test_projector_exception_safely_fails_turn_and_allows_next_turn(self) -> None:
+        runtime = self.make_runtime(text("recovered"))
+
+        with patch.object(
+            PromptProjector,
+            "project",
+            side_effect=RuntimeError("sensitive projector detail"),
+        ):
+            failed = runtime.loop.run_turn("first")
+        recovered = runtime.loop.run_turn("second")
+
+        self.assertEqual((failed.status, failed.error), (TurnStatus.FAILED, "agent turn failed"))
+        self.assertEqual(recovered.status, TurnStatus.COMPLETED)
+        self.assertEqual(len(self.terminal_events(runtime)), 2)
+        self.assertIsNone(runtime.state.active_turn_id)
+
+    def test_model_exception_safely_fails_turn_and_allows_next_turn(self) -> None:
+        runtime = self.make_runtime(
+            RuntimeError("sensitive model detail"), text("recovered")
+        )
+
+        failed = runtime.loop.run_turn("first")
+        recovered = runtime.loop.run_turn("second")
+
+        self.assertEqual((failed.status, failed.error), (TurnStatus.FAILED, "agent turn failed"))
+        self.assertEqual(recovered.status, TurnStatus.COMPLETED)
+        self.assertEqual(len(self.terminal_events(runtime)), 2)
+        self.assertIsNone(runtime.state.active_turn_id)
+
+    def test_system_exit_is_not_caught_or_terminalized(self) -> None:
+        runtime = self.make_runtime(SystemExit(7))
+
+        with self.assertRaises(SystemExit) as raised:
+            runtime.loop.run_turn("exit")
+
+        self.assertEqual(raised.exception.code, 7)
+        self.assertEqual(
+            [event.type for event in runtime.store.load()],
+            ["session_created", "turn_started"],
+        )
 
     def test_read_result_is_projected_exactly_before_final_text(self) -> None:
         executions: list[str] = []
@@ -470,6 +584,66 @@ class AgentLoopTests(AgentLoopTestCase):
                 self.assertEqual(len(terminal), 1)
                 self.assertEqual(terminal[0].payload["status"], status.value)
                 self.assertEqual(terminal[0].payload["error"], expected_error)
+
+    def test_discarded_streamed_length_and_filtered_samples_invalidate_once(self) -> None:
+        for outcome in (SamplingOutcome.LENGTH_EXCEEDED, SamplingOutcome.FILTERED):
+            with self.subTest(outcome=outcome):
+                invalidated: list[str] = []
+                runtime = self.make_runtime(
+                    StreamedSample(SamplingResult(outcome, content="partial")),
+                    on_content=lambda _: None,
+                    on_invalidate=lambda: invalidated.append("invalid"),
+                )
+
+                result = runtime.loop.run_turn("discard")
+
+                self.assertEqual(result.status, TurnStatus.FAILED)
+                self.assertEqual(invalidated, ["invalid"])
+
+    def test_model_invalidation_is_not_duplicated_for_discarded_transport_result(
+        self,
+    ) -> None:
+        invalidated: list[str] = []
+        runtime = self.make_runtime(
+            StreamedSample(
+                SamplingResult(
+                    SamplingOutcome.TRANSPORT_INTERRUPTED, content="partial"
+                ),
+                model_invalidates=True,
+            ),
+            on_content=lambda _: None,
+            on_invalidate=lambda: invalidated.append("invalid"),
+        )
+
+        result = runtime.loop.run_turn("transport")
+
+        self.assertEqual(result.status, TurnStatus.FAILED)
+        self.assertEqual(invalidated, ["invalid"])
+
+    def test_invalid_streamed_limit_finalization_is_invalidated_once(self) -> None:
+        invalidated: list[str] = []
+        runtime = self.make_runtime(
+            StreamedSample(
+                SamplingResult(
+                    SamplingOutcome.COMPLETE_TEXT,
+                    content="discard me",
+                    tool_calls=(call("forbidden", "missing"),),
+                    finish_reason="stop",
+                )
+            ),
+            config=Config(api_key="test", max_steps=0),
+            on_content=lambda _: None,
+            on_invalidate=lambda: invalidated.append("invalid"),
+        )
+
+        result = runtime.loop.run_turn("bounded")
+
+        self.assertEqual(result.status, TurnStatus.MAX_STEPS_REACHED)
+        self.assertEqual(result.final_text, MAX_STEPS_FALLBACK)
+        self.assertEqual(invalidated, ["invalid"])
+        self.assertFalse(
+            any(event.type == "assistant_accepted" for event in runtime.store.load())
+        )
 
     def test_empty_complete_text_is_a_terminal_protocol_failure(self) -> None:
         runtime = self.make_runtime(text(""), text("must not retry"))
@@ -693,6 +867,79 @@ class AgentLoopTests(AgentLoopTestCase):
         self.assertEqual(len(runtime.model.requests), 1)
         self.assertEqual(len(self.terminal_events(runtime)), 1)
 
+    def test_keyboard_interrupt_after_terminal_append_preserves_original_finish(
+        self,
+    ) -> None:
+        runtime = self.make_runtime(text("durable answer"))
+        real_append = runtime.loop._append
+        interrupted = False
+
+        def append_then_interrupt(
+            event_type: str, payload: Mapping[str, Any]
+        ) -> object:
+            nonlocal interrupted
+            event = real_append(event_type, payload)
+            if event_type == "turn_finished" and not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return event
+
+        with patch.object(runtime.loop, "_append", side_effect=append_then_interrupt):
+            result = runtime.loop.run_turn("finish once")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(result.final_text, "durable answer")
+        self.assertIsNone(result.error)
+        self.assertEqual(len(self.terminal_events(runtime)), 1)
+        self.assertEqual(SessionReducer.replay(runtime.store.load()), runtime.state)
+        self.assertIsNone(runtime.state.active_turn_id)
+
+    def test_post_commit_tool_interrupt_keeps_success_and_skips_remaining_calls(
+        self,
+    ) -> None:
+        runtime = self.make_runtime(
+            tool_batch(call("committed", "write"), call("remaining", "write")),
+            text("must not sample"),
+            specs=[tool_spec("write", lambda _: ToolResult(title="write", output="ok"))],
+        )
+
+        def execute_then_interrupt(accepted: object) -> object:
+            runtime.loop._append(
+                "tool_started",
+                {
+                    "call_key": accepted.call_key,
+                    "call_id": accepted.provider_call_id,
+                    "name": accepted.name,
+                    "arguments": {},
+                },
+            )
+            runtime.loop._append(
+                "tool_finished",
+                {
+                    "call_key": accepted.call_key,
+                    "call_id": accepted.provider_call_id,
+                    "status": "succeeded",
+                    "result": "file commit succeeded",
+                    "truncated": False,
+                },
+            )
+            raise KeyboardInterrupt
+
+        with patch.object(runtime.executor, "execute", side_effect=execute_then_interrupt):
+            result = runtime.loop.run_turn("write files")
+
+        self.assertEqual(result.status, TurnStatus.INTERRUPTED)
+        self.assertEqual(result.error, "turn interrupted by user")
+        finished = [
+            event for event in runtime.store.load() if event.type == "tool_finished"
+        ]
+        self.assertEqual(
+            [(event.payload["call_id"], event.payload["status"]) for event in finished],
+            [("committed", "succeeded"), ("remaining", "not_executed")],
+        )
+        self.assertEqual(len(self.terminal_events(runtime)), 1)
+        self.assertEqual(len(runtime.model.requests), 1)
+
     def test_recovery_blocked_state_refuses_turn_before_append_or_model_call(self) -> None:
         runtime = self.make_runtime(text("must not sample"))
         old_turn_id = str(uuid.uuid4())
@@ -743,8 +990,12 @@ class AgentLoopTests(AgentLoopTestCase):
     def test_reducer_failure_after_append_poison_stops_the_loop(self) -> None:
         runtime = self.make_runtime(text("must not sample"))
 
-        with patch(
-            "mca.agent.SessionReducer.apply", side_effect=RuntimeError("bad reducer")
+        with (
+            patch("mca.agent.reduce_event", return_value=SessionState()),
+            patch(
+                "mca.agent.SessionReducer.apply",
+                side_effect=RuntimeError("bad reducer"),
+            ),
         ):
             with self.assertRaisesRegex(AgentLoopError, "durable event 2"):
                 runtime.loop.run_turn("persist first")
