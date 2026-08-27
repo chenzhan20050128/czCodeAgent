@@ -117,6 +117,7 @@ class ExecutedFileChange:
     canonical_path: Path
     before_hash: str | None
     after_hash: str
+    after_mode: int
     durability_warning: bool = False
     interruption_warning: bool = False
 
@@ -184,8 +185,11 @@ class PreparedFileChange:
                 if committed:
                     try:
                         _fsync_directory(parent)
-                    except (OSError, KeyboardInterrupt):
+                    except OSError:
                         durability_warning = True
+                    except KeyboardInterrupt:
+                        durability_warning = True
+                        interruption_warning = True
             finally:
                 if previous_mask is not None:
                     try:
@@ -205,6 +209,7 @@ class PreparedFileChange:
             canonical_path=target,
             before_hash=self.before_hash,
             after_hash=sha256_bytes(self.proposed_bytes),
+            after_mode=mode,
             durability_warning=durability_warning,
             interruption_warning=interruption_warning,
         )

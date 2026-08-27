@@ -231,6 +231,74 @@ class ToolExecutorTests(ExecutorTestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(approver.requests[0].render(), r"Custom target\x1b[31m")
 
+    def test_renderer_keyboard_interrupt_cancels_once_and_propagates(self) -> None:
+        executions = 0
+
+        class Prepared:
+            def execute(self) -> ToolResult:
+                nonlocal executions
+                executions += 1
+                return ToolResult(title="custom", output="ran")
+
+        registry = ToolRegistry(
+            [
+                ToolSpec(
+                    "custom",
+                    "Custom side effect.",
+                    {"type": "object", "properties": {}, "additionalProperties": False},
+                    prepare_handler=lambda _: Prepared(),
+                    side_effect=True,
+                    approval_renderer=lambda _: (_ for _ in ()).throw(KeyboardInterrupt()),
+                )
+            ]
+        )
+        call = self.accept("custom", "{}")
+
+        with self.assertRaises(KeyboardInterrupt):
+            self.executor(registry=registry).execute(call)
+
+        events = self.events_after_acceptance()
+        self.assertEqual([event.type for event in events], ["tool_finished"])
+        self.assertEqual(events[0].payload["status"], "cancelled")
+        self.assertEqual(executions, 0)
+
+    def test_renderer_failure_or_non_string_finishes_failed_once(self) -> None:
+        for renderer in (
+            lambda _: (_ for _ in ()).throw(RuntimeError("render failed")),
+            lambda _: 42,
+        ):
+            with self.subTest(renderer=renderer):
+                self.tearDown()
+                self.setUp()
+                executions = []
+
+                class Prepared:
+                    def execute(self) -> ToolResult:
+                        executions.append(True)
+                        return ToolResult(title="custom", output="ran")
+
+                registry = ToolRegistry(
+                    [
+                        ToolSpec(
+                            "custom",
+                            "Custom side effect.",
+                            {"type": "object", "properties": {}, "additionalProperties": False},
+                            prepare_handler=lambda _: Prepared(),
+                            side_effect=True,
+                            approval_renderer=renderer,
+                        )
+                    ]
+                )
+                call = self.accept("custom", "{}")
+
+                result = self.executor(registry=registry).execute(call)
+
+                events = self.events_after_acceptance()
+                self.assertEqual([event.type for event in events], ["tool_finished"])
+                self.assertEqual(events[0].payload["status"], "failed")
+                self.assertEqual(result.status, "failed")
+                self.assertEqual(executions, [])
+
     def test_shell_executor_forwards_live_output_callback(self) -> None:
         chunks: list[tuple[str, str]] = []
         call = self.accept("bash", '{"command":"printf live"}')
@@ -286,13 +354,49 @@ class ToolExecutorTests(ExecutorTestCase):
         self.assertEqual(snapshot["before_mode"], 0o640)
         expected_hash = hashlib.sha256(b"new\n").hexdigest()
         self.assertEqual(events[-1].payload["after_hash"], expected_hash)
+        self.assertEqual(events[-1].payload["after_mode"], 0o640)
         self.assertEqual(events[-1].payload["path"], str(path.resolve()))
         self.assertEqual(path.read_bytes(), b"new\n")
         self.assertEqual(result.metadata["after_hash"], expected_hash)
+        self.assertEqual(result.metadata["after_mode"], 0o640)
         self.assertEqual(
             self.state.file_snapshots[(self.turn_id, str(path.resolve()))].after_hash,
             expected_hash,
         )
+        self.assertEqual(
+            self.state.file_snapshots[(self.turn_id, str(path.resolve()))].after_mode,
+            0o640,
+        )
+
+    def test_post_commit_interrupt_persists_success_then_propagates_signal(self) -> None:
+        path = self.workspace / "interrupted.txt"
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o640)
+        call = self.accept(
+            "write_file", '{"path":"interrupted.txt","content":"after"}'
+        )
+        real_replace = os.replace
+
+        def replace_then_interrupt(source: object, target: object) -> None:
+            real_replace(source, target)
+            raise KeyboardInterrupt
+
+        with patch(
+            "mca.tools.filesystem.os.replace", side_effect=replace_then_interrupt
+        ):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                self.executor().execute(call)
+
+        self.assertEqual(type(raised.exception).__name__, "PostCommitInterrupted")
+        events = self.events_after_acceptance()
+        self.assertEqual(events[-1].type, "tool_finished")
+        self.assertEqual(events[-1].payload["status"], "succeeded")
+        self.assertEqual(events[-1].payload["path"], str(path.resolve()))
+        self.assertEqual(
+            events[-1].payload["after_hash"], hashlib.sha256(b"after").hexdigest()
+        )
+        self.assertEqual(events[-1].payload["after_mode"], 0o640)
+        self.assertEqual(self.state.tool_calls[call.call_key].status, ToolStatus.SUCCEEDED)
 
     def test_second_write_uses_first_baseline_and_updates_latest_after_hash(self) -> None:
         path = self.workspace / "notes.txt"

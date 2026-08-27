@@ -98,6 +98,7 @@ _TOOL_FINISH_TRANSITIONS = {
             ToolStatus.NOT_EXECUTED,
             ToolStatus.BATCH_LIMIT_EXCEEDED,
             ToolStatus.CANCELLED,
+            ToolStatus.FAILED,
         }
     ),
     ToolStatus.STARTED: frozenset(
@@ -311,6 +312,7 @@ class FileSnapshot:
     before_mode: int | None
     after_hash: str | None = None
     source_call_key: str | None = None
+    after_mode: int | None = None
 
     def __post_init__(self) -> None:
         _canonical_uuid(self.turn_id, field_name="turn_id")
@@ -336,14 +338,18 @@ class FileSnapshot:
             type(self.before_mode) is not int or not 0 <= self.before_mode <= 0o7777
         ):
             raise DomainError("before_mode must be permission bits or null")
-        if self.after_hash is not None and (
-            not isinstance(self.after_hash, str) or not self.after_hash
-        ):
+        if self.after_hash is not None and (not isinstance(self.after_hash, str) or not self.after_hash):
             raise DomainError("after_hash must be a non-empty string or null")
         if self.source_call_key is not None and (
             not isinstance(self.source_call_key, str) or not self.source_call_key
         ):
             raise DomainError("source_call_key must be a non-empty string or null")
+        if self.after_mode is not None and (
+            type(self.after_mode) is not int or not 0 <= self.after_mode <= 0o7777
+        ):
+            raise DomainError("after_mode must be permission bits or null")
+        if (self.after_hash is None) is not (self.after_mode is None):
+            raise DomainError("after_hash and after_mode must be recorded together")
 
 
 @dataclass
@@ -620,19 +626,25 @@ class SessionReducer:
 
         path = event.payload.get("path")
         after_hash = event.payload.get("after_hash")
+        after_mode = event.payload.get("after_mode")
         snapshot_update: tuple[tuple[str, str], FileSnapshot] | None = None
-        if path is not None or after_hash is not None:
+        if path is not None or after_hash is not None or after_mode is not None:
             if status is not ToolStatus.SUCCEEDED:
                 raise DomainError("after_hash is only valid for a successful tool")
             if not isinstance(path, str) or not path:
                 raise DomainError("path must accompany after_hash")
             if not isinstance(after_hash, str) or not after_hash:
                 raise DomainError("after_hash must accompany path")
+            if type(after_mode) is not int or not 0 <= after_mode <= 0o7777:
+                raise DomainError("after_mode must accompany path and after_hash")
             key = (call.turn_id, path)
             snapshot = state.file_snapshots.get(key)
             if snapshot is None:
                 raise DomainError("successful write has no file baseline")
-            snapshot_update = (key, replace(snapshot, after_hash=after_hash))
+            snapshot_update = (
+                key,
+                replace(snapshot, after_hash=after_hash, after_mode=after_mode),
+            )
 
         state.tool_calls[call.call_key] = replace(
             call,
@@ -761,9 +773,18 @@ class SessionReducer:
             existed_before=existed_before,
             before_bytes=before_bytes,
             before_mode=before_mode,
-            after_hash=event.payload.get("after_hash"),
             source_call_key=event.payload.get("call_key"),
+            after_hash=event.payload.get("after_hash"),
+            after_mode=event.payload.get("after_mode"),
         )
+        call_key = _payload_string(event.payload, "call_key")
+        source_call = state.tool_calls.get(call_key)
+        if source_call is None:
+            raise DomainError(f"unknown file snapshot call_key: {call_key}")
+        if source_call.turn_id != active_turn_id:
+            raise DomainError("file snapshot call_key is not in the active turn")
+        if source_call.status is not ToolStatus.REQUESTED:
+            raise DomainError("file snapshot call_key is not an active requested call")
         key = (turn_id, path)
         existing = state.file_snapshots.get(key)
         if existing is None:
@@ -800,6 +821,31 @@ class SessionReducer:
         files = event.payload.get("files")
         if not isinstance(files, (list, tuple)):
             raise DomainError("undo files must be an array")
+        allowed_statuses = {
+            "restored",
+            "deleted",
+            "already_restored",
+            "already_deleted",
+            "conflict",
+            "ineligible",
+            "not_modified",
+            "failed",
+        }
+        success_statuses = {
+            "restored", "deleted", "already_restored", "already_deleted"
+        }
+        observed_statuses: set[str] = set()
+        for item in files:
+            if not isinstance(item, Mapping) or set(item) != {"path", "status", "detail"}:
+                raise DomainError("each undo file must have exactly path, status, and detail")
+            for key in ("path", "status", "detail"):
+                if not isinstance(item[key], str):
+                    raise DomainError(f"undo file {key} must be a string")
+            if item["status"] not in allowed_statuses:
+                raise DomainError(f"unknown undo file status: {item['status']!r}")
+            observed_statuses.add(item["status"])
+        if status == "succeeded" and not observed_statuses <= success_statuses:
+            raise DomainError("succeeded undo may contain only successful file statuses")
         state.undo_results[turn_id] = event
 
     @staticmethod

@@ -48,6 +48,10 @@ class ToolExecutorError(RuntimeError):
     """Raised when durable executor invariants cannot be maintained."""
 
 
+class PostCommitInterrupted(KeyboardInterrupt):
+    """Signal that a file commit succeeded before Ctrl-C was observed."""
+
+
 @dataclass(frozen=True)
 class AcceptedToolCall:
     """The full identity of a call already accepted into SessionState."""
@@ -142,7 +146,21 @@ class ToolExecutor:
         requires_approval = spec.side_effect not in {SideEffect.NONE, False}
         if requires_approval:
             assert prepared is not None
-            request = self._approval_request(spec.side_effect, call.name, prepared)
+            try:
+                request = self._approval_request(spec.side_effect, call.name, prepared)
+            except KeyboardInterrupt:
+                self._finish_requested_error(
+                    state_call,
+                    ToolStatus.CANCELLED,
+                    "tool approval rendering interrupted",
+                )
+                raise
+            except Exception as error:
+                return self._finish_requested_error(
+                    state_call,
+                    ToolStatus.FAILED,
+                    _safe_error("tool approval rendering failed", error),
+                )
             try:
                 decision = self._approval_decision(request)
             except ApprovalInterrupted:
@@ -230,6 +248,8 @@ class ToolExecutor:
                 _safe_error("tool result handling failed", error),
             )
             self._finish_started(state_call, result)
+        if result.metadata.get("interruption_warning") is True:
+            raise PostCommitInterrupted from None
         return result
 
     def execute_call(self, accepted: AcceptedToolCall | ToolCall) -> ToolResult:
@@ -370,11 +390,13 @@ class ToolExecutor:
             payload["exit_code"] = exit_code
         path = result.metadata.get("path")
         after_hash = result.metadata.get("after_hash")
+        after_mode = result.metadata.get("after_mode")
         if status is ToolStatus.SUCCEEDED and isinstance(path, str) and isinstance(
             after_hash, str
-        ):
+        ) and type(after_mode) is int:
             payload["path"] = path
             payload["after_hash"] = after_hash
+            payload["after_mode"] = after_mode
         self._append_and_reduce("tool_finished", payload)
 
     def _normalize_result(self, name: str, raw_result: object) -> ToolResult:
@@ -397,7 +419,9 @@ class ToolExecutor:
                     "path": path,
                     "before_hash": raw_result.before_hash,
                     "after_hash": raw_result.after_hash,
+                    "after_mode": raw_result.after_mode,
                     "durability_warning": raw_result.durability_warning,
+                    "interruption_warning": raw_result.interruption_warning,
                 },
             )
         raise TypeError(f"{name} returned an unsupported result")
@@ -434,4 +458,9 @@ def _safe_error(prefix: str, error: BaseException) -> str:
     return f"{prefix}: {type(error).__name__}: {detail}"
 
 
-__all__ = ["AcceptedToolCall", "ToolExecutor", "ToolExecutorError"]
+__all__ = [
+    "AcceptedToolCall",
+    "PostCommitInterrupted",
+    "ToolExecutor",
+    "ToolExecutorError",
+]

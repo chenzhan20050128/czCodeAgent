@@ -47,6 +47,25 @@ class ShellToolError(RuntimeError):
     """Raised when a shell request cannot be prepared or launched."""
 
 
+class _CallbackGate:
+    """Serialize callback delivery and stop it permanently during cleanup."""
+
+    def __init__(self, callback: OutputCallback | None) -> None:
+        self._callback = callback
+        self._enabled = True
+        self._lock = threading.Lock()
+
+    def emit(self, stream_name: str, text: str) -> None:
+        with self._lock:
+            callback = self._callback if self._enabled else None
+        if callback is not None:
+            callback(stream_name, text)
+
+    def disable(self) -> None:
+        with self._lock:
+            self._enabled = False
+
+
 @dataclass
 class _BoundedCapture:
     """Retain a fixed byte window while the pipe itself is fully drained."""
@@ -122,15 +141,16 @@ class PreparedShellCommand:
         assert process.stderr is not None
         stdout = _BoundedCapture(self.max_output_bytes)
         stderr = _BoundedCapture(self.max_output_bytes)
+        callback_gate = _CallbackGate(on_output)
         threads = (
             threading.Thread(
                 target=_drain_pipe,
-                args=(process.stdout, "stdout", stdout, on_output),
+                args=(process.stdout, "stdout", stdout, callback_gate.emit),
                 daemon=True,
             ),
             threading.Thread(
                 target=_drain_pipe,
-                args=(process.stderr, "stderr", stderr, on_output),
+                args=(process.stderr, "stderr", stderr, callback_gate.emit),
                 daemon=True,
             ),
         )
@@ -147,9 +167,9 @@ class PreparedShellCommand:
             _join_threads(
                 tuple(started_threads), timeout=self.termination_grace_seconds
             )
-            if process.poll() is None:
-                process.kill()
-            process.wait()
+            callback_gate.disable()
+            if isinstance(error, KeyboardInterrupt):
+                raise
             raise ShellToolError("failed to start output drain") from error
 
         timed_out = False
@@ -171,7 +191,7 @@ class PreparedShellCommand:
                 _stop_process_group(
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
-            process.wait()
+            _wait_process_bounded(process, self.termination_grace_seconds)
             drains_finished = _join_threads(
                 tuple(started_threads), timeout=self.termination_grace_seconds
             )
@@ -179,7 +199,7 @@ class PreparedShellCommand:
                 timed_out = True
                 stderr.append(
                     b"pipe drain did not finish after shell exit; "
-                    b"descendants were terminated\n"
+                    b"escaped descendants may remain\n"
                 )
                 _stop_process_group(
                     process, signal.SIGTERM, self.termination_grace_seconds
@@ -188,6 +208,7 @@ class PreparedShellCommand:
                 _join_threads(
                     tuple(started_threads), timeout=self.termination_grace_seconds
                 )
+            callback_gate.disable()
 
         output, rendering_truncated = _render_streams(
             stdout.text(),
@@ -343,7 +364,19 @@ def _stop_process_group(
             except ProcessLookupError:
                 pass
     if process.poll() is None:
-        process.wait()
+        _wait_process_bounded(process, grace)
+
+
+def _wait_process_bounded(
+    process: subprocess.Popen[bytes], timeout: float
+) -> bool:
+    if process.poll() is not None:
+        return True
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False
+    return True
 
 
 def _signal_process_group(

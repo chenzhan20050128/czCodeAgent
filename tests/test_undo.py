@@ -93,6 +93,21 @@ class UndoTestCase(unittest.TestCase):
             )
         )
 
+    def pending_write_call(self, call_id: str = "snapshot") -> str:
+        self.append(
+            "assistant_accepted",
+            {
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": "write_file", "arguments": "{}"},
+                    }
+                ]
+            },
+        )
+        return f"{self.state.last_seq}:{call_id}"
+
     def undo(self, state: SessionState | None = None, store: RolloutStore | None = None):
         return ManagedUndo(
             store or self.store, state or self.state, self.workspace
@@ -100,6 +115,148 @@ class UndoTestCase(unittest.TestCase):
 
 
 class ManagedUndoTests(UndoTestCase):
+    def test_quarantine_name_is_deterministic_and_operation_scoped(self) -> None:
+        from mca.undo import _deterministic_quarantine_name
+
+        path = self.workspace / "nested" / "file.txt"
+        expected_hash = hashlib.sha256(b"managed").hexdigest()
+
+        first = _deterministic_quarantine_name(
+            path.name, self.turn_id, path, expected_hash
+        )
+        second = _deterministic_quarantine_name(
+            path.name, self.turn_id, path, expected_hash
+        )
+        other = _deterministic_quarantine_name(
+            path.name, str(uuid.uuid4()), path, expected_hash
+        )
+
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"^\.file\.txt\.mca-undo-[0-9a-f]{16}$")
+        self.assertNotEqual(first, other)
+
+    def test_existing_file_retry_recovers_after_crash_immediately_after_quarantine(self) -> None:
+        class SimulatedCrash(BaseException):
+            pass
+
+        path = self.workspace / "existing-crash.txt"
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o640)
+        self.write_call("write", "existing-crash.txt", "after")
+        real_rename = os.rename
+
+        def rename_then_crash(*args: object, **kwargs: object) -> None:
+            real_rename(*args, **kwargs)
+            raise SimulatedCrash
+
+        with patch("mca.undo.os.rename", side_effect=rename_then_crash):
+            with self.assertRaises(SimulatedCrash):
+                self.undo()
+
+        quarantines = list(self.workspace.glob(".existing-crash.txt.mca-undo-*"))
+        self.assertEqual(len(quarantines), 1)
+        self.assertFalse(path.exists())
+        self.store.close()
+        with RolloutStore.open(self.sessions, self.session_id) as reopened:
+            replayed = SessionReducer.replay(reopened.load())
+            result = ManagedUndo(reopened, replayed, self.workspace).undo_turn(
+                self.turn_id
+            )
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.files[0].status, "restored")
+        self.assertEqual(path.read_text(encoding="utf-8"), "before")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o640)
+        self.assertEqual(list(self.workspace.glob(".existing-crash.txt.mca-undo-*")), [])
+
+    def test_new_file_retry_recovers_after_crash_immediately_after_quarantine(self) -> None:
+        class SimulatedCrash(BaseException):
+            pass
+
+        path = self.workspace / "new-crash.txt"
+        self.write_call("write", "new-crash.txt", "after")
+        real_rename = os.rename
+
+        def rename_then_crash(*args: object, **kwargs: object) -> None:
+            real_rename(*args, **kwargs)
+            raise SimulatedCrash
+
+        with patch("mca.undo.os.rename", side_effect=rename_then_crash):
+            with self.assertRaises(SimulatedCrash):
+                self.undo()
+
+        quarantines = list(self.workspace.glob(".new-crash.txt.mca-undo-*"))
+        self.assertEqual(len(quarantines), 1)
+        self.assertFalse(path.exists())
+        self.store.close()
+        with RolloutStore.open(self.sessions, self.session_id) as reopened:
+            replayed = SessionReducer.replay(reopened.load())
+            result = ManagedUndo(reopened, replayed, self.workspace).undo_turn(
+                self.turn_id
+            )
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.files[0].status, "deleted")
+        self.assertFalse(path.exists())
+        self.assertEqual(list(self.workspace.glob(".new-crash.txt.mca-undo-*")), [])
+
+    def test_completed_restore_with_quarantine_is_cleaned_as_already_restored(self) -> None:
+        from mca.undo import _deterministic_quarantine_name
+
+        path = self.workspace / "completed.txt"
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o640)
+        self.write_call("write", "completed.txt", "after")
+        snapshot = self.state.file_snapshots[(self.turn_id, str(path.resolve()))]
+        quarantine = path.with_name(
+            _deterministic_quarantine_name(
+                path.name, self.turn_id, path.resolve(), snapshot.after_hash
+            )
+        )
+        path.rename(quarantine)
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o640)
+
+        result = self.undo()
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.files[0].status, "already_restored")
+        self.assertFalse(quarantine.exists())
+
+    def test_unexpected_quarantine_hash_conflicts_without_touching_target(self) -> None:
+        from mca.undo import _deterministic_quarantine_name
+
+        path = self.workspace / "quarantine-conflict.txt"
+        path.write_text("before", encoding="utf-8")
+        self.write_call("write", "quarantine-conflict.txt", "after")
+        snapshot = self.state.file_snapshots[(self.turn_id, str(path.resolve()))]
+        quarantine = path.with_name(
+            _deterministic_quarantine_name(
+                path.name, self.turn_id, path.resolve(), snapshot.after_hash
+            )
+        )
+        quarantine.write_text("unexpected", encoding="utf-8")
+
+        result = self.undo()
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(path.read_text(encoding="utf-8"), "after")
+        self.assertEqual(quarantine.read_text(encoding="utf-8"), "unexpected")
+
+    def test_external_chmod_after_write_is_an_undo_conflict(self) -> None:
+        path = self.workspace / "chmod.txt"
+        path.write_text("before", encoding="utf-8")
+        path.chmod(0o640)
+        self.write_call("write", "chmod.txt", "after")
+        path.chmod(0o600)
+
+        result = self.undo()
+
+        self.assertEqual(result.status, "conflict")
+        self.assertEqual(result.files[0].status, "conflict")
+        self.assertEqual(path.read_text(encoding="utf-8"), "after")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
     def test_restores_original_bytes_and_mode_atomically(self) -> None:
         path = self.workspace / "existing.txt"
         original = b"original\n"
@@ -162,6 +319,7 @@ class ManagedUndoTests(UndoTestCase):
     def test_missing_latest_hash_is_ineligible_and_does_not_mutate(self) -> None:
         path = self.workspace / "untouched.txt"
         path.write_text("live", encoding="utf-8")
+        call_key = self.pending_write_call()
         self.append(
             "file_snapshot",
             {
@@ -171,6 +329,7 @@ class ManagedUndoTests(UndoTestCase):
                 "before_bytes": base64.b64encode(b"old").decode(),
                 "before_encoding": "base64",
                 "before_mode": 0o644,
+                "call_key": call_key,
             },
         )
 
@@ -183,6 +342,7 @@ class ManagedUndoTests(UndoTestCase):
     def test_refuses_symlink_directory_and_outside_paths_before_mutation(self) -> None:
         safe = self.workspace / "safe.txt"
         safe.write_text("changed", encoding="utf-8")
+        call_key = self.pending_write_call()
         safe_snapshot = {
             "turn_id": self.turn_id,
             "path": str(safe),
@@ -191,6 +351,8 @@ class ManagedUndoTests(UndoTestCase):
             "before_encoding": "base64",
             "before_mode": 0o644,
             "after_hash": hashlib.sha256(b"changed").hexdigest(),
+            "after_mode": 0o644,
+            "call_key": call_key,
         }
         self.append("file_snapshot", safe_snapshot)
         outside = self.root / "outside.txt"
@@ -215,6 +377,7 @@ class ManagedUndoTests(UndoTestCase):
         outside = self.root / "outside.txt"
         outside.write_text("external", encoding="utf-8")
         disguised = self.workspace / ".." / "outside.txt"
+        call_key = self.pending_write_call()
         self.append(
             "file_snapshot",
             {
@@ -225,6 +388,8 @@ class ManagedUndoTests(UndoTestCase):
                 "before_encoding": "base64",
                 "before_mode": 0o644,
                 "after_hash": hashlib.sha256(b"external").hexdigest(),
+                "after_mode": 0o644,
+                "call_key": call_key,
             },
         )
 
@@ -332,7 +497,7 @@ class ManagedUndoTests(UndoTestCase):
         self.assertEqual(result.status, "conflict")
         self.assertEqual(result.files[0].status, "conflict")
         self.assertEqual(path.read_text(encoding="utf-8"), "concurrent")
-        quarantine = list(managed_dir.glob(".new.txt.mca-quarantine-*"))
+        quarantine = list(managed_dir.glob(".new.txt.mca-undo-*"))
         self.assertEqual(len(quarantine), 1)
         self.assertEqual(quarantine[0].read_text(encoding="utf-8"), "managed")
         self.assertIn(quarantine[0].name, result.files[0].detail)
@@ -447,6 +612,7 @@ class ManagedUndoTests(UndoTestCase):
     def test_oversized_snapshot_baseline_is_ineligible(self) -> None:
         path = self.workspace / "large-baseline.txt"
         path.write_text("current", encoding="utf-8")
+        call_key = self.pending_write_call()
         self.append(
             "file_snapshot",
             {
@@ -457,6 +623,8 @@ class ManagedUndoTests(UndoTestCase):
                 "before_encoding": "base64",
                 "before_mode": 0o644,
                 "after_hash": hashlib.sha256(b"current").hexdigest(),
+                "after_mode": 0o644,
+                "call_key": call_key,
             },
         )
 
@@ -499,6 +667,7 @@ class ManagedUndoTests(UndoTestCase):
     def test_invalid_base64_snapshot_is_rejected_before_undo(self) -> None:
         path = self.workspace / "bad.txt"
         path.write_text("current", encoding="utf-8")
+        call_key = self.pending_write_call()
         before_events = len(self.store.load())
 
         with self.assertRaisesRegex(ValueError, "valid base64"):
@@ -512,6 +681,8 @@ class ManagedUndoTests(UndoTestCase):
                     "before_encoding": "base64",
                     "before_mode": 0o644,
                     "after_hash": hashlib.sha256(b"current").hexdigest(),
+                    "after_mode": 0o644,
+                    "call_key": call_key,
                 },
             )
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import os
 import secrets
 import stat
@@ -101,26 +102,38 @@ class ManagedUndo:
         for item in eligible:
             try:
                 if item.snapshot.existed_before:
-                    _atomic_restore(
+                    file_status = _atomic_restore(
                         self.workspace,
                         item.path,
                         item.before_bytes,
                         item.snapshot.before_mode,
                         expected_hash=item.snapshot.after_hash,
+                        expected_mode=item.snapshot.after_mode,
+                        operation_key=turn_id,
                         max_file_bytes=self.max_file_bytes,
                     )
                     completed.append(
-                        UndoFileResult(str(item.path), "restored", "baseline restored")
+                        UndoFileResult(
+                            str(item.path),
+                            file_status,
+                            "baseline is already present"
+                            if file_status == "already_restored"
+                            else "baseline restored",
+                        )
                     )
                 else:
-                    _verified_delete(
+                    file_status = _verified_delete(
                         self.workspace,
                         item.path,
                         expected_hash=item.snapshot.after_hash,
+                        expected_mode=item.snapshot.after_mode,
+                        operation_key=turn_id,
                         max_file_bytes=self.max_file_bytes,
                     )
                     completed.append(
-                        UndoFileResult(str(item.path), "deleted", "created file removed")
+                        UndoFileResult(
+                            str(item.path), file_status, "created file removed"
+                        )
                     )
             except _UndoConflict as error:
                 completed.append(
@@ -167,6 +180,8 @@ class ManagedUndo:
                         error = "snapshot baseline exceeds size limit"
             if error is None and snapshot.after_hash is None:
                 error = "snapshot has no successful after_hash"
+            if error is None and snapshot.after_mode is None:
+                error = "snapshot has no successful after_mode"
             if (
                 error is None
                 and snapshot.existed_before
@@ -174,42 +189,80 @@ class ManagedUndo:
             ):
                 error = "original file snapshot has no mode"
             if error is None:
+                quarantine_name = _deterministic_quarantine_name(
+                    path.name,
+                    operation_key=snapshot.turn_id,
+                    path=path,
+                    expected_hash=snapshot.after_hash,
+                )
                 try:
-                    current, current_stat = _read_current(
-                        self.workspace, path, max_file_bytes=self.max_file_bytes
-                    )
-                except FileNotFoundError:
-                    if snapshot.existed_before:
-                        error = "managed file is missing"
-                    else:
-                        results.append(
-                            UndoFileResult(
-                                str(path),
-                                "already_deleted",
-                                "created file is already absent",
-                            )
+                    parent_fd = _open_parent_fd(self.workspace, path)
+                    try:
+                        quarantine = _read_optional_at(
+                            parent_fd, quarantine_name, max_file_bytes=self.max_file_bytes
                         )
-                        continue
+                        current_entry = _read_optional_at(
+                            parent_fd, path.name, max_file_bytes=self.max_file_bytes
+                        )
+                    finally:
+                        os.close(parent_fd)
                 except UndoError as exception:
                     error = str(exception)
                 except OSError as exception:
                     error = f"cannot inspect managed file: {exception}"
                 else:
-                    current_hash = sha256_bytes(current)
                     baseline_hash = sha256_bytes(before_bytes or b"")
-                    if snapshot.existed_before and current_hash == baseline_hash:
-                        if stat.S_IMODE(current_stat.st_mode) == snapshot.before_mode:
+                    if quarantine is not None:
+                        quarantine_bytes, quarantine_stat = quarantine
+                        if (
+                            sha256_bytes(quarantine_bytes) != snapshot.after_hash
+                            or stat.S_IMODE(quarantine_stat.st_mode) != snapshot.after_mode
+                        ):
+                            error = "undo quarantine changed after the recorded write"
+                        elif current_entry is None:
+                            pass
+                        elif (
+                            snapshot.existed_before
+                            and sha256_bytes(current_entry[0]) == baseline_hash
+                            and stat.S_IMODE(current_entry[1].st_mode)
+                            == snapshot.before_mode
+                        ):
+                            pass
+                        else:
+                            error = (
+                                "managed target changed and exists alongside undo "
+                                "quarantine"
+                            )
+                    elif current_entry is None:
+                        if snapshot.existed_before:
+                            error = "managed file is missing"
+                        else:
                             results.append(
                                 UndoFileResult(
                                     str(path),
-                                    "already_restored",
-                                    "baseline is already present",
+                                    "already_deleted",
+                                    "created file is already absent",
                                 )
                             )
                             continue
-                        error = "managed file mode changed after the recorded write"
-                    if current_hash != snapshot.after_hash:
-                        error = "managed file changed after the recorded write"
+                    else:
+                        current, current_stat = current_entry
+                        current_hash = sha256_bytes(current)
+                        if snapshot.existed_before and current_hash == baseline_hash:
+                            if stat.S_IMODE(current_stat.st_mode) == snapshot.before_mode:
+                                results.append(
+                                    UndoFileResult(
+                                        str(path),
+                                        "already_restored",
+                                        "baseline is already present",
+                                    )
+                                )
+                                continue
+                            error = "managed file mode changed after the recorded write"
+                        if current_hash != snapshot.after_hash:
+                            error = "managed file changed after the recorded write"
+                        elif stat.S_IMODE(current_stat.st_mode) != snapshot.after_mode:
+                            error = "managed file mode changed after the recorded write"
             if error is not None:
                 status = (
                     "conflict"
@@ -266,35 +319,78 @@ def _atomic_restore(
     mode: int | None,
     *,
     expected_hash: str | None,
+    expected_mode: int | None,
+    operation_key: str,
     max_file_bytes: int,
-) -> None:
+) -> str:
     if mode is None:
         raise UndoError("original file snapshot has no mode")
     if expected_hash is None:
         raise UndoError("snapshot has no successful after_hash")
+    if expected_mode is None:
+        raise UndoError("snapshot has no successful after_mode")
     try:
         parent_fd = _open_parent_fd(workspace, path)
     except OSError as error:
         raise _UndoConflict("managed parent changed during undo") from error
     temp_name: str | None = None
-    quarantine_name: str | None = None
+    quarantine_name = _deterministic_quarantine_name(
+        path.name, operation_key, path, expected_hash
+    )
+    installed = False
     try:
-        quarantine_name = _quarantine_target(parent_fd, path.name)
-        try:
-            quarantined_stat = _require_current_hash(
-                parent_fd,
-                quarantine_name,
-                expected_hash,
-                max_file_bytes=max_file_bytes,
+        if _name_exists(parent_fd, quarantine_name):
+            try:
+                quarantined_stat = _require_current_state(
+                    parent_fd,
+                    quarantine_name,
+                    expected_hash,
+                    expected_mode,
+                    max_file_bytes=max_file_bytes,
+                )
+            except Exception as error:
+                raise _UndoConflict(
+                    "undo quarantine changed after the recorded write; "
+                    f"preserved {quarantine_name}"
+                ) from error
+            current = _read_optional_at(
+                parent_fd, path.name, max_file_bytes=max_file_bytes
             )
+            if current is not None:
+                if (
+                    sha256_bytes(current[0]) == sha256_bytes(content)
+                    and stat.S_IMODE(current[1].st_mode) == mode
+                ):
+                    _require_same_entry(parent_fd, quarantine_name, quarantined_stat)
+                    os.unlink(quarantine_name, dir_fd=parent_fd)
+                    _fsync_parent(parent_fd)
+                    return "already_restored"
+                raise _UndoConflict(
+                    "target exists alongside undo quarantine; concurrent target was "
+                    f"preserved; recover managed content from {quarantine_name}"
+                )
+        else:
+            _quarantine_target(parent_fd, path.name, quarantine_name)
+            try:
+                quarantined_stat = _require_current_state(
+                    parent_fd,
+                    quarantine_name,
+                    expected_hash,
+                    expected_mode,
+                    max_file_bytes=max_file_bytes,
+                )
+            except Exception as error:
+                detail, _ = _restore_quarantine(
+                    parent_fd, quarantine_name, path.name
+                )
+                raise _UndoConflict(
+                    f"managed file changed during undo; {detail}"
+                ) from error
+
+        try:
             _require_same_entry(parent_fd, quarantine_name, quarantined_stat)
         except Exception as error:
-            detail, removed = _restore_quarantine(
-                parent_fd, quarantine_name, path.name
-            )
-            if removed:
-                quarantine_name = None
-            raise _UndoConflict(f"managed file changed during undo; {detail}") from error
+            raise _UndoConflict("quarantined file changed during undo") from error
 
         temp_name, descriptor = _create_exclusive_file(
             parent_fd, path.name, "restore", mode
@@ -314,28 +410,23 @@ def _atomic_restore(
                 follow_symlinks=False,
             )
         except FileExistsError as error:
-            detail, removed = _restore_quarantine(
-                parent_fd, quarantine_name, path.name
-            )
-            if removed:
-                quarantine_name = None
             raise _UndoConflict(
-                f"target was recreated during undo; {detail}"
+                "target was recreated during undo; concurrent target was preserved; "
+                f"recover managed content from {quarantine_name}"
             ) from error
+        installed = True
         os.unlink(temp_name, dir_fd=parent_fd)
         temp_name = None
         os.unlink(quarantine_name, dir_fd=parent_fd)
-        quarantine_name = None
         _fsync_parent(parent_fd)
+        return "restored"
     except _UndoConflict:
         raise
     except Exception as error:
-        if quarantine_name is not None:
+        if not installed and _name_exists(parent_fd, quarantine_name):
             detail, removed = _restore_quarantine(
                 parent_fd, quarantine_name, path.name
             )
-            if removed:
-                quarantine_name = None
             raise UndoError(f"{error}; {detail}") from error
         raise
     finally:
@@ -352,48 +443,107 @@ def _verified_delete(
     path: Path,
     *,
     expected_hash: str | None,
+    expected_mode: int | None,
+    operation_key: str,
     max_file_bytes: int,
-) -> None:
+) -> str:
     if expected_hash is None:
         raise UndoError("snapshot has no successful after_hash")
+    if expected_mode is None:
+        raise UndoError("snapshot has no successful after_mode")
     try:
         parent_fd = _open_parent_fd(workspace, path)
     except OSError as error:
         raise _UndoConflict("managed parent changed during undo") from error
-    quarantine_name: str | None = None
+    quarantine_name = _deterministic_quarantine_name(
+        path.name, operation_key, path, expected_hash
+    )
     try:
-        quarantine_name = _quarantine_target(parent_fd, path.name)
+        if _name_exists(parent_fd, quarantine_name):
+            try:
+                quarantined_stat = _require_current_state(
+                    parent_fd,
+                    quarantine_name,
+                    expected_hash,
+                    expected_mode,
+                    max_file_bytes=max_file_bytes,
+                )
+            except Exception as error:
+                raise _UndoConflict(
+                    "undo quarantine changed after the recorded write; "
+                    f"preserved {quarantine_name}"
+                ) from error
+            if _name_exists(parent_fd, path.name):
+                raise _UndoConflict(
+                    "target exists alongside undo quarantine; concurrent target was "
+                    f"preserved; recover managed content from {quarantine_name}"
+                )
+        else:
+            _quarantine_target(parent_fd, path.name, quarantine_name)
+            try:
+                quarantined_stat = _require_current_state(
+                    parent_fd,
+                    quarantine_name,
+                    expected_hash,
+                    expected_mode,
+                    max_file_bytes=max_file_bytes,
+                )
+            except Exception as error:
+                detail, _ = _restore_quarantine(
+                    parent_fd, quarantine_name, path.name
+                )
+                raise _UndoConflict(
+                    f"managed file changed during undo; {detail}"
+                ) from error
         try:
-            quarantined_stat = _require_current_hash(
-                parent_fd,
-                quarantine_name,
-                expected_hash,
-                max_file_bytes=max_file_bytes,
-            )
             _require_same_entry(parent_fd, quarantine_name, quarantined_stat)
         except Exception as error:
-            detail, removed = _restore_quarantine(
-                parent_fd, quarantine_name, path.name
-            )
-            if removed:
-                quarantine_name = None
-            raise _UndoConflict(f"managed file changed during undo; {detail}") from error
+            raise _UndoConflict("quarantined file changed during undo") from error
         if _name_exists(parent_fd, path.name):
             raise _UndoConflict(
                 "target was recreated during undo; concurrent target was preserved; "
                 f"recover managed content from {quarantine_name}"
             )
         os.unlink(quarantine_name, dir_fd=parent_fd)
-        quarantine_name = None
         _fsync_parent(parent_fd)
+        return "deleted"
     finally:
         os.close(parent_fd)
 
 
-def _quarantine_target(parent_fd: int, target_name: str) -> str:
-    quarantine_name, descriptor = _create_exclusive_file(
-        parent_fd, target_name, "quarantine", 0o600
-    )
+def _deterministic_quarantine_name(
+    target_name: str, operation_key: str, path: Path, expected_hash: str | None
+) -> str:
+    if not operation_key or expected_hash is None:
+        raise UndoError("deterministic undo quarantine requires operation identity")
+    digest = hashlib.sha256(
+        b"\0".join(
+            (
+                operation_key.encode("utf-8"),
+                str(path).encode("utf-8"),
+                expected_hash.encode("ascii"),
+            )
+        )
+    ).hexdigest()[:16]
+    return f".{target_name}.mca-undo-{digest}"
+
+
+def _quarantine_target(parent_fd: int, target_name: str, quarantine_name: str) -> None:
+    try:
+        descriptor = os.open(
+            quarantine_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+    except FileExistsError as error:
+        raise _UndoConflict(
+            f"undo quarantine already exists: {quarantine_name}"
+        ) from error
+    placeholder_stat = os.fstat(descriptor)
     os.close(descriptor)
     try:
         os.rename(
@@ -404,11 +554,12 @@ def _quarantine_target(parent_fd: int, target_name: str) -> str:
         )
     except BaseException:
         try:
-            os.unlink(quarantine_name, dir_fd=parent_fd)
-        except FileNotFoundError:
+            _require_same_entry(parent_fd, quarantine_name, placeholder_stat)
+        except (FileNotFoundError, _UndoConflict):
             pass
+        else:
+            os.unlink(quarantine_name, dir_fd=parent_fd)
         raise
-    return quarantine_name
 
 
 def _restore_quarantine(
@@ -550,6 +701,17 @@ def _read_current_at(
         os.close(descriptor)
 
 
+def _read_optional_at(
+    parent_fd: int, name: str, *, max_file_bytes: int
+) -> tuple[bytes, os.stat_result] | None:
+    try:
+        return _read_current_at(
+            parent_fd, name, max_file_bytes=max_file_bytes
+        )
+    except FileNotFoundError:
+        return None
+
+
 def _require_current_hash(
     parent_fd: int, name: str, expected_hash: str, *, max_file_bytes: int
 ) -> os.stat_result:
@@ -558,6 +720,22 @@ def _require_current_hash(
     )
     if sha256_bytes(content) != expected_hash:
         raise UndoError("managed file changed during undo")
+    return file_stat
+
+
+def _require_current_state(
+    parent_fd: int,
+    name: str,
+    expected_hash: str,
+    expected_mode: int,
+    *,
+    max_file_bytes: int,
+) -> os.stat_result:
+    file_stat = _require_current_hash(
+        parent_fd, name, expected_hash, max_file_bytes=max_file_bytes
+    )
+    if stat.S_IMODE(file_stat.st_mode) != expected_mode:
+        raise UndoError("managed file mode changed during undo")
     return file_stat
 
 

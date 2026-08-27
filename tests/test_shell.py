@@ -13,7 +13,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +21,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from mca.tools import create_tool_registry
 from mca.tools.registry import ToolValidationError
-from mca.tools.shell import ShellRunner, ShellToolError
+from mca.tools.shell import ShellRunner, ShellToolError, _CallbackGate, _stop_process_group
 
 
 class ShellRunnerTests(unittest.TestCase):
@@ -209,6 +209,7 @@ class ShellRunnerTests(unittest.TestCase):
         self.assertEqual(result.status, "timed_out")
         self.assertIs(result.metadata["timed_out"], True)
         self.assertIn("pipe drain", result.output)
+        self.assertIn("escaped descendants may remain", result.output)
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             try:
@@ -257,6 +258,59 @@ class ShellRunnerTests(unittest.TestCase):
 
         self.assertEqual(len(processes), 1)
         self.assertIsNotNone(processes[0].poll())
+
+    def test_keyboard_interrupt_during_thread_start_reaps_then_propagates(self) -> None:
+        real_popen = subprocess.Popen
+        processes: list[subprocess.Popen[bytes]] = []
+
+        def recording_popen(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        with (
+            patch("mca.tools.shell.subprocess.Popen", side_effect=recording_popen),
+            patch(
+                "mca.tools.shell.threading.Thread.start",
+                side_effect=KeyboardInterrupt,
+            ),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                ShellRunner(
+                    self.workspace, termination_grace_seconds=0.05
+                ).prepare(
+                    {"command": "sleep 60", "timeout_seconds": 10}
+                ).execute()
+
+        self.assertEqual(len(processes), 1)
+        self.assertIsNotNone(processes[0].poll())
+
+    def test_sigkill_cleanup_never_uses_unbounded_wait(self) -> None:
+        process = Mock()
+        process.pid = 12345
+        process.poll.return_value = None
+        process.wait.side_effect = subprocess.TimeoutExpired("test", 0.001)
+
+        with (
+            patch("mca.tools.shell._signal_process_group", return_value=True),
+            patch("mca.tools.shell._process_group_exists", return_value=True),
+        ):
+            _stop_process_group(process, signal.SIGTERM, 0.001)
+
+        self.assertGreaterEqual(process.wait.call_count, 1)
+        self.assertTrue(
+            all(call.kwargs.get("timeout") is not None for call in process.wait.call_args_list)
+        )
+
+    def test_callback_gate_drops_output_after_disable(self) -> None:
+        chunks: list[tuple[str, str]] = []
+        gate = _CallbackGate(lambda stream, text: chunks.append((stream, text)))
+
+        gate.emit("stdout", "before")
+        gate.disable()
+        gate.emit("stdout", "after")
+
+        self.assertEqual(chunks, [("stdout", "before")])
 
     def test_keyboard_interrupt_interrupts_group_and_returns_terminal_result(self) -> None:
         runner = ShellRunner(self.workspace, termination_grace_seconds=0.1)

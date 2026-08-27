@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import signal
 import stat
 import sys
 import tempfile
@@ -293,6 +294,59 @@ class FileSystemToolTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), b"new")
         self.assertEqual(result.after_hash, hashlib.sha256(b"new").hexdigest())
         self.assertIs(result.interruption_warning, True)
+        self.assertEqual(result.after_mode, 0o644)
+
+    def test_keyboard_interrupt_during_parent_fsync_marks_committed_change(self) -> None:
+        path = self.write_bytes("fsync-interrupted.txt", b"old")
+        path.chmod(0o640)
+        change = self.tools.prepare_write_file(
+            {"path": "fsync-interrupted.txt", "content": "new"}
+        )
+
+        with patch(
+            "mca.tools.filesystem._fsync_directory", side_effect=KeyboardInterrupt
+        ):
+            result = change.execute()
+
+        self.assertEqual(path.read_bytes(), b"new")
+        self.assertEqual(result.after_mode, 0o640)
+        self.assertIs(result.interruption_warning, True)
+
+    @unittest.skipUnless(hasattr(signal, "pthread_sigmask"), "requires pthread_sigmask")
+    def test_keyboard_interrupt_during_sigint_unmask_marks_committed_change(self) -> None:
+        path = self.write_bytes("unmask-interrupted.txt", b"old")
+        change = self.tools.prepare_write_file(
+            {"path": "unmask-interrupted.txt", "content": "new"}
+        )
+
+        with patch(
+            "mca.tools.filesystem.signal.pthread_sigmask",
+            side_effect=[set(), KeyboardInterrupt],
+        ):
+            result = change.execute()
+
+        self.assertEqual(path.read_bytes(), b"new")
+        self.assertIs(result.interruption_warning, True)
+
+    def test_system_exit_after_replace_is_not_swallowed(self) -> None:
+        path = self.write_bytes("system-exit.txt", b"old")
+        change = self.tools.prepare_write_file(
+            {"path": "system-exit.txt", "content": "new"}
+        )
+        real_replace = os.replace
+
+        def replace_then_exit(source: object, target: object) -> None:
+            real_replace(source, target)
+            raise SystemExit(17)
+
+        with patch(
+            "mca.tools.filesystem.os.replace", side_effect=replace_then_exit
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                change.execute()
+
+        self.assertEqual(raised.exception.code, 17)
+        self.assertEqual(path.read_bytes(), b"new")
 
     def test_keyboard_interrupt_before_replace_propagates_without_committing(self) -> None:
         path = self.write_bytes("uncommitted.txt", b"old")
