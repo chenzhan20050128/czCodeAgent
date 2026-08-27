@@ -9,7 +9,6 @@ import signal
 import subprocess
 import threading
 import time
-from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO
@@ -41,32 +40,46 @@ _MODEL_SECRET_KEYS = frozenset(
 )
 _STREAM_HEADERS = ("[stdout]\n", "\n[stderr]\n")
 _OUTPUT_QUEUE_CHUNKS = 64
-_OUTPUT_POLL_SECONDS = 0.01
-
-OutputCallback = Callable[[str, str], object]
 
 
 class ShellToolError(RuntimeError):
     """Raised when a shell request cannot be prepared or launched."""
 
 
-class _CallbackGate:
-    """Serialize callback delivery and stop it permanently during cleanup."""
+class BoundedOutputChannel:
+    """A fixed-capacity, non-blocking channel for display-only shell output."""
 
-    def __init__(self, callback: OutputCallback | None) -> None:
-        self._callback = callback
-        self._enabled = True
-        self._lock = threading.Lock()
+    __slots__ = ("_queue",)
 
-    def emit(self, stream_name: str, text: str) -> None:
-        with self._lock:
-            callback = self._callback if self._enabled else None
-        if callback is not None:
-            callback(stream_name, text)
+    def __init__(self, capacity: int = _OUTPUT_QUEUE_CHUNKS) -> None:
+        if type(capacity) is not int or capacity < 1:
+            raise ValueError("capacity must be a positive integer")
+        self._queue: queue.Queue[tuple[str, str]] = queue.Queue(maxsize=capacity)
 
-    def disable(self) -> None:
-        with self._lock:
-            self._enabled = False
+    def offer(self, stream_name: str, text: str) -> bool:
+        """Offer one display chunk without waiting for a consumer."""
+
+        try:
+            self._queue.put_nowait((stream_name, text))
+        except queue.Full:
+            return False
+        return True
+
+    def poll(self) -> tuple[str, str] | None:
+        """Return one queued display chunk, or ``None`` without waiting."""
+
+        try:
+            return self._queue.get_nowait()
+        except queue.Empty:
+            return None
+
+    def drain(self) -> list[tuple[str, str]]:
+        """Return all currently queued display chunks without waiting."""
+
+        chunks: list[tuple[str, str]] = []
+        while (chunk := self.poll()) is not None:
+            chunks.append(chunk)
+        return chunks
 
 
 @dataclass
@@ -122,7 +135,16 @@ class PreparedShellCommand:
     max_output_lines: int = field(repr=False)
     termination_grace_seconds: float = field(repr=False)
 
-    def execute(self, *, on_output: OutputCallback | None = None) -> ToolResult:
+    def execute(
+        self, *, output_channel: BoundedOutputChannel | None = None
+    ) -> ToolResult:
+        if (
+            output_channel is not None
+            and type(output_channel) is not BoundedOutputChannel
+        ):
+            raise TypeError(
+                "output_channel must be a BoundedOutputChannel or None"
+            )
         environment = os.environ.copy()
         for key in _MODEL_SECRET_KEYS:
             environment.pop(key, None)
@@ -144,13 +166,7 @@ class PreparedShellCommand:
         assert process.stderr is not None
         stdout = _BoundedCapture(self.max_output_bytes)
         stderr = _BoundedCapture(self.max_output_bytes)
-        callback_gate = _CallbackGate(on_output)
-        output_queue: queue.Queue[tuple[str, str]] = queue.Queue(
-            maxsize=_OUTPUT_QUEUE_CHUNKS
-        )
         drain_stop = threading.Event()
-        lifecycle_done = threading.Event()
-        lifecycle_timed_out = threading.Event()
         threads = (
             threading.Thread(
                 target=_drain_pipe,
@@ -158,7 +174,7 @@ class PreparedShellCommand:
                     process.stdout,
                     "stdout",
                     stdout,
-                    output_queue,
+                    output_channel,
                     drain_stop,
                 ),
                 daemon=True,
@@ -169,37 +185,21 @@ class PreparedShellCommand:
                     process.stderr,
                     "stderr",
                     stderr,
-                    output_queue,
+                    output_channel,
                     drain_stop,
                 ),
                 daemon=True,
             ),
         )
         started_threads: list[threading.Thread] = []
-        watchdog: threading.Thread | None = None
         try:
             for thread in threads:
                 thread.start()
                 started_threads.append(thread)
-            watchdog = threading.Thread(
-                target=_watch_process_deadline,
-                args=(
-                    process,
-                    self.timeout_seconds,
-                    self.termination_grace_seconds,
-                    lifecycle_done,
-                    lifecycle_timed_out,
-                    drain_stop,
-                ),
-                daemon=True,
-            )
-            watchdog.start()
         except BaseException as error:
-            lifecycle_done.set()
             _stop_process_group(
                 process, signal.SIGTERM, self.termination_grace_seconds
             )
-            callback_gate.disable()
             drain_stop.set()
             _close_pipes(process.stdout, process.stderr)
             _join_threads(
@@ -212,18 +212,7 @@ class PreparedShellCommand:
         timed_out = False
         interrupted = False
         try:
-            timed_out = not _wait_process_with_output(
-                process,
-                timeout=self.timeout_seconds,
-                output_queue=output_queue,
-                callback=callback_gate.emit,
-            )
-            if timed_out:
-                lifecycle_timed_out.set()
-                drain_stop.set()
-                _stop_process_group(
-                    process, signal.SIGTERM, self.termination_grace_seconds
-                )
+            process.wait(timeout=self.timeout_seconds)
         except subprocess.TimeoutExpired:
             timed_out = True
             _stop_process_group(
@@ -235,18 +224,13 @@ class PreparedShellCommand:
                 process, signal.SIGINT, self.termination_grace_seconds
             )
         finally:
-            lifecycle_done.set()
-            timed_out = timed_out or lifecycle_timed_out.is_set()
             if process.poll() is None:
                 _stop_process_group(
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
             _wait_process_bounded(process, self.termination_grace_seconds)
-            drains_finished = _join_threads_with_output(
-                tuple(started_threads),
-                timeout=self.termination_grace_seconds,
-                output_queue=output_queue,
-                callback=callback_gate.emit,
+            drains_finished = _join_threads(
+                tuple(started_threads), timeout=self.termination_grace_seconds
             )
             if not drains_finished:
                 timed_out = True
@@ -257,26 +241,14 @@ class PreparedShellCommand:
                 _stop_process_group(
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
-                callback_gate.disable()
                 drain_stop.set()
                 _close_pipes(process.stdout, process.stderr)
-                drains_finished = _join_threads_with_output(
-                    tuple(started_threads),
-                    timeout=self.termination_grace_seconds,
-                    output_queue=output_queue,
-                    callback=None,
+                drains_finished = _join_threads(
+                    tuple(started_threads), timeout=self.termination_grace_seconds
                 )
                 if not drains_finished:
                     raise ShellToolError(
                         "output drain threads did not stop after bounded cleanup"
-                    )
-            _deliver_output(output_queue, callback_gate.emit)
-            callback_gate.disable()
-            if watchdog is not None:
-                watchdog.join(timeout=self.termination_grace_seconds)
-                if watchdog.is_alive():
-                    raise ShellToolError(
-                        "shell lifecycle watchdog did not stop after bounded cleanup"
                     )
 
         output, rendering_truncated = _render_streams(
@@ -376,7 +348,7 @@ def _drain_pipe(
     pipe: BinaryIO,
     stream_name: str,
     capture: _BoundedCapture,
-    output_queue: queue.Queue[tuple[str, str]] | None,
+    output_channel: BoundedOutputChannel | None,
     stop: threading.Event | None = None,
 ) -> None:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -399,95 +371,16 @@ def _drain_pipe(
                 break
             capture.append(chunk)
             rendered = decoder.decode(chunk)
-            if output_queue is not None and rendered:
-                _offer_output(output_queue, stream_name, rendered)
+            if output_channel is not None and rendered:
+                output_channel.offer(stream_name, rendered)
         rendered = decoder.decode(b"", final=True)
-        if output_queue is not None and rendered:
-            _offer_output(output_queue, stream_name, rendered)
+        if output_channel is not None and rendered:
+            output_channel.offer(stream_name, rendered)
     finally:
         try:
             pipe.close()
         except OSError:
             pass
-
-
-def _offer_output(
-    output_queue: queue.Queue[tuple[str, str]], stream_name: str, text: str
-) -> None:
-    try:
-        output_queue.put_nowait((stream_name, text))
-    except queue.Full:
-        pass
-
-
-def _deliver_output(
-    output_queue: queue.Queue[tuple[str, str]], callback: OutputCallback | None
-) -> None:
-    while True:
-        try:
-            stream_name, text = output_queue.get_nowait()
-        except queue.Empty:
-            return
-        if callback is not None:
-            try:
-                callback(stream_name, text)
-            except Exception:
-                pass
-
-
-def _wait_process_with_output(
-    process: subprocess.Popen[bytes],
-    *,
-    timeout: float,
-    output_queue: queue.Queue[tuple[str, str]],
-    callback: OutputCallback | None,
-) -> bool:
-    deadline = time.monotonic() + timeout
-    while True:
-        _deliver_output(output_queue, callback)
-        if process.poll() is not None:
-            return True
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        try:
-            process.wait(timeout=min(_OUTPUT_POLL_SECONDS, remaining))
-        except subprocess.TimeoutExpired:
-            continue
-
-
-def _watch_process_deadline(
-    process: subprocess.Popen[bytes],
-    timeout: float,
-    grace: float,
-    done: threading.Event,
-    timed_out: threading.Event,
-    drain_stop: threading.Event,
-) -> None:
-    if done.wait(timeout):
-        return
-    timed_out.set()
-    _stop_process_group(process, signal.SIGTERM, grace)
-    drain_stop.set()
-
-
-def _join_threads_with_output(
-    threads: tuple[threading.Thread, ...],
-    *,
-    timeout: float,
-    output_queue: queue.Queue[tuple[str, str]],
-    callback: OutputCallback | None,
-) -> bool:
-    deadline = time.monotonic() + timeout
-    while any(thread.is_alive() for thread in threads):
-        _deliver_output(output_queue, callback)
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return False
-        for thread in threads:
-            thread.join(timeout=min(_OUTPUT_POLL_SECONDS, remaining))
-    _deliver_output(output_queue, callback)
-    return True
 
 
 def _stop_process_group(
@@ -595,4 +488,9 @@ def _render_streams(
     return output, stdout_truncated or stderr_truncated
 
 
-__all__ = ["PreparedShellCommand", "ShellRunner", "ShellToolError"]
+__all__ = [
+    "BoundedOutputChannel",
+    "PreparedShellCommand",
+    "ShellRunner",
+    "ShellToolError",
+]

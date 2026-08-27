@@ -24,7 +24,7 @@ from .tools.registry import (
     ToolValidationError,
     UnknownToolError,
 )
-from .tools.shell import PreparedShellCommand
+from .tools.shell import BoundedOutputChannel, PreparedShellCommand
 
 
 _KNOWN_SECRET_KEYS = (
@@ -90,17 +90,24 @@ class ToolExecutor:
         approver: Approver,
         workspace: str | os.PathLike[str],
         *,
-        on_output: Any | None = None,
+        output_channel: BoundedOutputChannel | None = None,
     ) -> None:
         workspace_path = Path(workspace).resolve(strict=True)
         if not workspace_path.is_dir():
             raise ValueError("workspace must be a directory")
+        if (
+            output_channel is not None
+            and type(output_channel) is not BoundedOutputChannel
+        ):
+            raise TypeError(
+                "output_channel must be a BoundedOutputChannel or None"
+            )
         self.registry = registry
         self.store = store
         self.state = state
         self.approver = approver
         self.workspace = workspace_path
-        self.on_output = on_output
+        self.output_channel = output_channel
         self._usable = True
         if registry.workspace is not None and registry.workspace != workspace_path:
             raise ValueError("registry workspace does not match executor workspace")
@@ -214,7 +221,7 @@ class ToolExecutor:
             else:
                 assert prepared is not None
                 if isinstance(prepared, PreparedShellCommand):
-                    raw_result = prepared.execute(on_output=self.on_output)
+                    raw_result = prepared.execute(output_channel=self.output_channel)
                 else:
                     raw_result = prepared.execute()  # type: ignore[attr-defined]
             result = self._normalize_result(call.name, raw_result)

@@ -24,6 +24,7 @@ from mca.store import RolloutStore
 from mca.tools import create_tool_registry
 from mca.tools.filesystem import PreparedFileChange
 from mca.tools.registry import SideEffect, ToolRegistry, ToolResult, ToolSpec
+from mca.tools.shell import BoundedOutputChannel
 
 
 class RecordingApprover:
@@ -299,8 +300,8 @@ class ToolExecutorTests(ExecutorTestCase):
                 self.assertEqual(result.status, "failed")
                 self.assertEqual(executions, [])
 
-    def test_shell_executor_forwards_live_output_callback(self) -> None:
-        chunks: list[tuple[str, str]] = []
+    def test_shell_executor_forwards_bounded_output_channel(self) -> None:
+        channel = BoundedOutputChannel(capacity=8)
         call = self.accept("bash", '{"command":"printf live"}')
         executor = ToolExecutor(
             create_tool_registry(self.workspace),
@@ -308,12 +309,32 @@ class ToolExecutorTests(ExecutorTestCase):
             self.state,
             RecordingApprover(ApprovalDecision.ALLOW_ONCE),
             self.workspace,
-            on_output=lambda stream, text: chunks.append((stream, text)),
+            output_channel=channel,
         )
 
         executor.execute(call)
 
-        self.assertIn(("stdout", "live"), chunks)
+        self.assertIn(("stdout", "live"), channel.drain())
+
+    def test_executor_rejects_callable_output_channel(self) -> None:
+        with self.assertRaisesRegex(TypeError, "BoundedOutputChannel"):
+            ToolExecutor(
+                create_tool_registry(self.workspace),
+                self.store,
+                self.state,
+                RecordingApprover(ApprovalDecision.ALLOW_ONCE),
+                self.workspace,
+                output_channel=lambda stream, text: None,
+            )
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+            ToolExecutor(
+                create_tool_registry(self.workspace),
+                self.store,
+                self.state,
+                RecordingApprover(ApprovalDecision.ALLOW_ONCE),
+                self.workspace,
+                on_output=lambda stream, text: None,
+            )
 
     def test_write_orders_approval_snapshot_start_effect_and_success(self) -> None:
         path = self.workspace / "notes.txt"

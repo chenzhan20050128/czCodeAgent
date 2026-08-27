@@ -22,10 +22,10 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from mca.tools import create_tool_registry
 from mca.tools.registry import ToolValidationError
 from mca.tools.shell import (
+    BoundedOutputChannel,
     ShellRunner,
     ShellToolError,
     _BoundedCapture,
-    _CallbackGate,
     _drain_pipe,
     _stop_process_group,
 )
@@ -123,170 +123,101 @@ class ShellRunnerTests(unittest.TestCase):
         self.assertIn("[stdout]", result.output)
         self.assertIn("[stderr]", result.output)
 
-    def test_callback_exceptions_are_isolated_from_execution(self) -> None:
-        chunks: list[tuple[str, str]] = []
-
-        def broken_callback(stream: str, text: str) -> None:
-            chunks.append((stream, text))
-            raise RuntimeError("display failed")
+    def test_output_channel_receives_stdout_and_stderr(self) -> None:
+        channel = BoundedOutputChannel(capacity=8)
 
         result = ShellRunner(self.workspace).prepare(
             {"command": "printf hello; printf world >&2"}
-        ).execute(on_output=broken_callback)
+        ).execute(output_channel=channel)
 
+        chunks = channel.drain()
         self.assertEqual(result.status, "succeeded")
         self.assertEqual({stream for stream, _ in chunks}, {"stdout", "stderr"})
-        self.assertIn("hello", result.output)
-        self.assertIn("world", result.output)
+        self.assertEqual(
+            "".join(text for stream, text in chunks if stream == "stdout"),
+            "hello",
+        )
+        self.assertEqual(
+            "".join(text for stream, text in chunks if stream == "stderr"),
+            "world",
+        )
 
-    def test_blocking_callback_never_blocks_or_leaks_drain_threads(self) -> None:
-        callback_entered = threading.Event()
-        release_callback = threading.Event()
+    def test_output_channel_has_fixed_nonblocking_capacity(self) -> None:
+        channel = BoundedOutputChannel(capacity=1)
+
+        self.assertIs(channel.offer("stdout", "first"), True)
+        self.assertIs(channel.offer("stderr", "dropped"), False)
+        self.assertEqual(channel.poll(), ("stdout", "first"))
+        self.assertIsNone(channel.poll())
+
+    def test_full_unconsumed_output_channel_does_not_block_command(self) -> None:
+        channel = BoundedOutputChannel(capacity=1)
+        command = self.python_command(
+            "import os; "
+            "[(os.write(1, b'O' * 8192), os.write(2, b'E' * 8192)) "
+            "for _ in range(80)]"
+        )
+        started = time.monotonic()
+
+        result = ShellRunner(self.workspace).prepare(
+            {"command": command, "timeout_seconds": 10}
+        ).execute(output_channel=channel)
+
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(len(channel.drain()), 1)
+        self.assertIn("O", result.output)
+        self.assertIn("E", result.output)
+
+    def test_full_unconsumed_channel_preserves_timeout_and_drain_cleanup(self) -> None:
+        channel = BoundedOutputChannel(capacity=1)
         real_thread = threading.Thread
         created_threads: list[tuple[object, threading.Thread]] = []
-        callback_threads: list[threading.Thread] = []
-        outcomes: list[object] = []
-        errors: list[BaseException] = []
-
-        def blocking_callback(stream: str, text: str) -> None:
-            del stream, text
-            callback_threads.append(threading.current_thread())
-            callback_entered.set()
-            release_callback.wait(timeout=2)
-
-        def recording_thread(*args: object, **kwargs: object) -> threading.Thread:
-            thread = real_thread(*args, **kwargs)
-            created_threads.append((kwargs.get("target"), thread))
-            return thread
-
-        def execute() -> None:
-            try:
-                with patch(
-                    "mca.tools.shell.threading.Thread",
-                    side_effect=recording_thread,
-                ):
-                    outcomes.append(
-                        ShellRunner(self.workspace)
-                        .prepare({"command": "printf ready"})
-                        .execute(on_output=blocking_callback)
-                    )
-            except BaseException as error:
-                errors.append(error)
-
-        owner = real_thread(target=execute, daemon=True)
-        try:
-            owner.start()
-            self.assertTrue(callback_entered.wait(timeout=1))
-            actual_drain_threads = [
-                thread
-                for target, thread in created_threads
-                if getattr(target, "__name__", None) == "_drain_pipe"
-            ]
-            deadline = time.monotonic() + 1
-            while (
-                any(thread.is_alive() for thread in actual_drain_threads)
-                and time.monotonic() < deadline
-            ):
-                time.sleep(0.01)
-            self.assertEqual(len(actual_drain_threads), 2)
-            self.assertTrue(
-                all(not thread.is_alive() for thread in actual_drain_threads)
-            )
-            self.assertTrue(owner.is_alive())
-        finally:
-            release_callback.set()
-            owner.join(timeout=2)
-
-        self.assertFalse(owner.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(len(outcomes), 1)
-        self.assertTrue(all(thread is owner for thread in callback_threads))
-
-    def test_watchdog_times_out_process_while_owner_callback_is_blocked(self) -> None:
-        callback_entered = threading.Event()
-        release_callback = threading.Event()
-        real_thread = threading.Thread
-        real_popen = subprocess.Popen
-        created_threads: list[tuple[object, threading.Thread]] = []
-        processes: list[subprocess.Popen[bytes]] = []
-        outcomes: list[object] = []
-        errors: list[BaseException] = []
         thread_errors: list[BaseException] = []
         original_excepthook = threading.excepthook
 
-        def blocking_callback(stream: str, text: str) -> None:
-            del stream, text
-            callback_entered.set()
-            release_callback.wait()
-
         def recording_thread(*args: object, **kwargs: object) -> threading.Thread:
             thread = real_thread(*args, **kwargs)
             created_threads.append((kwargs.get("target"), thread))
             return thread
 
-        def recording_popen(
-            *args: object, **kwargs: object
-        ) -> subprocess.Popen[bytes]:
-            process = real_popen(*args, **kwargs)
-            processes.append(process)
-            return process
-
-        def execute() -> None:
-            try:
-                with (
-                    patch(
-                        "mca.tools.shell.threading.Thread",
-                        side_effect=recording_thread,
-                    ),
-                    patch(
-                        "mca.tools.shell.subprocess.Popen",
-                        side_effect=recording_popen,
-                    ),
-                ):
-                    outcomes.append(
-                        ShellRunner(
-                            self.workspace, termination_grace_seconds=0.1
-                        )
-                        .prepare(
-                            {"command": "printf ready; sleep 60", "timeout_seconds": 1}
-                        )
-                        .execute(on_output=blocking_callback)
-                    )
-            except BaseException as error:
-                errors.append(error)
-
         threading.excepthook = lambda args: thread_errors.append(args.exc_value)
-        owner = real_thread(target=execute, daemon=True)
         try:
-            owner.start()
-            self.assertTrue(callback_entered.wait(timeout=1))
-            time.sleep(1.3)
-            self.assertEqual(len(processes), 1)
-            self.assertIsNotNone(processes[0].poll())
-            drain_threads = [
-                thread
-                for target, thread in created_threads
-                if getattr(target, "__name__", None) == "_drain_pipe"
-            ]
-            self.assertEqual(len(drain_threads), 2)
-            self.assertTrue(all(not thread.is_alive() for thread in drain_threads))
-            self.assertTrue(owner.is_alive())
+            started = time.monotonic()
+            with patch(
+                "mca.tools.shell.threading.Thread",
+                side_effect=recording_thread,
+            ):
+                result = ShellRunner(
+                    self.workspace, termination_grace_seconds=0.1
+                ).prepare(
+                    {
+                        "command": "printf ready; printf error >&2; sleep 60",
+                        "timeout_seconds": 1,
+                    }
+                ).execute(output_channel=channel)
         finally:
-            release_callback.set()
-            if processes and processes[0].poll() is None:
-                try:
-                    os.killpg(processes[0].pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-            owner.join(timeout=3)
             threading.excepthook = original_excepthook
 
-        self.assertFalse(owner.is_alive())
-        self.assertEqual(errors, [])
-        self.assertEqual(len(outcomes), 1)
-        self.assertEqual(outcomes[0].status, "timed_out")
-        self.assertTrue(all(not thread.is_alive() for _, thread in created_threads))
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertEqual(result.status, "timed_out")
+        drain_threads = [
+            thread
+            for target, thread in created_threads
+            if getattr(target, "__name__", None) == "_drain_pipe"
+        ]
+        self.assertEqual(len(created_threads), 2)
+        self.assertEqual(len(drain_threads), 2)
+        self.assertTrue(all(not thread.is_alive() for thread in drain_threads))
         self.assertEqual(thread_errors, [])
+
+    def test_shell_execute_rejects_callable_output_channel(self) -> None:
+        prepared = ShellRunner(self.workspace).prepare({"command": "printf no"})
+
+        with self.assertRaisesRegex(TypeError, "BoundedOutputChannel"):
+            prepared.execute(output_channel=lambda stream, text: None)
+        with self.assertRaisesRegex(TypeError, "unexpected keyword argument"):
+            prepared.execute(on_output=lambda stream, text: None)
 
     def test_known_model_secrets_are_removed_but_ordinary_environment_remains(self) -> None:
         keys = (
@@ -564,16 +495,6 @@ class ShellRunnerTests(unittest.TestCase):
         self.assertTrue(
             all(call.kwargs.get("timeout") is not None for call in process.wait.call_args_list)
         )
-
-    def test_callback_gate_drops_output_after_disable(self) -> None:
-        chunks: list[tuple[str, str]] = []
-        gate = _CallbackGate(lambda stream, text: chunks.append((stream, text)))
-
-        gate.emit("stdout", "before")
-        gate.disable()
-        gate.emit("stdout", "after")
-
-        self.assertEqual(chunks, [("stdout", "before")])
 
     def test_keyboard_interrupt_interrupts_group_and_returns_terminal_result(self) -> None:
         runner = ShellRunner(self.workspace, termination_grace_seconds=0.1)
