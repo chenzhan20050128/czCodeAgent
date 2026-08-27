@@ -234,6 +234,79 @@ class ShellRunnerTests(unittest.TestCase):
             self.fail(f"descendant process {child_pid} survived pipe cleanup")
         self.assertEqual(thread_errors, [])
 
+    def test_escaped_setsid_descendant_cannot_leave_drain_threads_alive(self) -> None:
+        command = (
+            self.python_command(
+                "import os,time; "
+                "os.setsid(); "
+                "pid_file=open('escaped.pid','w'); "
+                "pid_file.write(str(os.getpid())); pid_file.close(); "
+                "time.sleep(60)"
+            )
+            + " & exit 0"
+        )
+        real_thread = threading.Thread
+        real_popen = subprocess.Popen
+        drain_threads: list[threading.Thread] = []
+        processes: list[subprocess.Popen[bytes]] = []
+        thread_errors: list[BaseException] = []
+        original_excepthook = threading.excepthook
+        escaped_pid: int | None = None
+
+        def recording_thread(*args: object, **kwargs: object) -> threading.Thread:
+            thread = real_thread(*args, **kwargs)
+            drain_threads.append(thread)
+            return thread
+
+        def recording_popen(
+            *args: object, **kwargs: object
+        ) -> subprocess.Popen[bytes]:
+            process = real_popen(*args, **kwargs)
+            processes.append(process)
+            return process
+
+        threading.excepthook = lambda args: thread_errors.append(args.exc_value)
+        try:
+            with (
+                patch(
+                    "mca.tools.shell.threading.Thread", side_effect=recording_thread
+                ),
+                patch("mca.tools.shell.subprocess.Popen", side_effect=recording_popen),
+                patch("mca.tools.shell._close_pipes"),
+            ):
+                result = ShellRunner(
+                    self.workspace, termination_grace_seconds=0.1
+                ).prepare(
+                    {"command": command, "timeout_seconds": 2}
+                ).execute()
+
+            pid_path = self.workspace / "escaped.pid"
+            self.assertTrue(pid_path.exists())
+            escaped_pid = int(pid_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.status, "timed_out")
+            self.assertIn("escaped descendants may remain", result.output)
+            self.assertEqual(len(drain_threads), 2)
+            self.assertTrue(all(not thread.is_alive() for thread in drain_threads))
+            self.assertEqual(thread_errors, [])
+        finally:
+            if escaped_pid is None:
+                pid_path = self.workspace / "escaped.pid"
+                if pid_path.exists():
+                    escaped_pid = int(pid_path.read_text(encoding="utf-8"))
+            if escaped_pid is not None:
+                try:
+                    os.kill(escaped_pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            for process in processes:
+                if process.stdout is not None:
+                    process.stdout.close()
+                if process.stderr is not None:
+                    process.stderr.close()
+            for thread in drain_threads:
+                thread.join(timeout=1)
+            threading.excepthook = original_excepthook
+
     def test_drain_pipe_closed_before_fileno_has_no_background_exception(self) -> None:
         read_fd, write_fd = os.pipe()
         pipe = os.fdopen(read_fd, "rb", buffering=0)

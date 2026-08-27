@@ -142,15 +142,28 @@ class PreparedShellCommand:
         stdout = _BoundedCapture(self.max_output_bytes)
         stderr = _BoundedCapture(self.max_output_bytes)
         callback_gate = _CallbackGate(on_output)
+        drain_stop = threading.Event()
         threads = (
             threading.Thread(
                 target=_drain_pipe,
-                args=(process.stdout, "stdout", stdout, callback_gate.emit),
+                args=(
+                    process.stdout,
+                    "stdout",
+                    stdout,
+                    callback_gate.emit,
+                    drain_stop,
+                ),
                 daemon=True,
             ),
             threading.Thread(
                 target=_drain_pipe,
-                args=(process.stderr, "stderr", stderr, callback_gate.emit),
+                args=(
+                    process.stderr,
+                    "stderr",
+                    stderr,
+                    callback_gate.emit,
+                    drain_stop,
+                ),
                 daemon=True,
             ),
         )
@@ -163,11 +176,12 @@ class PreparedShellCommand:
             _stop_process_group(
                 process, signal.SIGTERM, self.termination_grace_seconds
             )
+            callback_gate.disable()
+            drain_stop.set()
             _close_pipes(process.stdout, process.stderr)
             _join_threads(
                 tuple(started_threads), timeout=self.termination_grace_seconds
             )
-            callback_gate.disable()
             if isinstance(error, KeyboardInterrupt):
                 raise
             raise ShellToolError("failed to start output drain") from error
@@ -205,14 +219,14 @@ class PreparedShellCommand:
                     process, signal.SIGTERM, self.termination_grace_seconds
                 )
                 callback_gate.disable()
+                drain_stop.set()
                 _close_pipes(process.stdout, process.stderr)
                 drains_finished = _join_threads(
                     tuple(started_threads), timeout=self.termination_grace_seconds
                 )
                 if not drains_finished:
-                    stderr.append(
-                        b"pipe drain threads did not exit after pipes were closed; "
-                        b"escaped descendants may remain\n"
+                    raise ShellToolError(
+                        "output drain threads did not stop after bounded cleanup"
                     )
             callback_gate.disable()
 
@@ -314,12 +328,22 @@ def _drain_pipe(
     stream_name: str,
     capture: _BoundedCapture,
     callback: OutputCallback | None,
+    stop: threading.Event | None = None,
 ) -> None:
     decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    stop = stop or threading.Event()
     try:
-        while True:
+        try:
+            descriptor = pipe.fileno()
+            os.set_blocking(descriptor, False)
+        except (OSError, ValueError):
+            return
+        while not stop.is_set():
             try:
-                chunk = os.read(pipe.fileno(), 8192)
+                chunk = os.read(descriptor, 8192)
+            except BlockingIOError:
+                stop.wait(0.01)
+                continue
             except (OSError, ValueError):
                 break
             if not chunk:
