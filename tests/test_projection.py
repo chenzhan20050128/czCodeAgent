@@ -20,6 +20,7 @@ from mca.projection import (
     PromptProjector,
     estimate_request_tokens,
     request_fits_budget,
+    usage_anchored_request_tokens,
     validate_conversation,
 )
 from mca.sse import StreamAssembler
@@ -917,6 +918,67 @@ class RequestBudgetTests(unittest.TestCase):
                 context_window=estimate + 10,
                 reserved_output_tokens=7,
                 safety_margin=4,
+            )
+        )
+
+    def test_usage_anchor_raises_the_estimate_above_the_heuristic(self) -> None:
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "worked on it"},
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        ]
+        heuristic = estimate_request_tokens(messages)
+
+        anchored = usage_anchored_request_tokens(
+            messages, last_usage=(10_000, 20, 10_020)
+        )
+
+        self.assertGreater(anchored, heuristic)
+        tail = [messages[-1]]
+        self.assertEqual(
+            anchored, 10_020 + estimate_request_tokens(tail)
+        )
+
+    def test_usage_anchor_without_usage_matches_the_heuristic(self) -> None:
+        messages = [{"role": "user", "content": "task"}]
+        self.assertEqual(
+            usage_anchored_request_tokens(messages, last_usage=None),
+            estimate_request_tokens(messages),
+        )
+
+    def test_usage_anchor_never_drops_below_the_heuristic(self) -> None:
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "x" * 4_000},
+        ]
+        anchored = usage_anchored_request_tokens(
+            messages, last_usage=(1, 1, 2)
+        )
+        self.assertEqual(anchored, estimate_request_tokens(messages))
+
+    def test_budget_uses_the_usage_anchor_when_supplied(self) -> None:
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "done"},
+        ]
+        heuristic = estimate_request_tokens(messages)
+
+        # Heuristic alone fits, but the real anchor is far larger and must not.
+        self.assertTrue(
+            request_fits_budget(
+                messages,
+                context_window=heuristic + 100,
+                reserved_output_tokens=0,
+                safety_margin=0,
+            )
+        )
+        self.assertFalse(
+            request_fits_budget(
+                messages,
+                context_window=heuristic + 100,
+                reserved_output_tokens=0,
+                safety_margin=0,
+                last_usage=(heuristic + 500, 5, heuristic + 505),
             )
         )
 
