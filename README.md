@@ -34,7 +34,7 @@ user input ──> AgentLoop ──> ModelClient (SSE, bounded retry)
 - **sse.py / model.py** — incremental SSE parsing and one bounded-retry sample.
 - **agent.py** — the bounded Turn state machine (the only owner of turn transitions).
 - **tools/** — six explicit tools: `read_file`, `list_dir`, `grep`,
-  `write_file`, `edit_file`, `bash`.
+  `write_file`, `edit_file`, `bash`, plus `exit_plan_mode` for plan review.
 - **executor.py / approval.py / undo.py** — approval, atomic writes, managed undo.
 - **compact.py** — checkpoint generation at a complete sampling boundary.
 - **session.py** — resume, crash recovery, and reconciliation of uncertain outcomes.
@@ -69,16 +69,29 @@ mca                                            # interactive REPL
 mca --resume <session-id>                      # resume a session
 mca --list                                     # list sessions (read-only)
 mca --show <session-id>                        # print a session transcript (read-only)
+mca --plan                                     # start in plan mode (research first)
 mca --verbose                                  # stream output + show turn status
 mca --yolo                                     # skip approval (checks still apply)
 ```
 
-REPL commands: `/help`, `/status`, `/compact`, `/undo`, `/exit`.
+REPL commands: `/help`, `/status`, `/plan [off]`, `/compact`, `/undo`, `/exit`.
 
 Sessions are stored under `<workspace>/.mca/sessions/` (gitignored).
 `--list`, `--show`, and `/status` are pure read-only projections of the same
 fact log the agent runs on; they need no API key, take no lock, and never
 modify the rollout — a live session can be inspected while it is still running.
+
+**Plan mode** is a two-layer guardrail: the system prompt asks the model to
+research and propose a plan first (soft layer), and the runtime refuses
+`write_file`, `edit_file`, and `bash` until you approve the plan via
+`exit_plan_mode` (hard layer). Read-only tools stay available. The state is a
+log-only `plan_mode_set` fact, so it survives `--resume`.
+
+**Context budget** is anchored on the provider's real token usage when
+available: the last successful response's `total_tokens` prices the history it
+covered, and only messages appended after it are estimated heuristically. The
+result never dips below the pure heuristic, so anchoring can only trigger
+compaction earlier, never skip it.
 
 ## Safety boundaries
 
