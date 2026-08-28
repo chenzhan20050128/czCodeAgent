@@ -136,7 +136,7 @@ class CliRunTests(unittest.TestCase):
         code, output = self._run(["say hello"], ScriptedModel(_text("done")))
         self.assertEqual(code, 0)
         self.assertIn("done", output)
-        self.assertIn("[session ", output)
+        self.assertIn("[session]", output)
 
     def test_one_shot_never_leaks_the_api_key(self) -> None:
         _, output = self._run(
@@ -250,7 +250,7 @@ class CliRunTests(unittest.TestCase):
             [], ScriptedModel(), stdin="/plan\n/status\n/plan off\n/exit\n"
         )
         self.assertEqual(code, 0)
-        self.assertIn("plan mode on", output.lower())
+        self.assertIn("[plan] plan mode on", output.lower())
         self.assertIn("plan mode: on", output.lower())
         self.assertIn("plan mode off", output.lower())
 
@@ -268,7 +268,7 @@ class CliRunTests(unittest.TestCase):
         )
 
         self.assertEqual(code, 0)
-        self.assertIn("workspace bound", output.lower())
+        self.assertIn("[workspace] bound", output.lower())
         self.assertEqual(len(model._results), 0)
         sessions_root = project / ".mca" / "sessions"
         session_file = next(sessions_root.glob("*.jsonl"))
@@ -325,7 +325,7 @@ class CliRunTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertFalse((self.workspace / "x.txt").exists())
-        self.assertIn("plan mode on", output.lower())
+        self.assertIn("[plan] plan mode on", output.lower())
 
 
 if __name__ == "__main__":

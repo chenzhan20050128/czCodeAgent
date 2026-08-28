@@ -31,6 +31,7 @@ mca --plan                               以 plan 模式启动（先研究）
 mca --list / mca --show <session-id>     只读列出/回放会话
 REPL 命令：/help /status /plan[ off] /compact /undo /exit
 直接输入 mca 后，第一条任务可写：workspace: /绝对项目路径 | 任务内容。此时才在目标目录建立会话，文件工具、bash 与 /undo 都被锁在该目录；首轮之后不允许切换路径。
+交互 REPL 支持多行任务：Enter 只换行，Ctrl+Enter 提交整个任务；部分终端会把 Ctrl+Enter 编码成普通 Enter，此时用 Ctrl+S 提交。终端使用低饱和蓝灰、靛紫、琥珀、青绿、砖红的语义配色；NO_COLOR、TERM=dumb 或非终端输出自动退化为纯文本。
 
 五、测试与演示
 .venv/bin/python -m unittest discover -s tests -v  （确定性测试，使用 fake model/SSE）

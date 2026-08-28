@@ -35,6 +35,7 @@ from .session import (
     resume_session,
 )
 from .store import RolloutCorruptionError, RolloutStore, SessionLockedError
+from .terminal import TerminalInputError, TerminalTheme, read_multiline_prompt
 from .tools import create_tool_registry
 from .undo import ManagedUndo, UndoError
 
@@ -50,12 +51,13 @@ _REPL_HELP = (
     "  /compact  compact the conversation into a checkpoint\n"
     "  /undo     undo the managed file writes of the last finished turn\n"
     "  /exit     leave the REPL\n"
-    "Any other line is sent to the agent as a new task."
+    "Enter inserts a new line. Ctrl+Enter submits; Ctrl+S is the fallback."
 )
 _UNBOUND_REPL_HELP = (
     "Before the first task, bind mca to a project with:\n"
     "  workspace: /absolute/path/to/project | your task\n"
     "Commands before binding: /help, /plan, /plan off, /exit.\n"
+    "Enter inserts a new line. Ctrl+Enter submits; Ctrl+S is the fallback.\n"
     "The selected directory becomes the only workspace for this session."
 )
 
@@ -79,26 +81,33 @@ def _live_environment(workspace: Path) -> ProjectionEnvironment:
 class _Console:
     """Stdout writer that also renders streamed assistant content."""
 
-    def __init__(self, *, verbose: bool) -> None:
+    def __init__(self, *, verbose: bool, color: bool | None = None) -> None:
         self.verbose = verbose
         self._streaming = False
+        enabled = sys.stdout.isatty() if color is None else color
+        self.theme = TerminalTheme.auto(isatty=enabled)
 
-    def line(self, text: str = "") -> None:
+    def line(self, text: str = "", *, role: str | None = None) -> None:
         if self._streaming:
             sys.stdout.write("\n")
             self._streaming = False
-        print(text)
+        print(self.theme.style(text, role) if role is not None else text)
+
+    def badge(self, label: str, text: str, *, role: str) -> None:
+        self.line(
+            f"{self.theme.style('[' + label + ']', role)} {text}"
+        )
 
     def stream(self, delta: str) -> None:
         if not delta:
             return
-        sys.stdout.write(delta)
+        sys.stdout.write(self.theme.style(delta, "model"))
         sys.stdout.flush()
         self._streaming = True
 
     def invalidate(self) -> None:
         if self._streaming:
-            sys.stdout.write("\n[output discarded]\n")
+            sys.stdout.write("\n" + self.theme.style("[output discarded]\n", "failure"))
             sys.stdout.flush()
             self._streaming = False
 
@@ -122,7 +131,11 @@ class _Runtime:
         self.console = console
         self.model = ModelClient(config)
         registry = create_tool_registry(workspace)
-        approver = InteractiveApprover(yolo=config.yolo)
+        approver = InteractiveApprover(
+            yolo=config.yolo,
+            output_fn=lambda rendered: console.badge("approval", rendered, role="approval"),
+            input_fn=lambda prompt: input(console.theme.style(prompt, "approval")),
+        )
         self.executor = ToolExecutor(
             registry=registry,
             store=store,
@@ -161,22 +174,24 @@ class _Runtime:
         label = status.value if isinstance(status, TurnStatus) else str(status)
         if status in _SUCCESS_STATUSES:
             if self.console.verbose:
-                self.console.line(f"[turn {label}]")
+                self.console.badge("turn", label, role="success")
         else:
-            self.console.line(f"[turn {label}: {error or 'no result'}]")
+            self.console.badge(
+                "turn", f"{label}: {error or 'no result'}", role="failure"
+            )
 
     def undo_last_turn(self) -> None:
         turn_id = _last_finished_turn(self.state)
         if turn_id is None:
-            self.console.line("[undo: no finished turn to undo]")
+            self.console.badge("undo", "no finished turn to undo", role="muted")
             return
         undo = ManagedUndo(self.store, self.state, self.workspace)
         try:
             result = undo.undo_turn(turn_id)
         except UndoError as error:
-            self.console.line(f"[undo failed: {error}]")
+            self.console.badge("undo", f"failed: {error}", role="failure")
             return
-        self.console.line(f"[undo {result.status}]")
+        self.console.badge("undo", result.status, role="success")
         for item in result.files:
             self.console.line(f"  {item.status}: {item.path}")
 
@@ -184,36 +199,36 @@ class _Runtime:
         try:
             self.compactor.compact()
         except CompactionError as error:
-            self.console.line(f"[compact skipped: {error}]")
+            self.console.badge("compact", f"skipped: {error}", role="approval")
             return
-        self.console.line("[compacted conversation into a checkpoint]")
+        self.console.badge("compact", "conversation checkpoint created", role="info")
 
     def status(self) -> None:
         summary = summarize(self.state)
         self.console.line(summary.render_line())
         if self.state.plan_mode_active:
-            self.console.line("[plan mode: ON]")
+            self.console.badge("plan", "plan mode: ON — writes are blocked", role="approval")
         try:
             messages = PromptProjector.project(
                 self.store.load(), self.state, _live_environment(self.workspace)
             )
             schemas = self.executor.registry.provider_schemas()
             tokens = estimate_request_tokens(messages, schemas)
-            self.console.line(
-                f"[context ~{tokens} tokens / {self.config.context_window} window]"
+            self.console.badge(
+                "context",
+                f"~{tokens} tokens / {self.config.context_window} window",
+                role="muted",
             )
         except Exception:
-            self.console.line("[context estimate unavailable at this boundary]")
+            self.console.badge("context", "estimate unavailable at this boundary", role="muted")
 
     def set_plan_mode(self, active: bool) -> None:
         if self.state.plan_mode_active == active:
-            self.console.line(
-                f"[plan mode already {'on' if active else 'off'}]"
-            )
+            self.console.badge("plan", f"already {'on' if active else 'off'}", role="muted")
             return
         event = self.store.append("plan_mode_set", {"active": active})
         SessionReducer.apply(self.state, event)
-        self.console.line(f"[plan mode {'on' if active else 'off'}]")
+        self.console.badge("plan", f"plan mode {'on' if active else 'off'}", role="approval" if active else "info")
 
 
 def _last_finished_turn(state: SessionState) -> str | None:
@@ -240,7 +255,7 @@ def _create_session(
         },
     )
     SessionReducer.apply(state, event)
-    console.line(f"[session {session_id}]")
+    console.badge("session", session_id, role="info")
     return _Runtime(
         store=store,
         state=state,
@@ -263,7 +278,7 @@ def _resume_session(
         config=config,
         console=console,
     )
-    console.line(f"[resumed session {session_id}]")
+    console.badge("session", f"resumed session {session_id}", role="info")
     _reconcile_if_blocked(runtime)
     return runtime
 
@@ -313,6 +328,20 @@ def _run_once(runtime: _Runtime, prompt: str) -> int:
     return 0 if result.status in _SUCCESS_STATUSES else 1
 
 
+def _read_repl_prompt(console: _Console) -> str:
+    """Use the raw editor on a real TTY, retain line input for automation."""
+
+    try:
+        return read_multiline_prompt(
+            prompt=console.theme.style("mca> ", "prompt"),
+            continuation=console.theme.style("...  ", "muted"),
+        )
+    except TerminalInputError:
+        # Unit tests, piped CLI use, and dumb terminals retain the original
+        # one-line input contract. The main interactive experience is raw mode.
+        return input("mca> ")
+
+
 def _parse_workspace_prompt(line: str) -> tuple[Path, str]:
     """Parse the one allowed unbound-REPL task header.
 
@@ -350,15 +379,15 @@ def _unbound_repl(
     """Wait for an explicit workspace before creating any session or tools."""
 
     requested_plan = plan_requested
-    console.line("mca REPL. Bind a project before the first task. Type /help.")
+    console.badge("mca", "bind a project before the first task; type /help", role="info")
     while True:
         try:
-            line = input("mca> ")
+            line = _read_repl_prompt(console)
         except EOFError:
             console.line()
             return 0
         except KeyboardInterrupt:
-            console.line("\n[interrupted; type /exit to quit]")
+            console.badge("input", "interrupted; type /exit to quit", role="muted")
             continue
         command = line.strip()
         if not command:
@@ -370,25 +399,25 @@ def _unbound_repl(
             continue
         if command == "/plan" or command == "/plan on":
             requested_plan = True
-            console.line("[plan mode will turn on when a workspace is bound]")
+            console.badge("plan", "will turn on when a workspace is bound", role="approval")
             continue
         if command == "/plan off":
             requested_plan = False
-            console.line("[plan mode will remain off when a workspace is bound]")
+            console.badge("plan", "will remain off when a workspace is bound", role="muted")
             continue
         if command.startswith("/"):
-            console.line(f"[unknown command before workspace binding: {command}]")
+            console.badge("command", f"unknown before workspace binding: {command}", role="failure")
             continue
         try:
             workspace, task = _parse_workspace_prompt(command)
         except ValueError as error:
-            console.line(f"[error: {error}]")
+            console.badge("error", str(error), role="failure")
             continue
         runtime = _create_session(workspace, config, console)
         try:
             if requested_plan:
                 runtime.set_plan_mode(True)
-            console.line(f"[workspace bound: {workspace}]")
+            console.badge("workspace", f"bound to {workspace}", role="workspace")
             runtime.report(runtime.loop.run_turn(task))
             return _repl(runtime)
         finally:
@@ -397,22 +426,22 @@ def _unbound_repl(
 
 def _repl(runtime: _Runtime) -> int:
     console = runtime.console
-    console.line("mca REPL. Type /help for commands, /exit to quit.")
+    console.badge("mca", "ready — /help lists commands", role="info")
     try:
         pending_turn = continuable_turn_id(runtime.state)
     except ReconciliationError:
         pending_turn = None
     if pending_turn is not None:
-        console.line("[continuing the recovered turn]")
+        console.badge("recovery", "continuing recovered turn", role="approval")
         runtime.report(runtime.loop.resume_active_turn())
     while True:
         try:
-            line = input("mca> ")
+            line = _read_repl_prompt(console)
         except EOFError:
             console.line()
             return 0
         except KeyboardInterrupt:
-            console.line("\n[interrupted; type /exit to quit]")
+            console.badge("input", "interrupted; type /exit to quit", role="muted")
             continue
         command = line.strip()
         if not command:
@@ -438,18 +467,19 @@ def _repl(runtime: _Runtime) -> int:
             runtime.undo_last_turn()
             continue
         if command.startswith("/"):
-            console.line(f"[unknown command: {command}]")
+            console.badge("command", f"unknown: {command}", role="failure")
             continue
         if command.startswith("workspace:"):
-            console.line(
-                "[workspace binding is only valid before the first turn; "
-                "this session is already bound]"
+            console.badge(
+                "workspace",
+                "binding is only valid before the first turn; this session is already bound",
+                role="approval",
             )
             continue
         try:
             runtime.report(runtime.loop.run_turn(command))
         except RecoveryBlockedError:
-            console.line("[session is blocked on an unknown tool outcome]")
+            console.badge("recovery", "session is blocked on an unknown tool outcome", role="failure")
             _reconcile_if_blocked(runtime)
 
 

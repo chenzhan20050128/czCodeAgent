@@ -86,6 +86,14 @@ This creates the rollout under that project and confines file tools, `bash`,
 and `/undo` to the same directory. Binding is allowed only before the first
 turn; use `mca --workspace /path/to/project` when you already know the target.
 
+In an interactive terminal, the REPL is a multi-line editor: **Enter** inserts
+a line break and **Ctrl+Enter** submits the whole prompt. mca recognizes the
+standard CSI-u / modifyOtherKeys Ctrl+Enter sequences. Some terminals encode
+Ctrl+Enter exactly like ordinary Enter; in that case use **Ctrl+S** to submit.
+The prompt prints this fallback behavior in `/help`. Colors use a muted
+blue/indigo/amber/teal/brick semantic palette and automatically turn off when
+stdout is not a TTY, `TERM=dumb`, or `NO_COLOR` is set.
+
 REPL commands: `/help`, `/status`, `/plan [off]`, `/compact`, `/undo`, `/exit`.
 
 Sessions are stored under `<workspace>/.mca/sessions/` (gitignored).
