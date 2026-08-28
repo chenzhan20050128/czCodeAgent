@@ -61,6 +61,18 @@ export MCA_API_KEY=...          # do this in your shell, not in a file
 export MCA_MODEL=deepseek-v4-flash
 ```
 
+For DeepSeek V4 Flash, mca defaults to its 1M-token context window, a 512,000
+token local sample budget, and `thinking=enabled`. DeepSeek's documented API
+ceiling is 384,000 output tokens, so mca safely sends `max_tokens=384000` to
+that provider and reserves that actual amount in its context calculation.
+Override deliberately:
+
+```bash
+export MCA_CONTEXT_WINDOW=1000000
+export MCA_MAX_OUTPUT_TOKENS=512000
+export MCA_THINKING=enabled
+```
+
 ## Use
 
 ```bash

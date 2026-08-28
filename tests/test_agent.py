@@ -794,7 +794,7 @@ class AgentLoopTests(AgentLoopTestCase):
         )
         self.assertEqual(
             fits.call_args_list[0].kwargs["reserved_output_tokens"],
-            runtime.loop.config.max_output_tokens,
+            runtime.loop.config.request_max_output_tokens,
         )
 
     def test_proactive_compaction_and_provider_overflow_share_one_retry_budget(

@@ -438,7 +438,7 @@ class AgentLoop:
             messages,
             schemas,
             context_window=self.config.context_window,
-            reserved_output_tokens=self.config.max_output_tokens,
+            reserved_output_tokens=self.config.request_max_output_tokens,
             safety_margin=REQUEST_SAFETY_MARGIN,
             last_usage=self.state.last_usage,
         )

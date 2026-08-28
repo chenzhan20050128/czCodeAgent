@@ -164,8 +164,9 @@ class ModelClientTests(unittest.TestCase):
                 "messages": MESSAGES,
                 "stream": True,
                 "stream_options": {"include_usage": True},
+                "thinking": {"type": "enabled"},
                 "n": 1,
-                "max_tokens": 8192,
+                "max_tokens": 512_000,
                 "tools": TOOLS,
             },
         )
@@ -191,8 +192,55 @@ class ModelClientTests(unittest.TestCase):
 
         self.assertEqual(bodies[0]["model"], "deepseek-v4-flash")
         self.assertEqual(bodies[0]["tools"], TOOLS)
-        self.assertEqual(bodies[0]["max_tokens"], 8192)
+        self.assertEqual(bodies[0]["max_tokens"], 384_000)
+        self.assertEqual(bodies[0]["thinking"], {"type": "enabled"})
         self.assertNotIn("tool_choice", bodies[0])
+
+    def test_thinking_mode_is_sent_from_config(self) -> None:
+        bodies: list[dict[str, object]] = []
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: (
+                    bodies.append(json.loads(request.content)),
+                    response(text_body("ok")),
+                )[1]
+            )
+        )
+        self.addCleanup(http_client.close)
+        client = ModelClient(
+            Config(api_key="test-secret", thinking="enabled"),
+            client=http_client,
+            sleep=lambda _: None,
+        )
+
+        client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+        self.assertEqual(bodies[0]["thinking"], {"type": "enabled"})
+
+    def test_non_deepseek_gateway_keeps_the_configured_output_budget(self) -> None:
+        bodies: list[dict[str, object]] = []
+        http_client = httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: (
+                    bodies.append(json.loads(request.content)),
+                    response(text_body("ok")),
+                )[1]
+            )
+        )
+        self.addCleanup(http_client.close)
+        client = ModelClient(
+            Config(
+                base_url="https://gateway.example/v1",
+                api_key="test-secret",
+                max_output_tokens=512_000,
+            ),
+            client=http_client,
+            sleep=lambda _: None,
+        )
+
+        client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+        self.assertEqual(bodies[0]["max_tokens"], 512_000)
 
     def test_finalization_omits_tools_and_tool_choice(self) -> None:
         bodies: list[dict[str, object]] = []
@@ -215,8 +263,9 @@ class ModelClientTests(unittest.TestCase):
                     "messages": MESSAGES,
                     "stream": True,
                     "stream_options": {"include_usage": True},
+                    "thinking": {"type": "enabled"},
                     "n": 1,
-                    "max_tokens": 8192,
+                    "max_tokens": 512_000,
                 }
             ],
         )

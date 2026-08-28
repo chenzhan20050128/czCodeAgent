@@ -24,6 +24,7 @@ mca 是不依赖任何 Agent 框架/SDK、只用 Python 与 httpx 实现的命�
 python3 -m venv .venv
 .venv/bin/pip install -e .
 export MCA_API_KEY=你的key   （只从环境变量读取，不写入任何文件）
+默认按 DeepSeek V4 Flash 的 1M 上下文运行，本地单次输出预算 512K，默认开启 thinking；DeepSeek API 实际最大输出为 384K，mca 会安全钳制请求并按真实 384K 预留上下文。可通过 MCA_CONTEXT_WINDOW、MCA_MAX_OUTPUT_TOKENS、MCA_THINKING 覆盖。
 mca "修复 calculator.py 里失败的测试"   单次任务
 mca                                      多轮 REPL
 mca --resume <session-id>                恢复会话

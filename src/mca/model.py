@@ -102,8 +102,9 @@ class ModelClient:
             "messages": list(messages),
             "stream": True,
             "stream_options": {"include_usage": True},
+            "thinking": {"type": self._config.thinking},
             "n": 1,
-            "max_tokens": self._config.max_output_tokens,
+            "max_tokens": self._config.request_max_output_tokens,
         }
         if allow_tools:
             request_body["tools"] = list(tools)
