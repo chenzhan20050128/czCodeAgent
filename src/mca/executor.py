@@ -151,6 +151,28 @@ class ToolExecutor:
                 )
 
         requires_approval = spec.side_effect not in {SideEffect.NONE, False}
+        if spec.side_effect is SideEffect.PLAN_EXIT and not self.state.plan_mode_active:
+            # exit_plan_mode stays registered so the tool catalog is stable, but
+            # it is only meaningful while plan mode is active.
+            return self._finish_requested_error(
+                state_call,
+                ToolStatus.FAILED,
+                "exit_plan_mode is only available while plan mode is active",
+            )
+        if self.state.plan_mode_active and spec.side_effect in {
+            SideEffect.WORKSPACE_WRITE,
+            SideEffect.SHELL,
+        }:
+            # Hard layer: while plan mode is active the runtime refuses every
+            # workspace-mutating tool before approval, so the model must research
+            # and exit plan mode before it can touch the workspace. exit_plan_mode
+            # (PLAN_EXIT) is deliberately exempt so the model can leave plan mode.
+            return self._finish_requested_error(
+                state_call,
+                ToolStatus.DENIED,
+                "plan mode is active; call exit_plan_mode to get the plan "
+                "approved before running write_file, edit_file, or bash",
+            )
         if requires_approval:
             assert prepared is not None
             try:
@@ -215,6 +237,17 @@ class ToolExecutor:
                 "arguments": arguments,
             },
         )
+        if spec.side_effect is SideEffect.PLAN_EXIT:
+            # Approval of exit_plan_mode is the user's decision to leave plan
+            # mode; record it as a durable fact between started and finished so
+            # the tool result reflects a completed transition.
+            self._append_and_reduce("plan_mode_set", {"active": False})
+            result = ToolResult.bounded(
+                title="exit_plan_mode",
+                output="plan approved; plan mode exited",
+            )
+            self._finish_started(state_call, result)
+            return result
         try:
             if spec.handler is not None:
                 raw_result = spec.handler(arguments)

@@ -163,6 +163,7 @@ class ModelClientTests(unittest.TestCase):
                 "model": "test-model",
                 "messages": MESSAGES,
                 "stream": True,
+                "stream_options": {"include_usage": True},
                 "n": 1,
                 "max_tokens": 8192,
                 "tools": TOOLS,
@@ -213,6 +214,7 @@ class ModelClientTests(unittest.TestCase):
                     "model": "test-model",
                     "messages": MESSAGES,
                     "stream": True,
+                    "stream_options": {"include_usage": True},
                     "n": 1,
                     "max_tokens": 8192,
                 }
@@ -301,6 +303,40 @@ class ModelClientTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, SamplingOutcome.COMPLETE_TEXT)
         self.assertEqual(result.reasoning_content, "think")
+
+    def test_captures_provider_usage_on_a_complete_text_response(self) -> None:
+        body = stream_body(
+            choice({"role": "assistant", "content": "hi"}),
+            {
+                "id": "response-1",
+                "object": "chat.completion.chunk",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {
+                    "prompt_tokens": 41,
+                    "completion_tokens": 5,
+                    "total_tokens": 46,
+                },
+            },
+        )
+        client, http_client, _ = self.make_client(lambda _: response(body))
+        self.addCleanup(http_client.close)
+
+        result = client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+        self.assertEqual(result.outcome, SamplingOutcome.COMPLETE_TEXT)
+        self.assertIsNotNone(result.usage)
+        self.assertEqual(result.usage.prompt_tokens, 41)
+        self.assertEqual(result.usage.total_tokens, 46)
+
+    def test_usage_is_none_when_provider_omits_it(self) -> None:
+        client, http_client, _ = self.make_client(
+            lambda _: response(text_body("hi"))
+        )
+        self.addCleanup(http_client.close)
+
+        result = client.sample(MESSAGES, TOOLS, allow_tools=True)
+
+        self.assertIsNone(result.usage)
 
     def test_classifies_empty_stop_length_and_content_filter(self) -> None:
         cases = (

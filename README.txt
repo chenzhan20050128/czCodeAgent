@@ -15,9 +15,10 @@ mca 是不依赖任何 Agent 框架/SDK、只用 Python 与 httpx 实现的命�
 - 六个工具：read_file、list_dir、grep、write_file、edit_file、bash
 - 交互审批、文件原子写、基于快照的 /undo
 - 自行解析 SSE 与 tool-call 流式参数、有界重试
-- 上下文自动/手动压缩（/compact），保留原始事实
-- --resume 会话恢复与崩溃对账
-- 只读会话观测：--list 列出会话、--show 回放某会话、REPL /status 看摘要与上下文预算；三者复用同一个 reducer，不加锁、不改盘、不需要 key，可在会话运行时安全查看
+- 上下文自动/手动压缩（/compact）；用 provider 真实 token usage 锚定压缩触发，只对新增消息做启发式增量，取 max 保证只会更早压缩
+- Plan Mode：先研究后动手。软层注入提示引导先规划，硬层在批准前直接拒绝 write_file/edit_file/bash，用 exit_plan_mode 复用审批网关获批退出
+- --resume 会话恢复与崩溃对账；只读会话观测：--list、--show、/status
+- 凭据只从环境变量读取，不入库、不落日志
 
 四、安装与运行
 python3 -m venv .venv
@@ -26,8 +27,9 @@ export MCA_API_KEY=你的key   （只从环境变量读取，不写入任何文�
 mca "修复 calculator.py 里失败的测试"   单次任务
 mca                                      多轮 REPL
 mca --resume <session-id>                恢复会话
+mca --plan                               以 plan 模式启动（先研究）
 mca --list / mca --show <session-id>     只读列出/回放会话
-REPL 命令：/help /status /compact /undo /exit
+REPL 命令：/help /status /plan[ off] /compact /undo /exit
 
 五、测试与演示
 .venv/bin/python -m unittest discover -s tests -v  （确定性测试，使用 fake model/SSE）

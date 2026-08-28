@@ -107,6 +107,15 @@ class SampledToolCall:
 
 
 @dataclass(frozen=True)
+class TokenUsage:
+    """Provider-reported token accounting for one completed response."""
+
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+
+@dataclass(frozen=True)
 class StreamResponse:
     """A complete stream candidate, before outcome classification."""
 
@@ -114,6 +123,7 @@ class StreamResponse:
     reasoning_content: str
     tool_calls: tuple[SampledToolCall, ...]
     finish_reason: str
+    usage: TokenUsage | None = None
 
 
 @dataclass
@@ -146,6 +156,7 @@ class StreamAssembler:
         self._reasoning_content: list[str] = []
         self._tool_calls: dict[int, _ToolCallParts] = {}
         self._finish_reason: str | None = None
+        self._usage: TokenUsage | None = None
         self._done = False
         self._finished = False
 
@@ -181,7 +192,7 @@ class StreamAssembler:
             "insufficient_system_resource",
         }:
             return StreamResponse(
-                content, reasoning_content, (), self._finish_reason
+                content, reasoning_content, (), self._finish_reason, self._usage
             )
 
         calls: list[SampledToolCall] = []
@@ -210,7 +221,7 @@ class StreamAssembler:
         if self._finish_reason == "tool_calls" and not calls:
             raise ProtocolError("tool_calls finish_reason has no tool calls")
         return StreamResponse(
-            content, reasoning_content, tuple(calls), self._finish_reason
+            content, reasoning_content, tuple(calls), self._finish_reason, self._usage
         )
 
     def _consume_payload(self, payload: str) -> None:
@@ -221,8 +232,6 @@ class StreamAssembler:
             return
         if self._done:
             raise ProtocolError("received data after [DONE]")
-        if self._finish_reason is not None:
-            raise ProtocolError("received data after terminal finish_reason")
 
         try:
             document = json.loads(payload)
@@ -230,9 +239,20 @@ class StreamAssembler:
             raise ProtocolError("SSE data is not valid JSON") from None
         if not isinstance(document, dict):
             raise ProtocolError("stream event must be a JSON object")
+        if "usage" in document and document["usage"] is not None:
+            self._usage = _parse_usage(document["usage"])
         choices = document.get("choices")
-        if not isinstance(choices, list) or not choices:
+        if not isinstance(choices, list):
+            raise ProtocolError("stream event choices must be an array")
+        if not choices:
+            # A provider may send a trailing usage-only chunk with no choices,
+            # even after the terminal finish_reason; its usage was captured
+            # above and there is nothing else to consume.
+            if self._usage is not None or "usage" in document:
+                return
             raise ProtocolError("stream event choices must contain an item")
+        if self._finish_reason is not None:
+            raise ProtocolError("received data after terminal finish_reason")
         choice = choices[0]
         if not isinstance(choice, dict):
             raise ProtocolError("stream choice must be an object")
@@ -324,6 +344,24 @@ def _merge_metadata(
     return incoming
 
 
+def _parse_usage(usage: object) -> TokenUsage:
+    if not isinstance(usage, dict):
+        raise ProtocolError("stream usage must be an object")
+    values: dict[str, int] = {}
+    for field_name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        value = usage.get(field_name)
+        if type(value) is not int or value < 0:
+            raise ProtocolError(
+                f"stream usage {field_name} must be a non-negative integer"
+            )
+        values[field_name] = value
+    return TokenUsage(
+        prompt_tokens=values["prompt_tokens"],
+        completion_tokens=values["completion_tokens"],
+        total_tokens=values["total_tokens"],
+    )
+
+
 __all__ = [
     "ProtocolError",
     "SSEDecoder",
@@ -331,4 +369,5 @@ __all__ = [
     "StreamAssembler",
     "StreamInterruptedError",
     "StreamResponse",
+    "TokenUsage",
 ]

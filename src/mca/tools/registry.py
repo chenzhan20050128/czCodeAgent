@@ -36,6 +36,7 @@ class SideEffect(str, Enum):
     NONE = "none"
     WORKSPACE_WRITE = "workspace_write"
     SHELL = "shell"
+    PLAN_EXIT = "plan_exit"
 
 
 @dataclass(frozen=True)

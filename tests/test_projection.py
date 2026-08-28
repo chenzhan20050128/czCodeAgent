@@ -20,6 +20,7 @@ from mca.projection import (
     PromptProjector,
     estimate_request_tokens,
     request_fits_budget,
+    usage_anchored_request_tokens,
     validate_conversation,
 )
 from mca.sse import StreamAssembler
@@ -215,6 +216,38 @@ class PromptProjectionTests(ProjectionTestCase):
             ],
         )
         self.assertNotIn("/stale/rollout/cwd", messages[0]["content"])
+
+    def test_plan_mode_active_injects_a_policy_into_the_system_message(self) -> None:
+        self.start_turn("Investigate the crash")
+        self.apply("plan_mode_set", {"active": True})
+        self.apply(
+            "assistant_accepted",
+            {"content": "Looking into it.", "finish_reason": "stop", "tool_calls": []},
+        )
+
+        messages = self.project()
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("plan mode", messages[0]["content"].lower())
+        # The plan_mode_set fact never becomes a chat message of its own.
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "user", "assistant"],
+        )
+        validate_conversation(messages)
+
+    def test_plan_mode_inactive_leaves_the_system_message_unchanged(self) -> None:
+        self.start_turn("Investigate the crash")
+        self.apply("plan_mode_set", {"active": True})
+        self.apply("plan_mode_set", {"active": False})
+        self.apply(
+            "assistant_accepted",
+            {"content": "Done.", "finish_reason": "stop", "tool_calls": []},
+        )
+
+        messages = self.project()
+
+        self.assertEqual(messages[0], self.system_message)
 
     def test_projects_multi_tool_path_with_provider_ids_and_ignores_runtime_events(
         self,
@@ -917,6 +950,67 @@ class RequestBudgetTests(unittest.TestCase):
                 context_window=estimate + 10,
                 reserved_output_tokens=7,
                 safety_margin=4,
+            )
+        )
+
+    def test_usage_anchor_raises_the_estimate_above_the_heuristic(self) -> None:
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "worked on it"},
+            {"role": "tool", "tool_call_id": "c1", "content": "result"},
+        ]
+        heuristic = estimate_request_tokens(messages)
+
+        anchored = usage_anchored_request_tokens(
+            messages, last_usage=(10_000, 20, 10_020)
+        )
+
+        self.assertGreater(anchored, heuristic)
+        tail = [messages[-1]]
+        self.assertEqual(
+            anchored, 10_020 + estimate_request_tokens(tail)
+        )
+
+    def test_usage_anchor_without_usage_matches_the_heuristic(self) -> None:
+        messages = [{"role": "user", "content": "task"}]
+        self.assertEqual(
+            usage_anchored_request_tokens(messages, last_usage=None),
+            estimate_request_tokens(messages),
+        )
+
+    def test_usage_anchor_never_drops_below_the_heuristic(self) -> None:
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "x" * 4_000},
+        ]
+        anchored = usage_anchored_request_tokens(
+            messages, last_usage=(1, 1, 2)
+        )
+        self.assertEqual(anchored, estimate_request_tokens(messages))
+
+    def test_budget_uses_the_usage_anchor_when_supplied(self) -> None:
+        messages = [
+            {"role": "user", "content": "task"},
+            {"role": "assistant", "content": "done"},
+        ]
+        heuristic = estimate_request_tokens(messages)
+
+        # Heuristic alone fits, but the real anchor is far larger and must not.
+        self.assertTrue(
+            request_fits_budget(
+                messages,
+                context_window=heuristic + 100,
+                reserved_output_tokens=0,
+                safety_margin=0,
+            )
+        )
+        self.assertFalse(
+            request_fits_budget(
+                messages,
+                context_window=heuristic + 100,
+                reserved_output_tokens=0,
+                safety_margin=0,
+                last_usage=(heuristic + 500, 5, heuristic + 505),
             )
         )
 

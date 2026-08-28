@@ -128,6 +128,7 @@ def tool_batch(
     content: str = "",
     reasoning: str = "",
     finish_reason: str = "tool_calls",
+    usage: object = None,
 ) -> SamplingResult:
     return SamplingResult(
         SamplingOutcome.VALID_TOOL_BATCH,
@@ -135,15 +136,17 @@ def tool_batch(
         reasoning_content=reasoning,
         tool_calls=calls,
         finish_reason=finish_reason,
+        usage=usage,
     )
 
 
-def text(content: str, *, reasoning: str = "") -> SamplingResult:
+def text(content: str, *, reasoning: str = "", usage: object = None) -> SamplingResult:
     return SamplingResult(
         SamplingOutcome.COMPLETE_TEXT,
         content=content,
         reasoning_content=reasoning,
         finish_reason="stop",
+        usage=usage,
     )
 
 
@@ -697,6 +700,54 @@ class AgentLoopTests(AgentLoopTestCase):
         self.assertEqual(result.error, "model returned an empty text response")
         self.assertEqual(len(runtime.model.requests), 1)
         self.assertEqual(len(self.terminal_events(runtime)), 1)
+
+    def test_provider_usage_is_recorded_as_a_fact_and_anchors_the_budget(
+        self,
+    ) -> None:
+        from mca.model import TokenUsage
+
+        runtime = self.make_runtime(
+            text(
+                "done",
+                usage=TokenUsage(
+                    prompt_tokens=321, completion_tokens=7, total_tokens=328
+                ),
+            ),
+        )
+
+        result = runtime.loop.run_turn("do it")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        assistant = next(
+            event
+            for event in runtime.store.load()
+            if event.type == "assistant_accepted"
+        )
+        self.assertEqual(
+            assistant.payload["usage"],
+            {"prompt_tokens": 321, "completion_tokens": 7, "total_tokens": 328},
+        )
+        self.assertEqual(runtime.state.last_usage, (321, 7, 328))
+
+    def test_budget_gate_receives_the_recorded_usage_anchor(self) -> None:
+        from mca.model import TokenUsage
+
+        runtime = self.make_runtime(
+            tool_batch(
+                SampledToolCall(0, "call-1", "function", "read", "{}"),
+                usage=TokenUsage(
+                    prompt_tokens=900, completion_tokens=4, total_tokens=904
+                ),
+            ),
+            text("second turn done"),
+            specs=[tool_spec("read", lambda _: ToolResult("read", "ok"))],
+        )
+
+        with patch("mca.agent.request_fits_budget", return_value=True) as fits:
+            runtime.loop.run_turn("do it")
+
+        anchors = [call.kwargs.get("last_usage") for call in fits.call_args_list]
+        self.assertIn((900, 4, 904), anchors)
 
     def test_context_overflow_compacts_once_then_reprojects_and_succeeds(self) -> None:
         compact_calls: list[str] = []

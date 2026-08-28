@@ -45,6 +45,8 @@ _REPL_HELP = (
     "Commands:\n"
     "  /help     show this help\n"
     "  /status   show session summary and context budget\n"
+    "  /plan     enter plan mode (research first; writes are blocked)\n"
+    "  /plan off leave plan mode\n"
     "  /compact  compact the conversation into a checkpoint\n"
     "  /undo     undo the managed file writes of the last finished turn\n"
     "  /exit     leave the REPL\n"
@@ -183,6 +185,8 @@ class _Runtime:
     def status(self) -> None:
         summary = summarize(self.state)
         self.console.line(summary.render_line())
+        if self.state.plan_mode_active:
+            self.console.line("[plan mode: ON]")
         try:
             messages = PromptProjector.project(
                 self.store.load(), self.state, _live_environment(self.workspace)
@@ -194,6 +198,16 @@ class _Runtime:
             )
         except Exception:
             self.console.line("[context estimate unavailable at this boundary]")
+
+    def set_plan_mode(self, active: bool) -> None:
+        if self.state.plan_mode_active == active:
+            self.console.line(
+                f"[plan mode already {'on' if active else 'off'}]"
+            )
+            return
+        event = self.store.append("plan_mode_set", {"active": active})
+        SessionReducer.apply(self.state, event)
+        self.console.line(f"[plan mode {'on' if active else 'off'}]")
 
 
 def _last_finished_turn(state: SessionState) -> str | None:
@@ -323,6 +337,12 @@ def _repl(runtime: _Runtime) -> int:
         if command == "/status":
             runtime.status()
             continue
+        if command == "/plan" or command == "/plan on":
+            runtime.set_plan_mode(True)
+            continue
+        if command == "/plan off":
+            runtime.set_plan_mode(False)
+            continue
         if command == "/compact":
             runtime.compact_now()
             continue
@@ -418,6 +438,11 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="skip interactive approval (path and command checks stay on)",
     )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="start in plan mode: research first; writes are blocked until approved",
+    )
     return parser
 
 
@@ -474,6 +499,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         if runtime.state.recovery_blocked:
             console.line("[session is blocked until recovery is reconciled]")
             return 1
+        if args.plan and not runtime.state.plan_mode_active:
+            runtime.set_plan_mode(True)
         if args.prompt is not None:
             return _run_once(runtime, args.prompt)
         return _repl(runtime)

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..approval import ApprovalRequest
 from .filesystem import FileSystemTools
+from .plan import prepare_exit_plan_mode
 from .registry import (
     SideEffect,
     ToolRegistry,
@@ -166,6 +167,27 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             approval_renderer=lambda prepared: ApprovalRequest.for_shell(
                 command=prepared.command, cwd=prepared.cwd
             ).render(),
+        ),
+        ToolSpec(
+            name="exit_plan_mode",
+            description=(
+                "Use only in plan mode. Present your complete plan as markdown "
+                "starting with a # heading and request approval to leave plan "
+                "mode. Approval lets you carry out the plan from the next step; "
+                "denial keeps plan mode on with the user's feedback."
+            ),
+            schema={
+                "type": "object",
+                "properties": {"plan": {"type": "string", "minLength": 1}},
+                "required": ["plan"],
+                "additionalProperties": False,
+            },
+            prepare_handler=prepare_exit_plan_mode,
+            side_effect=SideEffect.PLAN_EXIT,
+            approval_renderer=lambda prepared: (
+                "Tool: exit_plan_mode\nApprove this plan and leave plan mode?\n"
+                "Plan:\n" + prepared.plan
+            ),
         ),
     ]
     return ToolRegistry(specs, workspace=Path(workspace))

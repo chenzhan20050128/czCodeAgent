@@ -396,6 +396,8 @@ class SessionState:
     assistant_events: list[Event] = field(default_factory=list)
     events: list[Event] = field(default_factory=list)
     recovery_blocked: bool = False
+    last_usage: tuple[int, int, int] | None = None
+    plan_mode_active: bool = False
 
 
 def _payload_string(
@@ -442,6 +444,28 @@ def _normalized_created_directories(value: object) -> tuple[str, ...]:
     ):
         raise DomainError("created_directories must be an array of non-empty strings")
     return tuple(value)
+
+
+def _parse_usage_payload(value: object) -> tuple[int, int, int] | None:
+    """Validate optional provider token usage recorded on an assistant fact."""
+
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise DomainError("usage must be an object or null")
+    fields = set(value)
+    expected = {"prompt_tokens", "completion_tokens", "total_tokens"}
+    if fields != expected:
+        raise DomainError(
+            "usage must have exactly prompt_tokens, completion_tokens, total_tokens"
+        )
+    parsed: list[int] = []
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        token_count = value[key]
+        if type(token_count) is not int or token_count < 0:
+            raise DomainError(f"usage {key} must be a non-negative integer")
+        parsed.append(token_count)
+    return (parsed[0], parsed[1], parsed[2])
 
 
 def reduce_undo_status(statuses: Iterable[str]) -> str:
@@ -602,11 +626,14 @@ class SessionReducer:
             raise DomainError(
                 "assistant reasoning_content must be a string"
             )
+        usage = _parse_usage_payload(event.payload.get("usage"))
         for call in pending:
             if call.call_key in state.tool_calls:
                 raise DomainError(f"duplicate internal tool call key: {call.call_key}")
             state.tool_calls[call.call_key] = call
         state.assistant_events.append(event)
+        if usage is not None:
+            state.last_usage = usage
 
     @staticmethod
     def _apply_approval_decided(state: SessionState, event: Event) -> None:
@@ -1018,6 +1045,16 @@ class SessionReducer:
                 f"undo status {status!r} does not match file results {expected_status!r}"
             )
         state.undo_results[turn_id] = event
+
+    @staticmethod
+    def _apply_plan_mode_set(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(state, "set plan mode")
+        if set(event.payload) != {"active"}:
+            raise DomainError("plan_mode_set payload must contain only active")
+        active = event.payload.get("active")
+        if type(active) is not bool:
+            raise DomainError("plan_mode_set active must be a boolean")
+        state.plan_mode_active = active
 
     @staticmethod
     def _require_active_turn(state: SessionState) -> str:

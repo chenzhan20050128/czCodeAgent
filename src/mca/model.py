@@ -18,6 +18,7 @@ from .sse import (
     SampledToolCall,
     StreamAssembler,
     StreamInterruptedError,
+    TokenUsage,
 )
 
 
@@ -32,6 +33,7 @@ class SamplingResult:
     tool_calls: tuple[SampledToolCall, ...] = ()
     finish_reason: str | None = None
     error: str | None = None
+    usage: TokenUsage | None = None
 
 
 class ModelClient:
@@ -99,6 +101,7 @@ class ModelClient:
             "model": self._config.model,
             "messages": list(messages),
             "stream": True,
+            "stream_options": {"include_usage": True},
             "n": 1,
             "max_tokens": self._config.max_output_tokens,
         }
@@ -232,6 +235,7 @@ def _classify(candidate: Any) -> SamplingResult:
             content=candidate.content,
             reasoning_content=candidate.reasoning_content,
             finish_reason=candidate.finish_reason,
+            usage=candidate.usage,
         )
     if candidate.finish_reason == "content_filter":
         return SamplingResult(
@@ -239,6 +243,7 @@ def _classify(candidate: Any) -> SamplingResult:
             content=candidate.content,
             reasoning_content=candidate.reasoning_content,
             finish_reason=candidate.finish_reason,
+            usage=candidate.usage,
         )
     outcome = (
         SamplingOutcome.VALID_TOOL_BATCH
@@ -251,6 +256,7 @@ def _classify(candidate: Any) -> SamplingResult:
         reasoning_content=candidate.reasoning_content,
         tool_calls=candidate.tool_calls,
         finish_reason=candidate.finish_reason,
+        usage=candidate.usage,
     )
 
 
@@ -331,4 +337,4 @@ def _notify_invalidation(callback: Callable[[], None] | None) -> None:
         pass
 
 
-__all__ = ["ModelClient", "SampledToolCall", "SamplingResult"]
+__all__ = ["ModelClient", "SampledToolCall", "SamplingResult", "TokenUsage"]

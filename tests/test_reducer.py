@@ -194,12 +194,101 @@ class SessionReducerTests(ReducerTestCase):
         self.assertEqual(self.state.context_window, 65_536)
         self.assertEqual(self.state.last_seq, 1)
 
+    def test_assistant_accepted_folds_optional_provider_usage(self) -> None:
+        self.start_turn()
+        self.assertIsNone(self.state.last_usage)
+        self.apply(
+            "assistant_accepted",
+            {
+                "content": "done",
+                "tool_calls": [],
+                "usage": {
+                    "prompt_tokens": 120,
+                    "completion_tokens": 8,
+                    "total_tokens": 128,
+                },
+            },
+        )
+
+        self.assertEqual(self.state.last_usage, (120, 8, 128))
+
+    def test_assistant_accepted_rejects_malformed_usage(self) -> None:
+        self.start_turn()
+        replay = SessionReducer.replay(self.state.events)
+        invalid = Event.create(
+            seq=replay.last_seq + 1,
+            session_id=self.session_id,
+            event_type="assistant_accepted",
+            payload={
+                "content": "x",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": -1, "completion_tokens": 1, "total_tokens": 2},
+            },
+        )
+        with self.assertRaisesRegex(DomainError, "usage"):
+            SessionReducer.apply(replay, invalid)
+
+    def test_later_usage_replaces_the_earlier_anchor(self) -> None:
+        self.start_turn()
+        self.apply(
+            "assistant_accepted",
+            {
+                "content": None,
+                "tool_calls": [self.tool("call-1")],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 5, "total_tokens": 105},
+            },
+        )
+        self.apply("tool_started", {"call_id": "call-1"})
+        self.apply(
+            "tool_finished",
+            {"call_id": "call-1", "status": "succeeded", "result": "ok"},
+        )
+        self.apply(
+            "assistant_accepted",
+            {
+                "content": "final",
+                "tool_calls": [],
+                "usage": {"prompt_tokens": 210, "completion_tokens": 9, "total_tokens": 219},
+            },
+        )
+
+        self.assertEqual(self.state.last_usage, (210, 9, 219))
+
     def test_turn_started_sets_the_active_turn(self) -> None:
         self.start_turn()
 
         self.assertEqual(self.state.active_turn_id, self.turn_id)
         self.assertEqual(self.state.turns[self.turn_id], TurnStatus.ACTIVE)
         self.assertEqual(self.state.turn_inputs[self.turn_id], "fix the tests")
+
+    def test_plan_mode_set_folds_last_wins_across_and_within_turns(self) -> None:
+        self.create_session()
+        # Between turns: a plan_mode_set may arrive with no active turn.
+        self.apply("plan_mode_set", {"active": True})
+        self.assertIs(self.state.plan_mode_active, True)
+        self.apply(
+            "turn_started",
+            {"turn_id": self.turn_id, "user_input": "research first"},
+        )
+        # Within a turn: the last value wins.
+        self.apply("plan_mode_set", {"active": False})
+        self.assertIs(self.state.plan_mode_active, False)
+
+    def test_plan_mode_set_requires_a_boolean_active(self) -> None:
+        self.create_session()
+        replay = SessionReducer.replay(self.state.events)
+        for bad in ({"active": "yes"}, {"active": 1}, {}):
+            with self.subTest(payload=bad):
+                invalid = Event.create(
+                    seq=replay.last_seq + 1,
+                    session_id=self.session_id,
+                    event_type="plan_mode_set",
+                    payload=bad,
+                )
+                with self.assertRaisesRegex(DomainError, "active"):
+                    SessionReducer.apply(
+                        SessionReducer.replay(self.state.events), invalid
+                    )
 
     def test_assistant_accepted_registers_all_requested_calls_in_order(self) -> None:
         self.start_turn()

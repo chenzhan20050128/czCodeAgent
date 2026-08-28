@@ -149,8 +149,20 @@ def _environment(value: ProjectionEnvironment | Mapping[str, Any]) -> Projection
     )
 
 
+PLAN_MODE_POLICY = (
+    "Plan mode is active. First research the task using read-only tools "
+    "(read_file, list_dir, grep) and present a concrete plan. Do not modify "
+    "files or run state-changing commands until the plan is approved: the "
+    "runtime will refuse write_file, edit_file, and bash while plan mode is "
+    "active. Call exit_plan_mode with the complete plan to request approval."
+)
+
+
 def _system_message(
-    environment: ProjectionEnvironment, *, checkpoint_summary: str | None
+    environment: ProjectionEnvironment,
+    *,
+    checkpoint_summary: str | None,
+    plan_mode_active: bool = False,
 ) -> dict[str, str]:
     live_environment = json.dumps(
         {
@@ -171,6 +183,8 @@ def _system_message(
         "Current live environment (supplied for this request, not recovered "
         f"from the rollout): {live_environment}"
     )
+    if plan_mode_active:
+        content += f"\n{PLAN_MODE_POLICY}"
     if checkpoint_summary:
         content += f"\nCompacted conversation summary:\n{checkpoint_summary}"
     return {"role": "system", "content": content}
@@ -395,7 +409,11 @@ class PromptProjector:
             baseline = _plain_json(replacement)
 
         messages: list[dict[str, Any]] = [
-            _system_message(current_environment, checkpoint_summary=summary)
+            _system_message(
+                current_environment,
+                checkpoint_summary=summary,
+                plan_mode_active=state.plan_mode_active,
+            )
         ]
         messages.extend(baseline)
         call_tracker = _EventCallTracker()
@@ -461,6 +479,7 @@ def request_fits_budget(
     context_window: int,
     reserved_output_tokens: int,
     safety_margin: int,
+    last_usage: tuple[int, int, int] | None = None,
 ) -> bool:
     """Return whether estimated input fits after output and safety reserves."""
 
@@ -474,4 +493,49 @@ def request_fits_budget(
             qualifier = "non-negative" if allow_zero else "positive"
             raise ProjectionError(f"{name} must be a {qualifier} integer")
     available_input = context_window - reserved_output_tokens - safety_margin
-    return estimate_request_tokens(messages, tool_schemas) <= available_input
+    estimate = usage_anchored_request_tokens(
+        messages, tool_schemas, last_usage=last_usage
+    )
+    return estimate <= available_input
+
+
+def usage_anchored_request_tokens(
+    messages: Sequence[Mapping[str, Any]],
+    tool_schemas: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    last_usage: tuple[int, int, int] | None = None,
+) -> int:
+    """Estimate request tokens, anchored on the last real provider usage.
+
+    The provider's ``total_tokens`` already priced the system prompt, tool
+    schemas, and history up to and including the last assistant reply.  Only
+    the messages appended after that reply (tool results, a new user turn) are
+    unpriced, so they are added with the heuristic.  The result is never below
+    the pure heuristic, so anchoring can only trigger compaction earlier, never
+    skip it.
+    """
+
+    heuristic = estimate_request_tokens(messages, tool_schemas)
+    if last_usage is None:
+        return heuristic
+    if (
+        not isinstance(last_usage, tuple)
+        or len(last_usage) != 3
+        or any(type(item) is not int or item < 0 for item in last_usage)
+    ):
+        raise ProjectionError(
+            "last_usage must be three non-negative integers or None"
+        )
+    tail = _messages_after_last_assistant(messages)
+    tail_schemas = tool_schemas if tail is messages else None
+    anchored = last_usage[2] + estimate_request_tokens(tail, tail_schemas)
+    return max(heuristic, anchored)
+
+
+def _messages_after_last_assistant(
+    messages: Sequence[Mapping[str, Any]],
+) -> Sequence[Mapping[str, Any]]:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "assistant":
+            return messages[index + 1 :]
+    return messages

@@ -33,6 +33,17 @@ def event(delta: object, finish_reason: object = None) -> bytes:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
 
 
+def finish_with_usage(usage: object, finish_reason: str = "stop") -> bytes:
+    payload = {
+        "id": "response-1",
+        "choices": [
+            {"index": 0, "delta": {}, "finish_reason": finish_reason}
+        ],
+        "usage": usage,
+    }
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+
 DONE = b"data: [DONE]\n\n"
 
 
@@ -315,6 +326,78 @@ class StreamAssemblerTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ProtocolError, "JSON"):
             assembler.feed(b"data: {not-json}\n\n")
+
+
+class StreamUsageTests(unittest.TestCase):
+    def test_usage_rides_on_the_final_finish_chunk(self) -> None:
+        assembler = StreamAssembler()
+        assembler.feed(event({"role": "assistant", "content": "hi"}))
+        assembler.feed(
+            finish_with_usage(
+                {"prompt_tokens": 17, "completion_tokens": 9, "total_tokens": 26}
+            )
+        )
+        assembler.feed(DONE)
+
+        response = assembler.finish()
+
+        self.assertEqual(response.content, "hi")
+        self.assertIsNotNone(response.usage)
+        self.assertEqual(response.usage.prompt_tokens, 17)
+        self.assertEqual(response.usage.completion_tokens, 9)
+        self.assertEqual(response.usage.total_tokens, 26)
+
+    def test_usage_absent_leaves_usage_none(self) -> None:
+        assembler = StreamAssembler()
+        assembler.feed(event({"content": "hi"}))
+        assembler.feed(event({}, "stop"))
+        assembler.feed(DONE)
+
+        self.assertIsNone(assembler.finish().usage)
+
+    def test_null_usage_on_intermediate_chunks_is_ignored(self) -> None:
+        assembler = StreamAssembler()
+        payload = {
+            "id": "response-1",
+            "choices": [{"index": 0, "delta": {"content": "a"}, "finish_reason": None}],
+            "usage": None,
+        }
+        assembler.feed(f"data: {json.dumps(payload)}\n\n".encode())
+        assembler.feed(
+            finish_with_usage(
+                {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+            )
+        )
+        assembler.feed(DONE)
+
+        self.assertEqual(assembler.finish().usage.total_tokens, 4)
+
+    def test_usage_only_chunk_with_empty_choices_is_tolerated(self) -> None:
+        assembler = StreamAssembler()
+        assembler.feed(event({"content": "hi"}))
+        assembler.feed(event({}, "stop"))
+        usage_only = {
+            "id": "response-1",
+            "choices": [],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7},
+        }
+        assembler.feed(f"data: {json.dumps(usage_only)}\n\n".encode())
+        assembler.feed(DONE)
+
+        response = assembler.finish()
+        self.assertEqual(response.content, "hi")
+        self.assertEqual(response.usage.total_tokens, 7)
+
+    def test_malformed_usage_is_a_protocol_error(self) -> None:
+        assembler = StreamAssembler()
+        assembler.feed(event({"content": "hi"}))
+        bad = {
+            "id": "response-1",
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": "x", "completion_tokens": 1, "total_tokens": 2},
+        }
+        with self.assertRaisesRegex(ProtocolError, "usage"):
+            assembler.feed(f"data: {json.dumps(bad)}\n\n".encode())
 
 
 if __name__ == "__main__":

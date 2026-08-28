@@ -24,7 +24,7 @@ sys.path.insert(0, str(SRC_ROOT))
 
 from mca import cli
 from mca.domain import SamplingOutcome, SessionReducer
-from mca.model import SamplingResult
+from mca.model import SampledToolCall, SamplingResult
 from mca.store import RolloutStore
 
 
@@ -232,6 +232,35 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("tokens", output)
         self.assertIn("last=completed", output)
+
+    def test_repl_plan_command_toggles_plan_mode(self) -> None:
+        code, output = self._run(
+            [], ScriptedModel(), stdin="/plan\n/status\n/plan off\n/exit\n"
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("plan mode on", output.lower())
+        self.assertIn("plan mode: on", output.lower())
+        self.assertIn("plan mode off", output.lower())
+
+    def test_plan_flag_starts_in_plan_mode_and_blocks_writes(self) -> None:
+        # In plan mode the model asks to write, the runtime refuses without
+        # approval, and the second sample gives a text answer.
+        write_call = SamplingResult(
+            SamplingOutcome.VALID_TOOL_BATCH,
+            tool_calls=(
+                SampledToolCall(
+                    0, "c1", "function", "write_file",
+                    '{"path":"x.txt","content":"hi"}',
+                ),
+            ),
+            finish_reason="tool_calls",
+        )
+        model = ScriptedModel(write_call, _text("here is my plan"))
+        code, output = self._run(["--plan", "build a thing"], model)
+
+        self.assertEqual(code, 0)
+        self.assertFalse((self.workspace / "x.txt").exists())
+        self.assertIn("plan mode on", output.lower())
 
 
 if __name__ == "__main__":

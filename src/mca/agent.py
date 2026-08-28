@@ -440,6 +440,7 @@ class AgentLoop:
             context_window=self.config.context_window,
             reserved_output_tokens=self.config.max_output_tokens,
             safety_margin=REQUEST_SAFETY_MARGIN,
+            last_usage=self.state.last_usage,
         )
 
     def _compact_once(self) -> bool:
@@ -506,6 +507,7 @@ class AgentLoop:
                 "reasoning_content": sampled.reasoning_content,
                 "finish_reason": sampled.finish_reason,
                 "tool_calls": call_documents,
+                "usage": _usage_payload(sampled.usage),
             },
         )
         return self._accepted_calls(event, sampled) if include_calls else ()
@@ -741,6 +743,18 @@ class AgentLoop:
             ) from error
         for state_field in fields(SessionState):
             setattr(self.state, state_field.name, getattr(synchronized, state_field.name))
+
+
+def _usage_payload(usage: object) -> dict[str, int] | None:
+    """Convert an optional provider TokenUsage into a durable fact payload."""
+
+    if usage is None:
+        return None
+    return {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "total_tokens": usage.total_tokens,
+    }
 
 
 __all__ = [

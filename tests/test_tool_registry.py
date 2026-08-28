@@ -214,14 +214,22 @@ class ToolResultTruncationTests(unittest.TestCase):
 
 
 class BuiltinToolSpecTests(unittest.TestCase):
-    def test_registry_contains_exactly_the_six_documented_tools(self) -> None:
+    def test_registry_contains_the_documented_tools_and_plan_exit(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             registry = create_tool_registry(temporary)
 
         schemas = registry.provider_schemas()
         self.assertEqual(
             [schema["function"]["name"] for schema in schemas],
-            ["read_file", "list_dir", "grep", "write_file", "edit_file", "bash"],
+            [
+                "read_file",
+                "list_dir",
+                "grep",
+                "write_file",
+                "edit_file",
+                "bash",
+                "exit_plan_mode",
+            ],
         )
         for schema in schemas:
             function = schema["function"]
