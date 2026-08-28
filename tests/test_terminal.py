@@ -127,6 +127,28 @@ class MultiLineBufferTests(unittest.TestCase):
 
         self.assertEqual(value, "x")
 
+    def test_raw_reader_decodes_a_multibyte_utf8_paste_incrementally(self) -> None:
+        class TtyInput:
+            def isatty(self):
+                return True
+
+            def fileno(self):
+                return 7
+
+        # "你" arrives as three separate os.read() bytes, exactly as it does
+        # in raw terminal mode. It must not become three replacement glyphs.
+        with patch("mca.terminal.termios.tcgetattr", return_value=["old"]), patch(
+            "mca.terminal.termios.tcsetattr"
+        ), patch("mca.terminal.tty.setraw"), patch(
+            "mca.terminal.os.read",
+            side_effect=[b"\xe4", b"\xbd", b"\xa0", b"\x13"],
+        ):
+            value = read_multiline_prompt(
+                input_stream=TtyInput(), output_stream=StringIO()
+            )
+
+        self.assertEqual(value, "你")
+
 
 if __name__ == "__main__":
     unittest.main()

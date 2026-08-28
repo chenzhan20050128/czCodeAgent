@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import sys
 import termios
@@ -112,52 +113,21 @@ def read_multiline_prompt(
         # documented Ctrl+S fallback remains available.
         _write(output_stream, "\x1b[>4;2m\x1b[>1u")
         escape = ""
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while True:
             raw = os.read(descriptor, 1)
             if not raw:
                 raise EOFError
-            character = raw.decode("utf-8", errors="replace")
-            if escape:
-                escape += character
-                if is_ctrl_enter_sequence(escape):
-                    _write(output_stream, "\r\n")
-                    return buffer.value.strip()
-                candidates = ("\x1b[13;5u", "\x1b[27;5;13~", "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D")
-                if escape in {"\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"}:
-                    escape = ""
-                    continue
-                if any(candidate.startswith(escape) for candidate in candidates):
-                    continue
-                buffer.insert(escape)
-                _write(output_stream, escape)
-                escape = ""
+            decoded = decoder.decode(raw, final=False)
+            if not decoded:
                 continue
-            if character == "\x1b":
-                escape = character
-                continue
-            if character == "\x13":
-                _write(output_stream, "\r\n")
-                return buffer.value.strip()
-            if character == "\x03":
-                raise KeyboardInterrupt
-            if character == "\x04" and not buffer.value:
-                raise EOFError
-            if character in {"\x7f", "\x08"}:
-                if buffer.value:
-                    was_newline = buffer.value.endswith("\n")
-                    buffer.backspace()
-                    if was_newline:
-                        _write(output_stream, "\r\x1b[2K" + prompt + buffer.value.rsplit("\n", 1)[-1])
-                    else:
-                        _write(output_stream, "\b \b")
-                continue
-            if character in {"\r", "\n"}:
-                buffer.newline()
-                _write(output_stream, "\r\n" + continuation)
-                continue
-            if ord(character) >= 32:
-                buffer.insert(character)
-                _write(output_stream, character)
+            for character in decoded:
+                submitted = _consume_character(
+                    character, buffer, output_stream, prompt, continuation, escape
+                )
+                escape = submitted.escape
+                if submitted.value is not None:
+                    return submitted.value
     finally:
         # Restore the terminal's ordinary keyboard protocol before returning
         # control to prompts, shells, or approval input.
@@ -168,6 +138,63 @@ def read_multiline_prompt(
 def _write(stream: object, value: str) -> None:
     stream.write(value)
     stream.flush()
+
+
+class _EditResult:
+    def __init__(self, escape: str, value: str | None = None) -> None:
+        self.escape = escape
+        self.value = value
+
+
+def _consume_character(
+    character: str,
+    buffer: MultiLineBuffer,
+    output_stream: object,
+    prompt: str,
+    continuation: str,
+    escape: str,
+) -> _EditResult:
+    """Consume one decoded Unicode character from the raw terminal."""
+
+    if escape:
+        escape += character
+        if is_ctrl_enter_sequence(escape):
+            _write(output_stream, "\r\n")
+            return _EditResult("", buffer.value.strip())
+        candidates = ("\x1b[13;5u", "\x1b[27;5;13~", "\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D")
+        if escape in {"\x1b[A", "\x1b[B", "\x1b[C", "\x1b[D"}:
+            return _EditResult("")
+        if any(candidate.startswith(escape) for candidate in candidates):
+            return _EditResult(escape)
+        buffer.insert(escape)
+        _write(output_stream, escape)
+        return _EditResult("")
+    if character == "\x1b":
+        return _EditResult(character)
+    if character == "\x13":
+        _write(output_stream, "\r\n")
+        return _EditResult("", buffer.value.strip())
+    if character == "\x03":
+        raise KeyboardInterrupt
+    if character == "\x04" and not buffer.value:
+        raise EOFError
+    if character in {"\x7f", "\x08"}:
+        if buffer.value:
+            was_newline = buffer.value.endswith("\n")
+            buffer.backspace()
+            if was_newline:
+                _write(output_stream, "\r\x1b[2K" + prompt + buffer.value.rsplit("\n", 1)[-1])
+            else:
+                _write(output_stream, "\b \b")
+        return _EditResult("")
+    if character in {"\r", "\n"}:
+        buffer.newline()
+        _write(output_stream, "\r\n" + continuation)
+        return _EditResult("")
+    if ord(character) >= 32:
+        buffer.insert(character)
+        _write(output_stream, character)
+    return _EditResult("")
 
 
 __all__ = [
