@@ -25,6 +25,7 @@ python3 -m venv .venv
 .venv/bin/pip install -e .
 export MCA_API_KEY=你的key   （只从环境变量读取，不写入任何文件）
 默认按 DeepSeek V4 Flash 的 1M 上下文运行，本地单次输出预算 512K，默认开启 thinking；DeepSeek API 实际最大输出为 384K，mca 会安全钳制请求并按真实 384K 预留上下文。可通过 MCA_CONTEXT_WINDOW、MCA_MAX_OUTPUT_TOKENS、MCA_THINKING 覆盖。
+长程工程任务默认最多 64 个工具批次轮次，单请求 timeout 600 秒、总重试预算 900 秒；可用 MCA_MAX_STEPS、MCA_REQUEST_TIMEOUT、MCA_RETRY_BUDGET_SECONDS 覆盖。
 mca "修复 calculator.py 里失败的测试"   单次任务
 mca                                      多轮 REPL
 mca --resume <session-id>                恢复会话
@@ -33,6 +34,7 @@ mca --list / mca --show <session-id>     只读列出/回放会话
 REPL 命令：/help /status /plan[ off] /compact /undo /exit
 直接输入 mca 后，第一条任务可写：workspace: /绝对项目路径 | 任务内容。此时才在目标目录建立会话，文件工具、bash 与 /undo 都被锁在该目录；首轮之后不允许切换路径。
 交互 REPL 支持多行任务：Enter 只换行，Ctrl+Enter 提交整个任务；部分终端会把 Ctrl+Enter 编码成普通 Enter，此时用 Ctrl+S 提交。终端使用低饱和蓝灰、靛紫、琥珀、青绿、砖红的语义配色；NO_COLOR、TERM=dumb 或非终端输出自动退化为纯文本。
+DeepSeek 长思考请求默认可等待 600 秒，总重试预算 900 秒；终端短时间没有文字不代表请求失败，等待当前 Turn 返回后再使用 /status 或 --show 查看事实日志。
 
 五、测试与演示
 .venv/bin/python -m unittest discover -s tests -v  （确定性测试，使用 fake model/SSE）

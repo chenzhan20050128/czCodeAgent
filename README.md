@@ -71,6 +71,9 @@ Override deliberately:
 export MCA_CONTEXT_WINDOW=1000000
 export MCA_MAX_OUTPUT_TOKENS=512000
 export MCA_THINKING=enabled
+export MCA_MAX_STEPS=64
+export MCA_REQUEST_TIMEOUT=600
+export MCA_RETRY_BUDGET_SECONDS=900
 ```
 
 ## Use
@@ -105,6 +108,11 @@ Ctrl+Enter exactly like ordinary Enter; in that case use **Ctrl+S** to submit.
 The prompt prints this fallback behavior in `/help`. Colors use a muted
 blue/indigo/amber/teal/brick semantic palette and automatically turn off when
 stdout is not a TTY, `TERM=dumb`, or `NO_COLOR` is set.
+
+For DeepSeek's long thinking turns, the default request timeout is 600 seconds
+and the retry budget is 900 seconds. Do not treat a quiet terminal during a
+thinking request as a failed request; use `/status` after the turn returns, or
+inspect the session with `mca --show <session-id> --workspace <project>`.
 
 REPL commands: `/help`, `/status`, `/plan [off]`, `/compact`, `/undo`, `/exit`.
 
