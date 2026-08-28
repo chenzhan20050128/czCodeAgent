@@ -14,9 +14,10 @@ if TYPE_CHECKING:
 
 
 class ApprovalDecision(str, Enum):
-    """The complete approval vocabulary; authorization is never cached."""
+    """A one-call or session-scoped user authorization decision."""
 
     ALLOW_ONCE = "allow_once"
+    ALLOW_SESSION = "allow_session"
     DENY = "deny"
 
 
@@ -111,7 +112,7 @@ def _escape_terminal_text(value: str, *, preserve_newlines: bool = False) -> str
 
 
 class InteractiveApprover:
-    """Ask once per request and deny every non-explicit affirmative answer."""
+    """Ask once per request, with an explicit current-session always mode."""
 
     def __init__(
         self,
@@ -123,20 +124,31 @@ class InteractiveApprover:
         self._yolo = bool(yolo)
         self._input = input_fn
         self._output = output_fn
+        self._session_always = False
 
     def decide(self, request: ApprovalRequest) -> ApprovalDecision:
         if self._yolo:
             return ApprovalDecision.ALLOW_ONCE
+        if self._session_always:
+            return ApprovalDecision.ALLOW_SESSION
         self._output(request.render())
         try:
-            answer = self._input("Allow once? [y/N] ")
+            answer = self._input("Allow once? [y/N/always] ")
         except EOFError:
             return ApprovalDecision.DENY
         except KeyboardInterrupt:
             raise ApprovalInterrupted from None
         if answer.strip().lower() in {"y", "yes"}:
             return ApprovalDecision.ALLOW_ONCE
+        if answer.strip().lower() == "always":
+            self._session_always = True
+            return ApprovalDecision.ALLOW_SESSION
         return ApprovalDecision.DENY
+
+    def reset_session_approval(self) -> None:
+        """Return this interactive approver to one-time confirmation mode."""
+
+        self._session_always = False
 
 
 __all__ = [

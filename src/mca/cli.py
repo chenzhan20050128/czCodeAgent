@@ -18,7 +18,7 @@ from datetime import date as _date
 from pathlib import Path
 
 from .agent import AgentLoop, RecoveryBlockedError
-from .approval import InteractiveApprover
+from .approval import InteractiveApprover, _escape_terminal_text
 from .compact import CompactionError, SessionCompactor
 from .config import Config
 from .domain import SessionReducer, SessionState, ToolStatus, TurnStatus
@@ -50,6 +50,7 @@ _REPL_HELP = (
     "  /plan off leave plan mode\n"
     "  /compact  compact the conversation into a checkpoint\n"
     "  /undo     undo the managed file writes of the last finished turn\n"
+    "  /approval reset  return from session always approval to prompts\n"
     "  /exit     leave the REPL\n"
     "Enter inserts a new line. Ctrl+Enter submits; Ctrl+S is the fallback."
 )
@@ -84,6 +85,7 @@ class _Console:
     def __init__(self, *, verbose: bool, color: bool | None = None) -> None:
         self.verbose = verbose
         self._streaming = False
+        self._reasoning_streaming = False
         enabled = sys.stdout.isatty() if color is None else color
         self.theme = TerminalTheme.auto(isatty=enabled)
 
@@ -101,6 +103,9 @@ class _Console:
     def stream(self, delta: str) -> None:
         if not delta:
             return
+        if self._reasoning_streaming:
+            sys.stdout.write("\n")
+            self._reasoning_streaming = False
         sys.stdout.write(self.theme.style(delta, "model"))
         sys.stdout.flush()
         self._streaming = True
@@ -110,6 +115,32 @@ class _Console:
             sys.stdout.write("\n" + self.theme.style("[output discarded]\n", "failure"))
             sys.stdout.flush()
             self._streaming = False
+
+    def reasoning(self, delta: str) -> None:
+        """Show only provider-supplied reasoning deltas in a muted stream."""
+
+        if not delta:
+            return
+        if self._streaming:
+            sys.stdout.write("\n")
+            self._streaming = False
+        if not self._reasoning_streaming:
+            sys.stdout.write(self.theme.style("[thinking] ", "muted"))
+            self._reasoning_streaming = True
+        sys.stdout.write(self.theme.style(_escape_terminal_text(delta), "muted"))
+        sys.stdout.flush()
+
+    def tool_calls(self, calls: Sequence[object]) -> None:
+        if self._reasoning_streaming or self._streaming:
+            sys.stdout.write("\n")
+            self._reasoning_streaming = False
+            self._streaming = False
+        for call in calls:
+            name = _escape_terminal_text(str(getattr(call, "name", "tool")))
+            arguments = _escape_terminal_text(str(getattr(call, "arguments", "")))
+            if len(arguments) > 220:
+                arguments = arguments[:200] + " ... [truncated]"
+            self.badge("tool call", f"{name} {arguments}", role="tool")
 
 
 class _Runtime:
@@ -136,6 +167,7 @@ class _Runtime:
             output_fn=lambda rendered: console.badge("approval", rendered, role="approval"),
             input_fn=lambda prompt: input(console.theme.style(prompt, "approval")),
         )
+        self.approver = approver
         self.executor = ToolExecutor(
             registry=registry,
             store=store,
@@ -159,6 +191,8 @@ class _Runtime:
             compactor=self.compactor,
             on_content=console.stream,
             on_invalidate=console.invalidate,
+            on_reasoning=console.reasoning,
+            on_tool_calls=console.tool_calls,
         )
 
     def close(self) -> None:
@@ -229,6 +263,15 @@ class _Runtime:
         event = self.store.append("plan_mode_set", {"active": active})
         SessionReducer.apply(self.state, event)
         self.console.badge("plan", f"plan mode {'on' if active else 'off'}", role="approval" if active else "info")
+
+    def reset_session_approval(self) -> None:
+        if not self.state.session_approval_always:
+            self.console.badge("approval", "already prompting for every side effect", role="muted")
+            return
+        event = self.store.append("session_approval_reset", {})
+        SessionReducer.apply(self.state, event)
+        self.approver.reset_session_approval()
+        self.console.badge("approval", "session always approval reset", role="approval")
 
 
 def _last_finished_turn(state: SessionState) -> str | None:
@@ -465,6 +508,9 @@ def _repl(runtime: _Runtime) -> int:
             continue
         if command == "/undo":
             runtime.undo_last_turn()
+            continue
+        if command == "/approval reset":
+            runtime.reset_session_approval()
             continue
         if command.startswith("/"):
             console.badge("command", f"unknown: {command}", role="failure")

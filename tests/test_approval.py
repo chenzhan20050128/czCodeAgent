@@ -151,7 +151,7 @@ class InteractiveApproverTests(unittest.TestCase):
 
         self.assertIs(decision, ApprovalDecision.ALLOW_ONCE)
         self.assertEqual(displayed, [self.request().render()])
-        self.assertEqual(prompts, ["Allow once? [y/N] "])
+        self.assertEqual(prompts, ["Allow once? [y/N/always] "])
 
     def test_explicit_no_denies(self) -> None:
         decision = InteractiveApprover(
@@ -162,13 +162,36 @@ class InteractiveApproverTests(unittest.TestCase):
         self.assertIs(decision, ApprovalDecision.DENY)
 
     def test_invalid_or_empty_input_fails_closed(self) -> None:
-        for response in ("", "always", "maybe", " y please"):
+        for response in ("", "maybe", " y please"):
             with self.subTest(response=response):
                 decision = InteractiveApprover(
                     input_fn=lambda _, value=response: value,
                     output_fn=lambda _: None,
                 ).decide(self.request())
                 self.assertIs(decision, ApprovalDecision.DENY)
+
+    def test_always_grants_session_scope_and_suppresses_later_prompts(self) -> None:
+        displayed: list[str] = []
+        inputs = Mock(return_value="always")
+        approver = InteractiveApprover(input_fn=inputs, output_fn=displayed.append)
+
+        first = approver.decide(self.request())
+        second = approver.decide(self.request())
+
+        self.assertIs(first, ApprovalDecision.ALLOW_SESSION)
+        self.assertIs(second, ApprovalDecision.ALLOW_SESSION)
+        inputs.assert_called_once()
+        self.assertEqual(len(displayed), 1)
+
+    def test_reset_session_always_requires_the_next_request_to_prompt_again(self) -> None:
+        answers = iter(("always", "n"))
+        approver = InteractiveApprover(
+            input_fn=lambda _: next(answers), output_fn=lambda _: None
+        )
+
+        self.assertIs(approver.decide(self.request()), ApprovalDecision.ALLOW_SESSION)
+        approver.reset_session_approval()
+        self.assertIs(approver.decide(self.request()), ApprovalDecision.DENY)
 
     def test_eof_fails_closed_as_denial(self) -> None:
         def eof(_: str) -> str:

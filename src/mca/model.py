@@ -94,6 +94,7 @@ class ModelClient:
         *,
         on_content: Callable[[str], None] | None = None,
         on_invalidate: Callable[[], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> SamplingResult:
         """Return one accepted terminal result or a bounded failure."""
 
@@ -137,7 +138,9 @@ class ModelClient:
                     except Exception:
                         content_callback_enabled = False
 
-            assembler = StreamAssembler(on_content=display)
+            assembler = StreamAssembler(
+                on_content=display, on_reasoning=on_reasoning
+            )
             retry_after: str | None = None
             retryable = False
             try:

@@ -149,9 +149,15 @@ _FINISH_REASONS = frozenset(
 class StreamAssembler:
     """Assemble the supported Chat Completions streaming subset."""
 
-    def __init__(self, *, on_content: Callable[[str], None] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        on_content: Callable[[str], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
+    ) -> None:
         self._decoder = SSEDecoder()
         self._on_content = on_content
+        self._on_reasoning = on_reasoning
         self._content: list[str] = []
         self._reasoning_content: list[str] = []
         self._tool_calls: dict[int, _ToolCallParts] = {}
@@ -282,6 +288,8 @@ class StreamAssembler:
                     "reasoning_content delta must be a string or null"
                 )
             self._reasoning_content.append(reasoning_content)
+            if self._on_reasoning is not None:
+                self._on_reasoning(reasoning_content)
 
         if "content" in delta and delta["content"] is not None:
             content = delta["content"]

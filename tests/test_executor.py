@@ -198,6 +198,52 @@ class ToolExecutorTests(ExecutorTestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(result.output, "1 | hello")
 
+    def test_session_scoped_always_approves_later_calls_and_records_scope(self) -> None:
+        path = self.workspace / "notes.txt"
+        path.write_text("old", encoding="utf-8")
+        first = self.accept(
+            "write_file", '{"path":"notes.txt","content":"new"}', call_id="one"
+        )
+
+        class SessionApprover:
+            calls = 0
+
+            def decide(self, request):
+                del request
+                self.calls += 1
+                return ApprovalDecision.ALLOW_SESSION
+
+        approver = SessionApprover()
+        executor = self.executor(approver=approver)
+
+        self.assertEqual(executor.execute(first).status, "succeeded")
+        second = self.accept(
+            "bash", '{"command":"true"}', call_id="two"
+        )
+        self.assertEqual(executor.execute(second).status, "succeeded")
+
+        approvals = [
+            event for event in self.store.load() if event.type == "approval_decided"
+        ]
+        self.assertEqual([event.payload["scope"] for event in approvals], ["session", "session"])
+        self.assertEqual(approver.calls, 1)
+
+    def test_replayed_session_scope_always_approves_without_prompting(self) -> None:
+        path = self.workspace / "notes.txt"
+        path.write_text("old", encoding="utf-8")
+        first = self.accept(
+            "write_file", '{"path":"notes.txt","content":"new"}', call_id="one"
+        )
+        class SessionApprover:
+            def decide(self, request):
+                del request
+                return ApprovalDecision.ALLOW_SESSION
+        self.executor(approver=SessionApprover()).execute(first)
+        self.store.close()
+        with RolloutStore.open(self.root / "sessions", self.session_id) as reopened:
+            state = SessionReducer.replay(reopened.load())
+            self.assertTrue(state.session_approval_always)
+
     def test_exit_plan_mode_approval_records_plan_mode_off_and_succeeds(self) -> None:
         self.append("plan_mode_set", {"active": True})
         call = self.accept(

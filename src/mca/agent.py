@@ -74,6 +74,7 @@ class ModelSampler(Protocol):
         *,
         on_content: Callable[[str], None] | None = None,
         on_invalidate: Callable[[], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> SamplingResult: ...
 
 
@@ -156,6 +157,8 @@ class AgentLoop:
         compactor: Compactor | None = None,
         on_content: Callable[[str], None] | None = None,
         on_invalidate: Callable[[], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
+        on_tool_calls: Callable[[Sequence[SampledToolCall]], None] | None = None,
     ) -> None:
         if config.max_steps < 0:
             raise ValueError("max_steps must be non-negative")
@@ -176,6 +179,8 @@ class AgentLoop:
         self.compactor = compactor
         self.on_content = on_content
         self.on_invalidate = on_invalidate
+        self.on_reasoning = on_reasoning
+        self.on_tool_calls = on_tool_calls
         self._usable = True
 
     def run_turn(self, user_input: str) -> TurnResult:
@@ -300,6 +305,11 @@ class AgentLoop:
                             tool_steps,
                             error="model returned an invalid tool batch",
                         )
+                    if self.on_tool_calls is not None:
+                        try:
+                            self.on_tool_calls(sampled.tool_calls)
+                        except Exception:
+                            pass
                     before_accept = self.state.last_seq
                     try:
                         accepted = self._accept_assistant(
@@ -414,6 +424,7 @@ class AgentLoop:
                 allow_tools,
                 on_content=stream.content,
                 on_invalidate=stream.invalidate,
+                on_reasoning=self.on_reasoning,
             )
         except KeyboardInterrupt:
             stream.discard()

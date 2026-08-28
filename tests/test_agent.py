@@ -78,9 +78,10 @@ class ScriptedModel:
         *,
         on_content: object = None,
         on_invalidate: object = None,
+        on_reasoning: object = None,
     ) -> SamplingResult:
         self.requests.append((list(messages), list(tools), allow_tools))
-        self.callbacks.append((on_content, on_invalidate))
+        self.callbacks.append((on_content, on_invalidate, on_reasoning))
         if not self.results:
             raise AssertionError("unexpected model sample")
         result = self.results.pop(0)
@@ -178,6 +179,8 @@ class AgentLoopTestCase(unittest.TestCase):
         environment: Callable[[], ProjectionEnvironment] | None = None,
         on_content: Callable[[str], None] | None = None,
         on_invalidate: Callable[[], None] | None = None,
+        on_reasoning: Callable[[str], None] | None = None,
+        on_tool_calls: Callable[[Sequence[SampledToolCall]], None] | None = None,
     ) -> SimpleNamespace:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
@@ -234,6 +237,8 @@ class AgentLoopTestCase(unittest.TestCase):
             compactor=compactor,
             on_content=on_content,
             on_invalidate=on_invalidate,
+            on_reasoning=on_reasoning,
+            on_tool_calls=on_tool_calls,
         )
         return SimpleNamespace(
             root=root,
@@ -331,6 +336,41 @@ class AgentLoopTests(AgentLoopTestCase):
         self.assertEqual(invalidated, [])
         self.assertIsNot(runtime.model.callbacks[0][0], on_content)
         self.assertIsNot(runtime.model.callbacks[0][1], on_invalidate)
+
+    def test_reasoning_and_tool_calls_are_reported_to_observers(self) -> None:
+        reasoning: list[str] = []
+        observed_calls: list[tuple[str, ...]] = []
+        runtime = self.make_runtime(
+            tool_batch(call("c1", "read"), reasoning="inspect first"),
+            text("done"),
+            specs=[tool_spec("read", lambda _: ToolResult("read", "ok"))],
+            on_reasoning=reasoning.append,
+            on_tool_calls=lambda calls: observed_calls.append(
+                tuple(item.name for item in calls)
+            ),
+        )
+
+        result = runtime.loop.run_turn("do it")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(observed_calls, [("read",)])
+
+    def test_model_reasoning_callback_is_forwarded_without_persisting_fake_deltas(self) -> None:
+        reasoning: list[str] = []
+
+        class ReasoningModel(ScriptedModel):
+            def sample(self, *args, on_reasoning=None, **kwargs):
+                if on_reasoning is not None:
+                    on_reasoning("checking repository")
+                return super().sample(*args, **kwargs)
+
+        runtime = self.make_runtime(text("done"), on_reasoning=reasoning.append)
+        runtime.loop.model = ReasoningModel(text("done"))
+
+        result = runtime.loop.run_turn("do it")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(reasoning, ["checking repository"])
 
     def test_environment_exception_safely_fails_turn_and_allows_next_turn(self) -> None:
         calls = 0

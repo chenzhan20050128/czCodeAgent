@@ -398,6 +398,7 @@ class SessionState:
     recovery_blocked: bool = False
     last_usage: tuple[int, int, int] | None = None
     plan_mode_active: bool = False
+    session_approval_always: bool = False
 
 
 def _payload_string(
@@ -656,9 +657,24 @@ class SessionReducer:
         scope = event.payload.get("scope")
         if scope is not None and (not isinstance(scope, str) or not scope):
             raise DomainError("scope must be a non-empty string or null")
+        if scope not in {None, "once", "session"}:
+            raise DomainError("scope must be once, session, or null")
+        if scope == "session" and decision is not True:
+            raise DomainError("session approval scope requires approval")
         state.tool_calls[call.call_key] = replace(
             call, approved=decision, approval_scope=scope
         )
+        if scope == "session":
+            state.session_approval_always = True
+
+    @staticmethod
+    def _apply_session_approval_reset(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(
+            state, "reset session approval"
+        )
+        if event.payload:
+            raise DomainError("session_approval_reset payload must be empty")
+        state.session_approval_always = False
 
     @staticmethod
     def _apply_tool_started(state: SessionState, event: Event) -> None:

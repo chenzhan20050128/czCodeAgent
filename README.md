@@ -101,6 +101,11 @@ This creates the rollout under that project and confines file tools, `bash`,
 and `/undo` to the same directory. Binding is allowed only before the first
 turn; use `mca --workspace /path/to/project` when you already know the target.
 
+Each approval is `[y/N/always]`. `always` writes an auditable **session-scoped**
+authorization: later side-effecting calls in that session auto-approve, and a
+resumed session restores that scope. It does not authorize a new session. Run
+`/approval reset` to return to per-call prompts.
+
 In an interactive terminal, the REPL is a multi-line editor: **Enter** inserts
 a line break and **Ctrl+Enter** submits the whole prompt. mca recognizes the
 standard CSI-u / modifyOtherKeys Ctrl+Enter sequences. Some terminals encode
@@ -108,6 +113,10 @@ Ctrl+Enter exactly like ordinary Enter; in that case use **Ctrl+S** to submit.
 The prompt prints this fallback behavior in `/help`. Colors use a muted
 blue/indigo/amber/teal/brick semantic palette and automatically turn off when
 stdout is not a TTY, `TERM=dumb`, or `NO_COLOR` is set.
+Provider-supplied reasoning deltas appear as muted `[thinking]` text; complete
+tool calls appear in deep amber before approval/execution, so an active agent
+does not look stalled. mca never invents or exposes reasoning it did not receive
+from the provider.
 
 For DeepSeek's long thinking turns, the default request timeout is 600 seconds
 and the retry budget is 900 seconds. Do not treat a quiet terminal during a

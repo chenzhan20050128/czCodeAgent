@@ -36,7 +36,14 @@ class ScriptedModel:
         self.closed = False
 
     def sample(
-        self, messages, tools, allow_tools, *, on_content=None, on_invalidate=None
+        self,
+        messages,
+        tools,
+        allow_tools,
+        *,
+        on_content=None,
+        on_invalidate=None,
+        on_reasoning=None,
     ):
         if not self._results:
             raise AssertionError("unexpected extra model sample")
@@ -253,6 +260,14 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("[plan] plan mode on", output.lower())
         self.assertIn("plan mode: on", output.lower())
         self.assertIn("plan mode off", output.lower())
+
+    def test_repl_approval_reset_is_available(self) -> None:
+        code, output = self._run(
+            [], ScriptedModel(), stdin="/approval reset\n/exit\n"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("already prompting for every side effect", output)
 
     def test_repl_first_prompt_binds_an_explicit_workspace(self) -> None:
         project = self.workspace / "external-project"

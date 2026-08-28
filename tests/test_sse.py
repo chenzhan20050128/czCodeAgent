@@ -123,6 +123,20 @@ class StreamAssemblerTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, "reasoning_content"):
             invalid.feed(event({"reasoning_content": 42}))
 
+    def test_reports_reasoning_deltas_as_they_arrive(self) -> None:
+        displayed: list[str] = []
+        assembler = StreamAssembler(on_reasoning=displayed.append)
+        assembler.feed(event({"reasoning_content": "inspect "}))
+        assembler.feed(event({"reasoning_content": "tests"}))
+        assembler.feed(event({"content": "answer"}))
+        assembler.feed(event({}, "stop"))
+        assembler.feed(DONE)
+
+        response = assembler.finish()
+
+        self.assertEqual(displayed, ["inspect ", "tests"])
+        self.assertEqual(response.reasoning_content, "inspect tests")
+
     def test_tool_id_and_name_may_arrive_after_arguments_start(self) -> None:
         assembler = StreamAssembler()
         assembler.feed(

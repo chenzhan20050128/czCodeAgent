@@ -190,32 +190,43 @@ class ToolExecutor:
                     ToolStatus.FAILED,
                     _safe_error("tool approval rendering failed", error),
                 )
-            try:
-                decision = self._approval_decision(request)
-            except ApprovalInterrupted:
-                self._append_and_reduce(
-                    "approval_decided",
-                    {
-                        "call_key": call.call_key,
-                        "call_id": call.provider_call_id,
-                        "approved": False,
-                        "scope": "once",
-                    },
-                )
-                self._finish_requested_error(
-                    state_call,
-                    ToolStatus.CANCELLED,
-                    "tool approval interrupted",
-                )
-                raise KeyboardInterrupt from None
-            approved = decision is ApprovalDecision.ALLOW_ONCE
+            if self.state.session_approval_always:
+                decision = ApprovalDecision.ALLOW_SESSION
+            else:
+                try:
+                    decision = self._approval_decision(request)
+                except ApprovalInterrupted:
+                    self._append_and_reduce(
+                        "approval_decided",
+                        {
+                            "call_key": call.call_key,
+                            "call_id": call.provider_call_id,
+                            "approved": False,
+                            "scope": "once",
+                        },
+                    )
+                    self._finish_requested_error(
+                        state_call,
+                        ToolStatus.CANCELLED,
+                        "tool approval interrupted",
+                    )
+                    raise KeyboardInterrupt from None
+            approved = decision in {
+                ApprovalDecision.ALLOW_ONCE,
+                ApprovalDecision.ALLOW_SESSION,
+            }
+            scope = (
+                "session"
+                if decision is ApprovalDecision.ALLOW_SESSION
+                else "once"
+            )
             self._append_and_reduce(
                 "approval_decided",
                 {
                     "call_key": call.call_key,
                     "call_id": call.provider_call_id,
                     "approved": approved,
-                    "scope": "once",
+                    "scope": scope,
                 },
             )
             if not approved:
@@ -343,7 +354,10 @@ class ToolExecutor:
             raise ApprovalInterrupted from None
         except Exception:
             return ApprovalDecision.DENY
-        if decision is ApprovalDecision.ALLOW_ONCE:
+        if decision in {
+            ApprovalDecision.ALLOW_ONCE,
+            ApprovalDecision.ALLOW_SESSION,
+        }:
             return decision
         return ApprovalDecision.DENY
 

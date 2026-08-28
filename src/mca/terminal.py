@@ -16,7 +16,7 @@ _PALETTE = {
     "info": "38;5;110",       # steel blue
     "workspace": "38;5;67",   # deep slate blue
     "model": "38;5;141",      # muted indigo
-    "tool": "38;5;104",       # dusk violet
+    "tool": "38;5;130",       # deep burnt amber
     "approval": "38;5;137",   # muted amber-brown
     "success": "38;5;72",     # deep teal-green
     "failure": "38;5;167",    # dusty brick
