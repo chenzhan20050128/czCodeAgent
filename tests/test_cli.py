@@ -100,6 +100,18 @@ class CliRunTests(unittest.TestCase):
                     )
         return code, captured.getvalue()
 
+    def _run_unbound(self, model, stdin="", *, plan=False):
+        """Run bare ``mca`` with a test-controlled current directory."""
+
+        captured = io.StringIO()
+        argv = ["--plan"] if plan else []
+        with patch.object(cli, "ModelClient", return_value=model):
+            with patch("builtins.input", side_effect=self._input_lines(stdin)):
+                with patch.object(cli.Path, "cwd", return_value=self.workspace):
+                    with contextlib.redirect_stdout(captured):
+                        code = cli.main(argv)
+        return code, captured.getvalue()
+
     @staticmethod
     def _input_lines(stdin):
         lines = iter(stdin.splitlines())
@@ -241,6 +253,59 @@ class CliRunTests(unittest.TestCase):
         self.assertIn("plan mode on", output.lower())
         self.assertIn("plan mode: on", output.lower())
         self.assertIn("plan mode off", output.lower())
+
+    def test_repl_first_prompt_binds_an_explicit_workspace(self) -> None:
+        project = self.workspace / "external-project"
+        project.mkdir()
+        model = ScriptedModel(_text("inspected the target"))
+
+        code, output = self._run_unbound(
+            model,
+            stdin=(
+                f"workspace: {project} | inspect the repository and report its structure\n"
+                "/exit\n"
+            ),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("workspace bound", output.lower())
+        self.assertEqual(len(model._results), 0)
+        sessions_root = project / ".mca" / "sessions"
+        session_file = next(sessions_root.glob("*.jsonl"))
+        self.assertFalse((self.workspace / ".mca" / "sessions").exists())
+        with RolloutStore.open(sessions_root, session_file.stem) as store:
+            state = SessionReducer.replay(store.load())
+        self.assertEqual(state.cwd, str(project.resolve()))
+        turn_id = next(iter(state.turn_inputs))
+        self.assertEqual(
+            state.turn_inputs[turn_id], "inspect the repository and report its structure"
+        )
+
+    def test_repl_rejects_workspace_binding_after_a_turn(self) -> None:
+        other = self.workspace / "other-project"
+        other.mkdir()
+        code, output = self._run_unbound(
+            ScriptedModel(_text("done")),
+            stdin=(
+                f"workspace: {self.workspace} | first task\n"
+                f"workspace: {other} | second task\n"
+                "/exit\n"
+            ),
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("only valid before the first turn", output.lower())
+
+    def test_repl_rejects_a_missing_workspace_binding_without_sampling(self) -> None:
+        missing = self.workspace / "not-here"
+        model = ScriptedModel()
+        code, output = self._run_unbound(
+            model, stdin=f"workspace: {missing} | investigate\n/exit\n"
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("workspace does not exist", output.lower())
+        self.assertEqual(model._results, [])
 
     def test_plan_flag_starts_in_plan_mode_and_blocks_writes(self) -> None:
         # In plan mode the model asks to write, the runtime refuses without

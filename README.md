@@ -74,6 +74,18 @@ mca --verbose                                  # stream output + show turn statu
 mca --yolo                                     # skip approval (checks still apply)
 ```
 
+When you start bare `mca` outside the target project, its first task binds the
+session safely to an explicit absolute workspace instead of treating the launch
+directory as the target:
+
+```text
+workspace: /absolute/path/to/project | investigate the failing integration tests and fix the root cause
+```
+
+This creates the rollout under that project and confines file tools, `bash`,
+and `/undo` to the same directory. Binding is allowed only before the first
+turn; use `mca --workspace /path/to/project` when you already know the target.
+
 REPL commands: `/help`, `/status`, `/plan [off]`, `/compact`, `/undo`, `/exit`.
 
 Sessions are stored under `<workspace>/.mca/sessions/` (gitignored).

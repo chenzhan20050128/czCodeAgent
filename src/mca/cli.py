@@ -52,6 +52,12 @@ _REPL_HELP = (
     "  /exit     leave the REPL\n"
     "Any other line is sent to the agent as a new task."
 )
+_UNBOUND_REPL_HELP = (
+    "Before the first task, bind mca to a project with:\n"
+    "  workspace: /absolute/path/to/project | your task\n"
+    "Commands before binding: /help, /plan, /plan off, /exit.\n"
+    "The selected directory becomes the only workspace for this session."
+)
 
 
 def _sessions_root(workspace: Path) -> Path:
@@ -307,6 +313,88 @@ def _run_once(runtime: _Runtime, prompt: str) -> int:
     return 0 if result.status in _SUCCESS_STATUSES else 1
 
 
+def _parse_workspace_prompt(line: str) -> tuple[Path, str]:
+    """Parse the one allowed unbound-REPL task header.
+
+    Binding is explicit rather than inferred from prose so the task's durable
+    cwd, file-tool boundary, shell cwd, and undo boundary all agree before the
+    first event is appended.
+    """
+
+    prefix = "workspace:"
+    if not line.startswith(prefix):
+        raise ValueError(
+            "workspace required: start with workspace: /absolute/path | task"
+        )
+    raw = line[len(prefix) :].strip()
+    path_text, separator, task = raw.partition("|")
+    if not separator or not path_text.strip() or not task.strip():
+        raise ValueError(
+            "workspace prompt must be workspace: /absolute/path | task"
+        )
+    raw_path = Path(path_text.strip())
+    if not raw_path.is_absolute():
+        raise ValueError("workspace must be an absolute path")
+    try:
+        workspace = raw_path.resolve(strict=True)
+    except (FileNotFoundError, OSError):
+        raise ValueError("workspace does not exist") from None
+    if not workspace.is_dir():
+        raise ValueError("workspace must be a directory")
+    return workspace, task.strip()
+
+
+def _unbound_repl(
+    config: Config, console: _Console, *, plan_requested: bool
+) -> int:
+    """Wait for an explicit workspace before creating any session or tools."""
+
+    requested_plan = plan_requested
+    console.line("mca REPL. Bind a project before the first task. Type /help.")
+    while True:
+        try:
+            line = input("mca> ")
+        except EOFError:
+            console.line()
+            return 0
+        except KeyboardInterrupt:
+            console.line("\n[interrupted; type /exit to quit]")
+            continue
+        command = line.strip()
+        if not command:
+            continue
+        if command in {"/exit", "/quit"}:
+            return 0
+        if command == "/help":
+            console.line(_UNBOUND_REPL_HELP)
+            continue
+        if command == "/plan" or command == "/plan on":
+            requested_plan = True
+            console.line("[plan mode will turn on when a workspace is bound]")
+            continue
+        if command == "/plan off":
+            requested_plan = False
+            console.line("[plan mode will remain off when a workspace is bound]")
+            continue
+        if command.startswith("/"):
+            console.line(f"[unknown command before workspace binding: {command}]")
+            continue
+        try:
+            workspace, task = _parse_workspace_prompt(command)
+        except ValueError as error:
+            console.line(f"[error: {error}]")
+            continue
+        runtime = _create_session(workspace, config, console)
+        try:
+            if requested_plan:
+                runtime.set_plan_mode(True)
+            console.line(f"[workspace bound: {workspace}]")
+            runtime.report(runtime.loop.run_turn(task))
+            return _repl(runtime)
+        finally:
+            runtime.close()
+
+
 def _repl(runtime: _Runtime) -> int:
     console = runtime.console
     console.line("mca REPL. Type /help for commands, /exit to quit.")
@@ -351,6 +439,12 @@ def _repl(runtime: _Runtime) -> int:
             continue
         if command.startswith("/"):
             console.line(f"[unknown command: {command}]")
+            continue
+        if command.startswith("workspace:"):
+            console.line(
+                "[workspace binding is only valid before the first turn; "
+                "this session is already bound]"
+            )
             continue
         try:
             runtime.report(runtime.loop.run_turn(command))
@@ -479,6 +573,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         console.line(
             "[yolo: interactive approval is OFF; tools run without confirmation]"
         )
+
+    if args.prompt is None and args.resume is None and args.workspace is None:
+        return _unbound_repl(config, console, plan_requested=args.plan)
 
     try:
         if args.resume is not None:
