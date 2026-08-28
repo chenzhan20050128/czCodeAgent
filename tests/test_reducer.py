@@ -261,6 +261,35 @@ class SessionReducerTests(ReducerTestCase):
         self.assertEqual(self.state.turns[self.turn_id], TurnStatus.ACTIVE)
         self.assertEqual(self.state.turn_inputs[self.turn_id], "fix the tests")
 
+    def test_plan_mode_set_folds_last_wins_across_and_within_turns(self) -> None:
+        self.create_session()
+        # Between turns: a plan_mode_set may arrive with no active turn.
+        self.apply("plan_mode_set", {"active": True})
+        self.assertIs(self.state.plan_mode_active, True)
+        self.apply(
+            "turn_started",
+            {"turn_id": self.turn_id, "user_input": "research first"},
+        )
+        # Within a turn: the last value wins.
+        self.apply("plan_mode_set", {"active": False})
+        self.assertIs(self.state.plan_mode_active, False)
+
+    def test_plan_mode_set_requires_a_boolean_active(self) -> None:
+        self.create_session()
+        replay = SessionReducer.replay(self.state.events)
+        for bad in ({"active": "yes"}, {"active": 1}, {}):
+            with self.subTest(payload=bad):
+                invalid = Event.create(
+                    seq=replay.last_seq + 1,
+                    session_id=self.session_id,
+                    event_type="plan_mode_set",
+                    payload=bad,
+                )
+                with self.assertRaisesRegex(DomainError, "active"):
+                    SessionReducer.apply(
+                        SessionReducer.replay(self.state.events), invalid
+                    )
+
     def test_assistant_accepted_registers_all_requested_calls_in_order(self) -> None:
         self.start_turn()
         self.apply(

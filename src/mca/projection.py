@@ -149,8 +149,20 @@ def _environment(value: ProjectionEnvironment | Mapping[str, Any]) -> Projection
     )
 
 
+PLAN_MODE_POLICY = (
+    "Plan mode is active. First research the task using read-only tools "
+    "(read_file, list_dir, grep) and present a concrete plan. Do not modify "
+    "files or run state-changing commands until the plan is approved: the "
+    "runtime will refuse write_file, edit_file, and bash while plan mode is "
+    "active. Call exit_plan_mode with the complete plan to request approval."
+)
+
+
 def _system_message(
-    environment: ProjectionEnvironment, *, checkpoint_summary: str | None
+    environment: ProjectionEnvironment,
+    *,
+    checkpoint_summary: str | None,
+    plan_mode_active: bool = False,
 ) -> dict[str, str]:
     live_environment = json.dumps(
         {
@@ -171,6 +183,8 @@ def _system_message(
         "Current live environment (supplied for this request, not recovered "
         f"from the rollout): {live_environment}"
     )
+    if plan_mode_active:
+        content += f"\n{PLAN_MODE_POLICY}"
     if checkpoint_summary:
         content += f"\nCompacted conversation summary:\n{checkpoint_summary}"
     return {"role": "system", "content": content}
@@ -395,7 +409,11 @@ class PromptProjector:
             baseline = _plain_json(replacement)
 
         messages: list[dict[str, Any]] = [
-            _system_message(current_environment, checkpoint_summary=summary)
+            _system_message(
+                current_environment,
+                checkpoint_summary=summary,
+                plan_mode_active=state.plan_mode_active,
+            )
         ]
         messages.extend(baseline)
         call_tracker = _EventCallTracker()

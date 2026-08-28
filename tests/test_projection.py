@@ -217,6 +217,38 @@ class PromptProjectionTests(ProjectionTestCase):
         )
         self.assertNotIn("/stale/rollout/cwd", messages[0]["content"])
 
+    def test_plan_mode_active_injects_a_policy_into_the_system_message(self) -> None:
+        self.start_turn("Investigate the crash")
+        self.apply("plan_mode_set", {"active": True})
+        self.apply(
+            "assistant_accepted",
+            {"content": "Looking into it.", "finish_reason": "stop", "tool_calls": []},
+        )
+
+        messages = self.project()
+
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("plan mode", messages[0]["content"].lower())
+        # The plan_mode_set fact never becomes a chat message of its own.
+        self.assertEqual(
+            [message["role"] for message in messages],
+            ["system", "user", "assistant"],
+        )
+        validate_conversation(messages)
+
+    def test_plan_mode_inactive_leaves_the_system_message_unchanged(self) -> None:
+        self.start_turn("Investigate the crash")
+        self.apply("plan_mode_set", {"active": True})
+        self.apply("plan_mode_set", {"active": False})
+        self.apply(
+            "assistant_accepted",
+            {"content": "Done.", "finish_reason": "stop", "tool_calls": []},
+        )
+
+        messages = self.project()
+
+        self.assertEqual(messages[0], self.system_message)
+
     def test_projects_multi_tool_path_with_provider_ids_and_ignores_runtime_events(
         self,
     ) -> None:

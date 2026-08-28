@@ -397,6 +397,7 @@ class SessionState:
     events: list[Event] = field(default_factory=list)
     recovery_blocked: bool = False
     last_usage: tuple[int, int, int] | None = None
+    plan_mode_active: bool = False
 
 
 def _payload_string(
@@ -1044,6 +1045,16 @@ class SessionReducer:
                 f"undo status {status!r} does not match file results {expected_status!r}"
             )
         state.undo_results[turn_id] = event
+
+    @staticmethod
+    def _apply_plan_mode_set(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(state, "set plan mode")
+        if set(event.payload) != {"active"}:
+            raise DomainError("plan_mode_set payload must contain only active")
+        active = event.payload.get("active")
+        if type(active) is not bool:
+            raise DomainError("plan_mode_set active must be a boolean")
+        state.plan_mode_active = active
 
     @staticmethod
     def _require_active_turn(state: SessionState) -> str:

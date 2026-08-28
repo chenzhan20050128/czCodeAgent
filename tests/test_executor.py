@@ -158,6 +158,99 @@ class ToolExecutorTests(ExecutorTestCase):
         self.assertEqual(events[-1].payload["result"], "1 | hello")
         approver.assert_not_called()
 
+    def test_plan_mode_blocks_side_effecting_tools_before_approval(self) -> None:
+        self.append("plan_mode_set", {"active": True})
+        path = self.workspace / "notes.txt"
+        path.write_text("old\n", encoding="utf-8")
+        call = self.accept(
+            "write_file", '{"path":"notes.txt","content":"new\\n"}'
+        )
+        before = len(self.store.load())
+        approver = Mock(side_effect=AssertionError("approval must not run"))
+
+        result = self.executor(approver=approver).execute(call)
+
+        new_events = self.store.load()[before:]
+        self.assertEqual([event.type for event in new_events], ["tool_finished"])
+        self.assertEqual(result.status, "denied")
+        self.assertIn("plan mode", result.output.lower())
+        self.assertEqual(path.read_text(encoding="utf-8"), "old\n")
+        approver.assert_not_called()
+
+    def test_plan_mode_blocks_bash_before_approval(self) -> None:
+        self.append("plan_mode_set", {"active": True})
+        call = self.accept("bash", '{"command":"echo hi"}')
+        approver = Mock(side_effect=AssertionError("approval must not run"))
+
+        result = self.executor(approver=approver).execute(call)
+
+        self.assertEqual(result.status, "denied")
+        self.assertIn("plan mode", result.output.lower())
+        approver.assert_not_called()
+
+    def test_plan_mode_allows_read_only_tools(self) -> None:
+        self.append("plan_mode_set", {"active": True})
+        (self.workspace / "notes.txt").write_text("hello\n", encoding="utf-8")
+        call = self.accept("read_file", '{"path":"notes.txt"}')
+
+        result = self.executor().execute(call)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(result.output, "1 | hello")
+
+    def test_exit_plan_mode_approval_records_plan_mode_off_and_succeeds(self) -> None:
+        self.append("plan_mode_set", {"active": True})
+        call = self.accept(
+            "exit_plan_mode", '{"plan":"# Fix\\nStep one."}'
+        )
+        approver = RecordingApprover(ApprovalDecision.ALLOW_ONCE)
+
+        result = self.executor(approver=approver).execute(call)
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertFalse(self.state.plan_mode_active)
+        types = [event.type for event in self.events_after_acceptance()]
+        self.assertIn("plan_mode_set", types)
+        self.assertEqual(types[-1], "tool_finished")
+        plan_off = [
+            event
+            for event in self.events_after_acceptance()
+            if event.type == "plan_mode_set"
+        ][-1]
+        self.assertIs(plan_off.payload["active"], False)
+        self.assertIn("# Fix", str(approver.requests[0]))
+
+    def test_exit_plan_mode_denial_keeps_plan_mode_on(self) -> None:
+        self.append("plan_mode_set", {"active": True})
+        call = self.accept(
+            "exit_plan_mode", '{"plan":"# Fix\\nStep one."}'
+        )
+        approver = RecordingApprover(ApprovalDecision.DENY)
+
+        result = self.executor(approver=approver).execute(call)
+
+        self.assertEqual(result.status, "denied")
+        self.assertTrue(self.state.plan_mode_active)
+        self.assertNotIn(
+            "plan_mode_set",
+            [
+                event.type
+                for event in self.events_after_acceptance()
+                if event.payload.get("active") is False
+            ],
+        )
+
+    def test_exit_plan_mode_rejects_a_plan_without_a_heading(self) -> None:
+        self.append("plan_mode_set", {"active": True})
+        call = self.accept("exit_plan_mode", '{"plan":"just prose"}')
+        approver = Mock(side_effect=AssertionError("approval must not run"))
+
+        result = self.executor(approver=approver).execute(call)
+
+        self.assertEqual(result.status, "invalid_arguments")
+        self.assertTrue(self.state.plan_mode_active)
+        approver.assert_not_called()
+
     def test_denied_write_records_decision_then_terminal_without_effect(self) -> None:
         path = self.workspace / "notes.txt"
         path.write_text("old\n", encoding="utf-8")
@@ -165,7 +258,6 @@ class ToolExecutorTests(ExecutorTestCase):
             "write_file", '{"path":"notes.txt","content":"new\\n"}'
         )
         approver = RecordingApprover(ApprovalDecision.DENY)
-
         result = self.executor(approver=approver).execute(call)
 
         events = self.events_after_acceptance()
