@@ -113,10 +113,11 @@ Ctrl+Enter exactly like ordinary Enter; in that case use **Ctrl+S** to submit.
 The prompt prints this fallback behavior in `/help`. Colors use a muted
 blue/indigo/amber/teal/brick semantic palette and automatically turn off when
 stdout is not a TTY, `TERM=dumb`, or `NO_COLOR` is set.
-Provider-supplied reasoning deltas appear as muted `[thinking]` text; complete
-tool calls appear in deep amber before approval/execution, so an active agent
-does not look stalled. mca never invents or exposes reasoning it did not receive
-from the provider.
+With `--verbose`, provider-supplied reasoning deltas appear as multiline muted
+`[thinking]` text; complete tool calls appear in deep amber before
+approval/execution, so an active agent does not look stalled. Without
+`--verbose`, reasoning stays hidden. mca never invents or exposes reasoning it
+did not receive from the provider.
 
 For DeepSeek's long thinking turns, the default request timeout is 600 seconds
 and the retry budget is 900 seconds. Do not treat a quiet terminal during a
