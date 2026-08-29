@@ -86,6 +86,8 @@ class _Console:
         self.verbose = verbose
         self._streaming = False
         self._reasoning_streaming = False
+        self._streamed_assistant_text = ""
+        self._separate_next_live_block = False
         enabled = sys.stdout.isatty() if color is None else color
         self.theme = TerminalTheme.auto(isatty=enabled)
 
@@ -100,47 +102,69 @@ class _Console:
             f"{self.theme.style('[' + label + ']', role)} {text}"
         )
 
+    def approval(self, text: str) -> None:
+        self._start_live_block()
+        self.badge("approval", text, role="approval")
+        self._separate_next_live_block = True
+
+    def _start_live_block(self) -> None:
+        if self._reasoning_streaming or self._streaming:
+            sys.stdout.write("\n\n")
+            self._reasoning_streaming = False
+            self._streaming = False
+        elif self._separate_next_live_block:
+            sys.stdout.write("\n")
+        self._separate_next_live_block = False
+
     def stream(self, delta: str) -> None:
         if not delta:
             return
-        if self._reasoning_streaming:
-            sys.stdout.write("\n")
-            self._reasoning_streaming = False
+        if not self._streaming:
+            self._start_live_block()
         sys.stdout.write(self.theme.style(delta, "model"))
         sys.stdout.flush()
         self._streaming = True
+        self._streamed_assistant_text += delta
 
     def invalidate(self) -> None:
         if self._streaming:
             sys.stdout.write("\n" + self.theme.style("[output discarded]\n", "failure"))
             sys.stdout.flush()
             self._streaming = False
+        self._streamed_assistant_text = ""
 
     def reasoning(self, delta: str) -> None:
         """Show only provider-supplied reasoning deltas in a muted stream."""
 
-        if not delta:
+        if not self.verbose or not delta:
             return
-        if self._streaming:
-            sys.stdout.write("\n")
-            self._streaming = False
         if not self._reasoning_streaming:
+            self._start_live_block()
             sys.stdout.write(self.theme.style("[thinking] ", "muted"))
             self._reasoning_streaming = True
-        sys.stdout.write(self.theme.style(_escape_terminal_text(delta), "muted"))
+        rendered = _escape_terminal_text(delta, preserve_newlines=True)
+        sys.stdout.write(self.theme.style(rendered, "muted"))
         sys.stdout.flush()
 
     def tool_calls(self, calls: Sequence[object]) -> None:
-        if self._reasoning_streaming or self._streaming:
-            sys.stdout.write("\n")
-            self._reasoning_streaming = False
-            self._streaming = False
+        self._start_live_block()
+        self._streamed_assistant_text = ""
         for call in calls:
             name = _escape_terminal_text(str(getattr(call, "name", "tool")))
             arguments = _escape_terminal_text(str(getattr(call, "arguments", "")))
             if len(arguments) > 220:
                 arguments = arguments[:200] + " ... [truncated]"
             self.badge("tool call", f"{name} {arguments}", role="tool")
+        self._separate_next_live_block = bool(calls)
+
+    def final_text_was_streamed(self, final_text: str) -> bool:
+        streamed = bool(final_text) and self._streamed_assistant_text == final_text
+        self._streamed_assistant_text = ""
+        if streamed and self._streaming:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._streaming = False
+        return streamed
 
 
 class _Runtime:
@@ -164,7 +188,7 @@ class _Runtime:
         registry = create_tool_registry(workspace)
         approver = InteractiveApprover(
             yolo=config.yolo,
-            output_fn=lambda rendered: console.badge("approval", rendered, role="approval"),
+            output_fn=console.approval,
             input_fn=lambda prompt: input(console.theme.style(prompt, "approval")),
         )
         self.approver = approver
@@ -203,7 +227,7 @@ class _Runtime:
         status = getattr(result, "status", None)
         final_text = getattr(result, "final_text", "")
         error = getattr(result, "error", None)
-        if final_text:
+        if final_text and not self.console.final_text_was_streamed(final_text):
             self.console.line(final_text)
         label = status.value if isinstance(status, TurnStatus) else str(status)
         if status in _SUCCESS_STATUSES:

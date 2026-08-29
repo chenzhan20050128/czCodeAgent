@@ -53,6 +53,32 @@ class ScriptedModel:
         self.closed = True
 
 
+class StreamingModel(ScriptedModel):
+    """A scripted model that emits its final text through the live callback."""
+
+    def sample(
+        self,
+        messages,
+        tools,
+        allow_tools,
+        *,
+        on_content=None,
+        on_invalidate=None,
+        on_reasoning=None,
+    ):
+        result = super().sample(
+            messages,
+            tools,
+            allow_tools,
+            on_content=on_content,
+            on_invalidate=on_invalidate,
+            on_reasoning=on_reasoning,
+        )
+        if on_content is not None and result.content:
+            on_content(result.content)
+        return result
+
+
 def _text(content: str) -> SamplingResult:
     return SamplingResult(
         SamplingOutcome.COMPLETE_TEXT, content=content, finish_reason="stop"
@@ -82,6 +108,74 @@ class CliHelpTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("usage:", result.stdout)
+
+
+class ConsoleFormattingTests(unittest.TestCase):
+    def test_reasoning_is_hidden_without_verbose_mode(self) -> None:
+        captured = io.StringIO()
+        console = cli._Console(verbose=False, color=False)
+
+        with contextlib.redirect_stdout(captured):
+            console.reasoning("inspect\nrepository")
+
+        self.assertEqual(captured.getvalue(), "")
+
+    def test_verbose_reasoning_preserves_lines_and_separates_tool_calls(self) -> None:
+        captured = io.StringIO()
+        console = cli._Console(verbose=True, color=False)
+        call = SampledToolCall(0, "c1", "function", "grep", '{"pattern":"FIXME"}')
+
+        with contextlib.redirect_stdout(captured):
+            console.reasoning("inspect\nrepository")
+            console.tool_calls((call,))
+
+        self.assertEqual(
+            captured.getvalue(),
+            '[thinking] inspect\nrepository\n\n[tool call] grep {"pattern":"FIXME"}\n',
+        )
+
+    def test_tool_approval_and_assistant_are_separate_blocks(self) -> None:
+        captured = io.StringIO()
+        console = cli._Console(verbose=True, color=False)
+        call = SampledToolCall(0, "c1", "function", "bash", '{"command":"true"}')
+
+        with contextlib.redirect_stdout(captured):
+            console.tool_calls((call,))
+            console.approval("Tool: bash\nAllow?")
+            console.stream("Tests pass.")
+            self.assertTrue(console.final_text_was_streamed("Tests pass."))
+
+        self.assertEqual(
+            captured.getvalue(),
+            '[tool call] bash {"command":"true"}\n'
+            '\n[approval] Tool: bash\nAllow?\n'
+            '\nTests pass.\n',
+        )
+
+    def test_verbose_reasoning_and_assistant_are_separate_blocks(self) -> None:
+        captured = io.StringIO()
+        console = cli._Console(verbose=True, color=False)
+
+        with contextlib.redirect_stdout(captured):
+            console.reasoning("checking")
+            console.stream("Ready.")
+            self.assertTrue(console.final_text_was_streamed("Ready."))
+
+        self.assertEqual(captured.getvalue(), "[thinking] checking\n\nReady.\n")
+
+    def test_approval_and_following_reasoning_are_separate_blocks(self) -> None:
+        captured = io.StringIO()
+        console = cli._Console(verbose=True, color=False)
+
+        with contextlib.redirect_stdout(captured):
+            console.approval("Tool: edit_file\nAllow?")
+            console.reasoning("Applying the approved change.")
+
+        self.assertEqual(
+            captured.getvalue(),
+            "[approval] Tool: edit_file\nAllow?\n"
+            "\n[thinking] Applying the approved change.",
+        )
 
 
 class CliRunTests(unittest.TestCase):
@@ -144,6 +238,14 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("done", output)
         self.assertIn("[session]", output)
+
+    def test_streamed_final_answer_is_printed_once(self) -> None:
+        code, output = self._run(
+            ["say hello"], StreamingModel(_text("one final answer"))
+        )
+
+        self.assertEqual(code, 0)
+        self.assertEqual(output.count("one final answer"), 1)
 
     def test_one_shot_never_leaks_the_api_key(self) -> None:
         _, output = self._run(
