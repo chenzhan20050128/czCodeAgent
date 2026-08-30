@@ -8,7 +8,10 @@ import signal
 import stat
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 from unittest.mock import patch
 
@@ -22,6 +25,8 @@ from mca.tools.filesystem import (
     PathSafetyError,
     WorkspaceResolver,
 )
+from mca.file_versions import DirectoryMutationLease
+from mca.file_versions import FileMutationCoordinator
 
 
 class FileSystemToolTests(unittest.TestCase):
@@ -197,6 +202,16 @@ class FileSystemToolTests(unittest.TestCase):
         self.assertEqual(change.proposed_bytes, b"new\n")
         self.assertIn("-old", change.diff)
         self.assertIn("+new", change.diff)
+        self.assertTrue(change.expected_version.exists)
+        self.assertEqual(change.expected_version.sha256, change.before_hash)
+        self.assertEqual(change.expected_version.mode, 0o640)
+        self.assertEqual(change.expected_version.size, len(b"old\n"))
+        self.assertIsNotNone(change.expected_version.device)
+        self.assertIsNotNone(change.expected_version.inode)
+        self.assertIsNotNone(change.expected_version.mtime_ns)
+        self.assertIsNotNone(change.expected_version.ctime_ns)
+        with self.assertRaises(FrozenInstanceError):
+            change.expected_version.mode = 0o600  # type: ignore[misc]
 
     def test_prepare_new_file_records_absent_snapshot_without_creating_it(self) -> None:
         change = self.tools.prepare_write_file(
@@ -207,7 +222,274 @@ class FileSystemToolTests(unittest.TestCase):
         self.assertFalse(change.existed_before)
         self.assertIsNone(change.before_hash)
         self.assertIsNone(change.before_mode)
+        self.assertFalse(change.expected_version.exists)
+        self.assertIsNone(change.expected_version.sha256)
+        self.assertIsNone(change.expected_version.mode)
+        self.assertIsNone(change.expected_version.size)
         self.assertIn("--- /dev/null", change.diff)
+
+    def test_mutation_coordinator_releases_idle_path_queues(self) -> None:
+        coordinator = FileMutationCoordinator()
+        path = (self.workspace / "file.txt").resolve()
+
+        with coordinator.mutation(path, ()):
+            self.assertEqual(len(coordinator._paths), 1)
+
+        self.assertEqual(coordinator._paths, {})
+
+    def test_different_file_commits_can_overlap(self) -> None:
+        first = self.write_bytes("first.txt", b"old")
+        second = self.write_bytes("second.txt", b"old")
+        changes = (
+            self.tools.prepare_write_file(
+                {"path": "first.txt", "content": "first"}
+            ),
+            self.tools.prepare_write_file(
+                {"path": "second.txt", "content": "second"}
+            ),
+        )
+        barrier = threading.Barrier(2)
+        real_replace = os.replace
+
+        def overlapping_replace(source: object, target: object) -> None:
+            barrier.wait(timeout=2)
+            real_replace(source, target)
+
+        with patch(
+            "mca.tools.filesystem.os.replace", side_effect=overlapping_replace
+        ):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda change: change.execute(), changes))
+
+        self.assertEqual(first.read_text(encoding="utf-8"), "first")
+        self.assertEqual(second.read_text(encoding="utf-8"), "second")
+        self.assertEqual(len(results), 2)
+
+    def test_same_version_same_file_writes_have_one_stale_loser(self) -> None:
+        path = self.write_bytes("shared.txt", b"old")
+        changes = (
+            self.tools.prepare_write_file(
+                {"path": "shared.txt", "content": "first"}
+            ),
+            self.tools.prepare_write_file(
+                {"path": "shared.txt", "content": "second"}
+            ),
+        )
+
+        def commit(change):
+            try:
+                return ("succeeded", change.execute())
+            except FileConflictError as error:
+                return ("conflict", str(error))
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(commit, changes))
+
+        self.assertEqual(
+            sorted(status for status, _ in outcomes), ["conflict", "succeeded"]
+        )
+        conflict = next(detail for status, detail in outcomes if status == "conflict")
+        self.assertIn("FILE_STALE_VERSION", conflict)
+        self.assertIn(path.read_text(encoding="utf-8"), {"first", "second"})
+
+    def test_same_version_write_and_edit_have_one_stale_loser(self) -> None:
+        path = self.write_bytes("shared.txt", b"old text")
+        changes = (
+            self.tools.prepare_write_file(
+                {"path": "shared.txt", "content": "whole write"}
+            ),
+            self.tools.prepare_edit_file(
+                {
+                    "path": "shared.txt",
+                    "old_text": "old",
+                    "new_text": "edited",
+                }
+            ),
+        )
+
+        def commit(change):
+            try:
+                change.execute()
+                return "succeeded"
+            except FileConflictError as error:
+                self.assertIn("FILE_STALE_VERSION", str(error))
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(commit, changes))
+
+        self.assertEqual(sorted(outcomes), ["conflict", "succeeded"])
+        self.assertIn(
+            path.read_text(encoding="utf-8"), {"whole write", "edited text"}
+        )
+
+    def test_same_absent_file_creation_has_one_stale_loser(self) -> None:
+        changes = (
+            self.tools.prepare_write_file(
+                {"path": "new.txt", "content": "first"}
+            ),
+            self.tools.prepare_write_file(
+                {"path": "new.txt", "content": "second"}
+            ),
+        )
+
+        def commit(change):
+            try:
+                change.execute()
+                return "succeeded"
+            except FileConflictError as error:
+                self.assertIn("FILE_STALE_VERSION", str(error))
+                return "conflict"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(commit, changes))
+
+        self.assertEqual(sorted(outcomes), ["conflict", "succeeded"])
+        self.assertIn(
+            (self.workspace / "new.txt").read_text(encoding="utf-8"),
+            {"first", "second"},
+        )
+
+    def test_parallel_writes_can_share_a_missing_parent_directory(self) -> None:
+        changes = (
+            self.tools.prepare_write_file(
+                {"path": "pkg/first.txt", "content": "first"}
+            ),
+            self.tools.prepare_write_file(
+                {"path": "pkg/second.txt", "content": "second"}
+            ),
+        )
+        shared_parent = self.tools.resolver.workspace / "pkg"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda change: change.execute(), changes))
+
+        self.assertEqual(
+            (shared_parent / "first.txt").read_text(encoding="utf-8"), "first"
+        )
+        self.assertEqual(
+            (shared_parent / "second.txt").read_text(encoding="utf-8"), "second"
+        )
+        self.assertEqual(
+            sum(shared_parent.resolve().as_posix() in result.created_directories for result in results),
+            1,
+        )
+
+    def test_failed_parent_creator_cannot_break_peer_before_peer_temp_creation(
+        self,
+    ) -> None:
+        creator = self.tools.prepare_write_file(
+            {"path": "pkg/creator.txt", "content": "creator"}
+        )
+        peer = self.tools.prepare_write_file(
+            {"path": "pkg/peer.txt", "content": "peer"}
+        )
+        shared_parent = self.tools.resolver.workspace / "pkg"
+        parent_created = threading.Event()
+        peer_adopted_parent = threading.Event()
+        allow_peer_temp = threading.Event()
+        real_create_directory = DirectoryMutationLease.create_directory
+        real_mkstemp = tempfile.mkstemp
+
+        def creator_mkdir(lease, path: Path, mode: int) -> bool:
+            created = real_create_directory(lease, path, mode)
+            if Path(path) == shared_parent:
+                parent_created.set()
+                self.assertTrue(peer_adopted_parent.wait(timeout=2))
+            return created
+
+        def interleaved_mkstemp(*args, **kwargs):
+            prefix = kwargs.get("prefix", "")
+            if prefix.startswith(".peer.txt."):
+                peer_adopted_parent.set()
+                self.assertTrue(allow_peer_temp.wait(timeout=2))
+            elif prefix.startswith(".creator.txt."):
+                raise OSError("creator disk failure")
+            return real_mkstemp(*args, **kwargs)
+
+        with (
+            patch.object(
+                DirectoryMutationLease,
+                "create_directory",
+                autospec=True,
+                side_effect=creator_mkdir,
+            ),
+            patch(
+                "mca.tools.filesystem.tempfile.mkstemp",
+                side_effect=interleaved_mkstemp,
+            ),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            creator_future = pool.submit(creator.execute)
+            self.assertTrue(parent_created.wait(timeout=2))
+            peer_future = pool.submit(peer.execute)
+            with self.assertRaisesRegex(OSError, "creator disk failure"):
+                creator_future.result(timeout=2)
+            self.assertTrue(shared_parent.is_dir())
+            allow_peer_temp.set()
+            peer_result = peer_future.result(timeout=2)
+
+        self.assertEqual(
+            (shared_parent / "peer.txt").read_text(encoding="utf-8"), "peer"
+        )
+        self.assertEqual(
+            peer_result.created_directories, (str(shared_parent.resolve()),)
+        )
+
+    def test_successful_peer_owns_parent_when_creator_fails_after_peer_commit(
+        self,
+    ) -> None:
+        creator = self.tools.prepare_write_file(
+            {"path": "pkg/creator.txt", "content": "creator"}
+        )
+        peer = self.tools.prepare_write_file(
+            {"path": "pkg/peer.txt", "content": "peer"}
+        )
+        shared_parent = self.tools.resolver.workspace / "pkg"
+        parent_created = threading.Event()
+        peer_committed = threading.Event()
+        real_create_directory = DirectoryMutationLease.create_directory
+        real_mkstemp = tempfile.mkstemp
+
+        def creator_mkdir(lease, path: Path, mode: int) -> bool:
+            created = real_create_directory(lease, path, mode)
+            if Path(path) == shared_parent:
+                parent_created.set()
+                self.assertTrue(peer_committed.wait(timeout=2))
+            return created
+
+        def fail_creator_temp(*args, **kwargs):
+            prefix = kwargs.get("prefix", "")
+            if prefix.startswith(".creator.txt."):
+                raise OSError("creator disk failure")
+            return real_mkstemp(*args, **kwargs)
+
+        with (
+            patch.object(
+                DirectoryMutationLease,
+                "create_directory",
+                autospec=True,
+                side_effect=creator_mkdir,
+            ),
+            patch(
+                "mca.tools.filesystem.tempfile.mkstemp",
+                side_effect=fail_creator_temp,
+            ),
+            ThreadPoolExecutor(max_workers=2) as pool,
+        ):
+            creator_future = pool.submit(creator.execute)
+            self.assertTrue(parent_created.wait(timeout=2))
+            peer_result = peer.execute()
+            peer_committed.set()
+            with self.assertRaisesRegex(OSError, "creator disk failure"):
+                creator_future.result(timeout=2)
+
+        self.assertEqual(
+            (shared_parent / "peer.txt").read_text(encoding="utf-8"), "peer"
+        )
+        self.assertEqual(
+            peer_result.created_directories, (str(shared_parent.resolve()),)
+        )
 
     def test_prepare_write_accepts_a_missing_parent_directory(self) -> None:
         change = self.tools.prepare_write_file(

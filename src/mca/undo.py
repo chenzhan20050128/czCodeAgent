@@ -111,6 +111,11 @@ class ManagedUndo:
             for result in preflight
             if result.status in {"already_restored", "already_deleted"}
         ]
+        created_directories = tuple(
+            directory
+            for snapshot in snapshots
+            for directory in snapshot.created_directories
+        )
         for item in eligible:
             try:
                 if item.snapshot.existed_before:
@@ -142,14 +147,7 @@ class ManagedUndo:
                         operation_key=turn_id,
                         max_file_bytes=self.max_file_bytes,
                     )
-                    removed_dirs = _remove_created_directories(
-                        self.workspace, item.snapshot.created_directories
-                    )
                     detail = "created file removed"
-                    if removed_dirs:
-                        detail += f"; removed {removed_dirs} created director" + (
-                            "y" if removed_dirs == 1 else "ies"
-                        )
                     completed.append(
                         UndoFileResult(str(item.path), file_status, detail)
                     )
@@ -165,6 +163,21 @@ class ManagedUndo:
                         f"undo failed: {type(error).__name__}: {error}",
                     )
                 )
+        removed_dirs = _remove_created_directories(
+            self.workspace, created_directories
+        )
+        if removed_dirs:
+            for index in range(len(completed) - 1, -1, -1):
+                item = completed[index]
+                if item.status in {"deleted", "already_deleted"}:
+                    completed[index] = UndoFileResult(
+                        item.path,
+                        item.status,
+                        item.detail
+                        + f"; removed {removed_dirs} created director"
+                        + ("y" if removed_dirs == 1 else "ies"),
+                    )
+                    break
         status = reduce_undo_status(item.status for item in completed)
         return self._record(UndoResult(turn_id, status, tuple(completed)))
 
@@ -740,7 +753,7 @@ def _remove_created_directories(
     """
 
     removed = 0
-    for raw in sorted(created, key=len, reverse=True):
+    for raw in sorted(set(created), key=lambda item: (len(Path(item).parts), len(item)), reverse=True):
         path = Path(raw)
         try:
             relative = path.relative_to(workspace)

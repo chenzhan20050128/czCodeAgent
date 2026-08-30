@@ -15,6 +15,8 @@ from types import MappingProxyType
 from typing import Any, Iterable
 
 from .conversation import ConversationError, validate_conversation
+from .code_graph import CodeNode, CodeNodeStatus, CodeRun, CodeRunStatus
+from .file_versions import FileVersion
 
 
 EVENT_VERSION = 1
@@ -67,6 +69,7 @@ class ToolStatus(str, Enum):
     USER_CONFIRMED_SUCCESS = "user_confirmed_success"
     USER_CONFIRMED_FAILURE = "user_confirmed_failure"
     ABANDONED = "abandoned"
+    UPSTREAM_FAILED = "upstream_failed"
 
 
 class TurnStatus(str, Enum):
@@ -109,6 +112,7 @@ _TOOL_FINISH_TRANSITIONS = {
             ToolStatus.BATCH_LIMIT_EXCEEDED,
             ToolStatus.CANCELLED,
             ToolStatus.FAILED,
+            ToolStatus.UPSTREAM_FAILED,
         }
     ),
     ToolStatus.STARTED: frozenset(
@@ -281,11 +285,16 @@ class ToolCall:
     result: str | None = None
     exit_code: int | None = None
     truncated: bool = False
+    result_metadata: Mapping[str, Any] = field(default_factory=dict)
     recovery_blocked: bool = False
     reconciliation_note: str | None = None
     requested_seq: int | None = None
     started_seq: int | None = None
     finished_seq: int | None = None
+    origin: str = "model"
+    parent_call_key: str | None = None
+    code_run_id: str | None = None
+    ordinal: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.call_key, str) or not self.call_key:
@@ -299,6 +308,16 @@ class ToolCall:
             raise DomainError("tool arguments must be a JSON string")
         if not isinstance(self.status, ToolStatus):
             raise DomainError("status must be a ToolStatus")
+        if not isinstance(self.result_metadata, Mapping):
+            raise DomainError("result_metadata must be an object")
+        object.__setattr__(self, "result_metadata", _freeze_json(self.result_metadata))
+        if self.origin not in {"model", "code"}:
+            raise DomainError("tool origin must be model or code")
+        if self.origin == "code":
+            if not self.parent_call_key or not self.code_run_id:
+                raise DomainError("code tool calls require parent and run identity")
+            if type(self.ordinal) is not int or self.ordinal < 1:
+                raise DomainError("code tool calls require a positive ordinal")
 
     @property
     def call_id(self) -> str:
@@ -323,6 +342,7 @@ class FileSnapshot:
     after_hash: str | None = None
     source_call_key: str | None = None
     after_mode: int | None = None
+    after_version: FileVersion | None = None
     created_directories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -361,6 +381,15 @@ class FileSnapshot:
             raise DomainError("after_mode must be permission bits or null")
         if self.after_hash is None and self.after_mode is not None:
             raise DomainError("after_mode requires after_hash")
+        if self.after_version is not None:
+            if not isinstance(self.after_version, FileVersion):
+                raise DomainError("after_version must be a FileVersion or null")
+            if not self.after_version.exists:
+                raise DomainError("after_version must describe an existing file")
+            if self.after_hash != self.after_version.sha256:
+                raise DomainError("after_version sha256 must match after_hash")
+            if self.after_mode != self.after_version.mode:
+                raise DomainError("after_version mode must match after_mode")
         if not isinstance(self.created_directories, tuple) or any(
             not isinstance(item, str) or not item
             for item in self.created_directories
@@ -370,6 +399,31 @@ class FileSnapshot:
             raise DomainError("created_directories requires a successful write")
         if self.created_directories and self.existed_before:
             raise DomainError("created_directories requires a new file")
+
+
+@dataclass(frozen=True)
+class FileMutationPlan:
+    """Durable approval-time provenance for one managed mutation call."""
+
+    turn_id: str
+    call_key: str
+    path: str
+    expected_version: FileVersion
+    proposed_hash: str
+    diff: str
+
+    def __post_init__(self) -> None:
+        _canonical_uuid(self.turn_id, field_name="turn_id")
+        if not isinstance(self.call_key, str) or not self.call_key:
+            raise DomainError("mutation plan call_key must be a non-empty string")
+        if not isinstance(self.path, str) or not self.path:
+            raise DomainError("mutation plan path must be a non-empty string")
+        if not isinstance(self.expected_version, FileVersion):
+            raise DomainError("mutation plan expected_version must be a FileVersion")
+        if not isinstance(self.proposed_hash, str) or not self.proposed_hash:
+            raise DomainError("mutation plan proposed_hash must be a non-empty string")
+        if not isinstance(self.diff, str):
+            raise DomainError("mutation plan diff must be a string")
 
 
 @dataclass
@@ -390,6 +444,9 @@ class SessionState:
     file_snapshots: dict[tuple[str, str], FileSnapshot] = field(
         default_factory=dict
     )
+    file_mutation_plans: dict[str, FileMutationPlan] = field(default_factory=dict)
+    code_runs: dict[str, CodeRun] = field(default_factory=dict)
+    code_nodes: dict[str, CodeNode] = field(default_factory=dict)
     undo_results: dict[str, Event] = field(default_factory=dict)
     latest_checkpoint: Event | None = None
     pending_recovery_intent: Event | None = None
@@ -689,6 +746,11 @@ class SessionReducer:
         state.tool_calls[call.call_key] = replace(
             call, status=ToolStatus.STARTED, started_seq=event.seq
         )
+        if call.origin == "code":
+            node = state.code_nodes[call.call_key]
+            state.code_nodes[call.call_key] = replace(
+                node, status=CodeNodeStatus.STARTED, started_seq=event.seq
+            )
 
     @staticmethod
     def _apply_tool_finished(state: SessionState, event: Event) -> None:
@@ -733,12 +795,14 @@ class SessionReducer:
         after_hash = event.payload.get("after_hash")
         after_mode = event.payload.get("after_mode")
         created_directories = event.payload.get("created_directories")
+        raw_after_version = event.payload.get("after_version")
         snapshot_update: tuple[tuple[str, str], FileSnapshot] | None = None
         if (
             path is not None
             or after_hash is not None
             or after_mode is not None
             or created_directories is not None
+            or raw_after_version is not None
         ):
             if status is not ToolStatus.SUCCEEDED:
                 raise DomainError("after_hash is only valid for a successful tool")
@@ -753,14 +817,33 @@ class SessionReducer:
             ):
                 raise DomainError("after_mode must be permission bits or null")
             directories = _normalized_created_directories(created_directories)
+            after_version: FileVersion | None = None
+            if raw_after_version is not None:
+                try:
+                    after_version = FileVersion.from_dict(raw_after_version)
+                except ValueError as error:
+                    raise DomainError(f"invalid after_version: {error}") from error
+                if not after_version.exists:
+                    raise DomainError("after_version must describe an existing file")
+                if after_version.sha256 != after_hash:
+                    raise DomainError("after_version sha256 must match after_hash")
+                if after_version.mode != after_mode:
+                    raise DomainError("after_version mode must match after_mode")
             key = (call.turn_id, path)
             snapshot = state.file_snapshots.get(key)
             if snapshot is None:
                 raise DomainError("successful write has no file baseline")
-            if (
+            mutation_plan = state.file_mutation_plans.get(call.call_key)
+            if mutation_plan is not None:
+                if mutation_plan.turn_id != call.turn_id or mutation_plan.path != path:
+                    raise DomainError("successful write does not match mutation plan")
+                if mutation_plan.proposed_hash != after_hash:
+                    raise DomainError("successful write hash does not match mutation plan")
+            elif (
                 snapshot.after_hash is None
                 and snapshot.source_call_key != call.call_key
             ):
+                # Compatibility for old rollouts written before per-call plans.
                 raise DomainError("successful write does not match snapshot source call")
             snapshot_update = (
                 key,
@@ -768,7 +851,12 @@ class SessionReducer:
                     snapshot,
                     after_hash=after_hash,
                     after_mode=after_mode,
-                    created_directories=directories,
+                    after_version=after_version,
+                    created_directories=tuple(
+                        dict.fromkeys(
+                            (*snapshot.created_directories, *directories)
+                        )
+                    ),
                 ),
             )
 
@@ -778,12 +866,143 @@ class SessionReducer:
             result=result,
             exit_code=exit_code,
             truncated=truncated,
+            result_metadata=event.payload.get("result_metadata", {}),
             recovery_blocked=recovery_blocked,
             finished_seq=event.seq,
         )
         if snapshot_update is not None:
             state.file_snapshots[snapshot_update[0]] = snapshot_update[1]
+        if call.origin == "code":
+            node = state.code_nodes[call.call_key]
+            node_status = CodeNodeStatus(status.value)
+            blocked_by = event.payload.get("blocked_by", ())
+            root_failures = event.payload.get("root_failures", ())
+            if not isinstance(blocked_by, (list, tuple)) or any(
+                not isinstance(item, str) for item in blocked_by
+            ):
+                raise DomainError("blocked_by must be an array of strings")
+            if not isinstance(root_failures, (list, tuple)) or any(
+                not isinstance(item, str) for item in root_failures
+            ):
+                raise DomainError("root_failures must be an array of strings")
+            state.code_nodes[call.call_key] = replace(
+                node,
+                status=node_status,
+                result=result,
+                blocked_by=tuple(blocked_by),
+                root_failures=tuple(root_failures),
+                finished_seq=event.seq,
+            )
         SessionReducer._refresh_recovery_block(state)
+
+    @staticmethod
+    def _apply_code_run_started(state: SessionState, event: Event) -> None:
+        turn_id = SessionReducer._require_active_turn(state)
+        run_id = _payload_uuid(event.payload, "run_id")
+        if run_id in state.code_runs:
+            raise DomainError("code run already exists")
+        event_turn_id = _payload_uuid(event.payload, "turn_id")
+        if event_turn_id != turn_id:
+            raise DomainError("code run belongs to another turn")
+        parent_call_key = _payload_string(event.payload, "parent_call_key")
+        parent = state.tool_calls.get(parent_call_key)
+        if parent is None or parent.turn_id != turn_id or parent.name != "run_code":
+            raise DomainError("code run parent must be an active run_code call")
+        if parent.status is not ToolStatus.STARTED:
+            raise DomainError("code run parent must be started")
+        state.code_runs[run_id] = CodeRun(
+            run_id=run_id,
+            turn_id=turn_id,
+            parent_call_key=parent_call_key,
+            description=_payload_string(event.payload, "description"),
+            source_hash=_payload_string(event.payload, "source_hash"),
+        )
+
+    @staticmethod
+    def _apply_code_node_planned(state: SessionState, event: Event) -> None:
+        turn_id = SessionReducer._require_active_turn(state)
+        run_id = _payload_uuid(event.payload, "run_id")
+        run = state.code_runs.get(run_id)
+        if run is None or run.status is not CodeRunStatus.ACTIVE:
+            raise DomainError("code node requires an active code run")
+        node_id = _payload_string(event.payload, "node_id")
+        if node_id in state.code_nodes or node_id in state.tool_calls:
+            raise DomainError("code node id has already been used")
+        ordinal = event.payload.get("ordinal")
+        if type(ordinal) is not int or ordinal < 1:
+            raise DomainError("code node ordinal must be a positive integer")
+        if any(
+            state.code_nodes[node].ordinal == ordinal
+            for node in run.node_ids
+        ):
+            raise DomainError("code node ordinal has already been used")
+        dependencies = event.payload.get("dependencies", ())
+        if not isinstance(dependencies, (list, tuple)) or any(
+            not isinstance(item, str) for item in dependencies
+        ):
+            raise DomainError("code node dependencies must be strings")
+        if len(set(dependencies)) != len(dependencies):
+            raise DomainError("code node dependencies must be unique")
+        if node_id in dependencies:
+            raise DomainError("code node cannot depend on itself")
+        if any(
+            dependency not in state.code_nodes
+            or state.code_nodes[dependency].run_id != run_id
+            for dependency in dependencies
+        ):
+            raise DomainError("code node dependency is unknown or foreign")
+        name = _payload_string(event.payload, "name")
+        arguments = _payload_string(event.payload, "arguments", allow_empty=True)
+        node = CodeNode(
+            node_id=node_id,
+            run_id=run_id,
+            parent_call_key=run.parent_call_key,
+            turn_id=turn_id,
+            ordinal=ordinal,
+            name=name,
+            arguments=arguments,
+            dependencies=tuple(dependencies),
+            requested_seq=event.seq,
+        )
+        state.code_nodes[node_id] = node
+        state.code_runs[run_id] = replace(
+            run, node_ids=(*run.node_ids, node_id)
+        )
+        state.tool_calls[node_id] = ToolCall(
+            call_key=node_id,
+            provider_call_id=node_id,
+            turn_id=turn_id,
+            name=name,
+            arguments=arguments,
+            requested_seq=event.seq,
+            origin="code",
+            parent_call_key=run.parent_call_key,
+            code_run_id=run_id,
+            ordinal=ordinal,
+        )
+
+    @staticmethod
+    def _apply_code_run_finished(state: SessionState, event: Event) -> None:
+        run_id = _payload_uuid(event.payload, "run_id")
+        run = state.code_runs.get(run_id)
+        if run is None or run.status is not CodeRunStatus.ACTIVE:
+            raise DomainError("code run is not active")
+        if any(not state.code_nodes[node].status.is_terminal for node in run.node_ids):
+            raise DomainError("code run cannot finish with unfinished nodes")
+        raw_status = _payload_string(event.payload, "status")
+        try:
+            status = CodeRunStatus(raw_status)
+        except ValueError:
+            raise DomainError("invalid code run status") from None
+        if status is CodeRunStatus.ACTIVE:
+            raise DomainError("code run finish requires a terminal status")
+        result = event.payload.get("result")
+        if not isinstance(result, str):
+            raise DomainError("code run result must be a string")
+        summary = event.payload.get("summary")
+        if not isinstance(summary, Mapping):
+            raise DomainError("code run summary must be an object")
+        state.code_runs[run_id] = replace(run, status=status, result=result)
 
     @staticmethod
     def _apply_turn_recovery_intent(
@@ -868,6 +1087,53 @@ class SessionReducer:
         note = event.payload.get("note", "")
         if not isinstance(note, str):
             raise DomainError("reconciliation note must be a string")
+        snapshot_update: tuple[tuple[str, str], FileSnapshot] | None = None
+        raw_after_version = event.payload.get("after_version")
+        mutation_plan = state.file_mutation_plans.get(call.call_key)
+        if (
+            raw_outcome in {"succeeded", "user_confirmed_success"}
+            and mutation_plan is not None
+            and raw_after_version is None
+        ):
+            raise DomainError(
+                "successful file reconciliation requires an observed file version"
+            )
+        if raw_after_version is not None:
+            if raw_outcome not in {"succeeded", "user_confirmed_success"}:
+                raise DomainError(
+                    "reconciled file version requires a successful outcome"
+                )
+            plan = mutation_plan
+            if plan is None:
+                raise DomainError("reconciled file version requires a mutation plan")
+            path = _payload_string(event.payload, "path")
+            after_hash = _payload_string(event.payload, "after_hash")
+            after_mode = event.payload.get("after_mode")
+            try:
+                after_version = FileVersion.from_dict(raw_after_version)
+            except ValueError as error:
+                raise DomainError(f"invalid after_version: {error}") from error
+            if (
+                path != plan.path
+                or after_hash != plan.proposed_hash
+                or not after_version.exists
+                or after_version.sha256 != after_hash
+                or after_version.mode != after_mode
+            ):
+                raise DomainError("reconciled file version does not match mutation plan")
+            key = (call.turn_id, path)
+            snapshot = state.file_snapshots.get(key)
+            if snapshot is None:
+                raise DomainError("reconciled write has no file baseline")
+            snapshot_update = (
+                key,
+                replace(
+                    snapshot,
+                    after_hash=after_hash,
+                    after_mode=after_mode,
+                    after_version=after_version,
+                ),
+            )
         state.tool_calls[call.call_key] = replace(
             call,
             status=statuses[raw_outcome],
@@ -875,6 +1141,16 @@ class SessionReducer:
             reconciliation_note=note,
             finished_seq=event.seq,
         )
+        if snapshot_update is not None:
+            state.file_snapshots[snapshot_update[0]] = snapshot_update[1]
+        if call.origin == "code":
+            node = state.code_nodes[call.call_key]
+            state.code_nodes[call.call_key] = replace(
+                node,
+                status=CodeNodeStatus(statuses[raw_outcome].value),
+                result=note or node.result,
+                finished_seq=event.seq,
+            )
         SessionReducer._refresh_recovery_block(state)
 
     @staticmethod
@@ -1015,6 +1291,43 @@ class SessionReducer:
                 state.file_snapshots[key] = snapshot
 
     @staticmethod
+    def _apply_file_mutation_planned(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(
+            state, "record a file mutation plan"
+        )
+        active_turn_id = SessionReducer._require_active_turn(state)
+        turn_id = _payload_uuid(event.payload, "turn_id")
+        if turn_id != active_turn_id:
+            raise DomainError("file mutation plan belongs to another turn")
+        call_key = _payload_string(event.payload, "call_key")
+        call = state.tool_calls.get(call_key)
+        if call is None:
+            raise DomainError(f"unknown mutation plan call_key: {call_key}")
+        if call.turn_id != turn_id or call.status is not ToolStatus.REQUESTED:
+            raise DomainError("mutation plan call_key is not an active requested call")
+        if call.name not in _MANAGED_WRITE_TOOL_NAMES:
+            raise DomainError("mutation plan call_key must identify a managed write")
+        if call.approved is not True:
+            raise DomainError("file mutation plan requires an approved call")
+        try:
+            expected_version = FileVersion.from_dict(
+                event.payload.get("expected_version")
+            )
+        except ValueError as error:
+            raise DomainError(f"invalid expected_version: {error}") from error
+        plan = FileMutationPlan(
+            turn_id=turn_id,
+            call_key=call_key,
+            path=_payload_string(event.payload, "path"),
+            expected_version=expected_version,
+            proposed_hash=_payload_string(event.payload, "proposed_hash"),
+            diff=event.payload.get("diff"),
+        )
+        if call_key in state.file_mutation_plans:
+            raise DomainError("file mutation plan already exists for call_key")
+        state.file_mutation_plans[call_key] = plan
+
+    @staticmethod
     def _apply_sampling_failed(state: SessionState, event: Event) -> None:
         SessionReducer._reject_pending_recovery_action(
             state, "record a sampling failure"
@@ -1148,6 +1461,9 @@ def reduce_event(state: SessionState, event: Event) -> SessionState:
         turn_inputs=dict(state.turn_inputs),
         tool_calls=dict(state.tool_calls),
         file_snapshots=dict(state.file_snapshots),
+        file_mutation_plans=dict(state.file_mutation_plans),
+        code_runs=dict(state.code_runs),
+        code_nodes=dict(state.code_nodes),
         undo_results=dict(state.undo_results),
         assistant_events=list(state.assistant_events),
         events=list(state.events),

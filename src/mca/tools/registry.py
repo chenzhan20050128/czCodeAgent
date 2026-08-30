@@ -39,6 +39,13 @@ class SideEffect(str, Enum):
     PLAN_EXIT = "plan_exit"
 
 
+class ExecutionMode(str, Enum):
+    """Host scheduling mode for one validated tool call."""
+
+    PARALLEL = "parallel"
+    EXCLUSIVE = "exclusive"
+
+
 @dataclass(frozen=True)
 class ToolSpec:
     """One handwritten provider contract and its local entry point."""
@@ -50,6 +57,7 @@ class ToolSpec:
     prepare_handler: ToolHandler | None = None
     side_effect: SideEffect | bool = SideEffect.NONE
     approval_renderer: Callable[[object], str] | None = None
+    is_concurrency_safe: Callable[[dict[str, Any]], bool] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -60,6 +68,10 @@ class ToolSpec:
             raise ValueError("tool must define exactly one handler or prepare handler")
         if not isinstance(self.side_effect, (SideEffect, bool)):
             raise ValueError("side_effect must be a SideEffect or boolean")
+        if self.is_concurrency_safe is not None and not callable(
+            self.is_concurrency_safe
+        ):
+            raise ValueError("is_concurrency_safe must be callable or None")
         _check_schema(self.schema, path="schema")
         if self.schema.get("type") != "object":
             raise ValueError("tool schema must have type object")
@@ -166,6 +178,22 @@ class ToolRegistry:
             raise ToolValidationError("arguments must be an object")
         validate_arguments(spec.schema, arguments)
         return arguments
+
+    def execution_mode(self, name: str, raw_arguments: str) -> ExecutionMode:
+        """Classify a pending call, failing closed on every uncertainty."""
+
+        try:
+            spec = self.resolve(name)
+            if spec.side_effect not in {SideEffect.NONE, False}:
+                return ExecutionMode.EXCLUSIVE
+            classifier = spec.is_concurrency_safe
+            if classifier is None:
+                return ExecutionMode.EXCLUSIVE
+            arguments = self.parse_and_validate(name, raw_arguments)
+            safe = classifier(arguments)
+        except Exception:
+            return ExecutionMode.EXCLUSIVE
+        return ExecutionMode.PARALLEL if safe is True else ExecutionMode.EXCLUSIVE
 
 
 def _raise_invalid_constant(value: str) -> object:

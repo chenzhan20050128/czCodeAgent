@@ -27,6 +27,7 @@ from .projection import (
     request_fits_budget,
 )
 from .store import RolloutStore
+from .tool_scheduler import ToolBatchScheduler
 from .tools.registry import ToolRegistry
 
 
@@ -164,6 +165,8 @@ class AgentLoop:
             raise ValueError("max_steps must be non-negative")
         if config.max_tool_calls_per_batch < 1:
             raise ValueError("max_tool_calls_per_batch must be positive")
+        if config.max_parallel_tool_calls < 1:
+            raise ValueError("max_parallel_tool_calls must be positive")
         if executor.store is not store or executor.state is not state:
             raise ValueError("executor must share the AgentLoop store and state")
         if state.session_id != store.session_id:
@@ -548,23 +551,23 @@ class AgentLoop:
 
     def _execute_batch(self, calls: Sequence[AcceptedToolCall]) -> bool:
         limit = self.config.max_tool_calls_per_batch
-        for index, call in enumerate(calls[:limit]):
-            try:
-                result = self.executor.execute(call)
-            except KeyboardInterrupt:
-                self._synchronize_state_from_store()
-                self._close_calls(
-                    calls[index:],
-                    current_call_key=call.call_key,
-                    current_status=ToolStatus.CANCELLED,
-                )
-                return True
-            except ToolExecutorError as error:
-                self._usable = False
-                raise AgentLoopError("tool executor cannot safely continue") from error
-            if result.status == ToolStatus.INTERRUPTED.value:
-                self._close_calls(calls[index + 1 :])
-                return True
+        scheduler = ToolBatchScheduler(
+            self.executor,
+            max_parallel=self.config.max_parallel_tool_calls,
+            close_calls=self._close_calls,
+        )
+        try:
+            interrupted = scheduler.execute(calls[:limit])
+        except KeyboardInterrupt:
+            self._synchronize_state_from_store()
+            self._close_calls(calls[:limit])
+            return True
+        except ToolExecutorError as error:
+            self._usable = False
+            raise AgentLoopError("tool executor cannot safely continue") from error
+        if interrupted:
+            self._close_calls(calls[limit:])
+            return True
 
         for call in calls[limit:]:
             self._finish_requested_call(

@@ -22,6 +22,9 @@ from mca.domain import (
     ToolStatus,
     TurnStatus,
 )
+from mca.code_graph import CodeRunStatus
+from mca.approval import ApprovalDecision
+from mca.executor import AcceptedToolCall, ToolExecutor
 from mca.projection import (
     ProjectionBlockedError,
     ProjectionEnvironment,
@@ -40,6 +43,8 @@ from mca.store import (
     RolloutStore,
     SessionLockedError,
 )
+from mca.tools import create_tool_registry
+from mca.undo import ManagedUndo
 
 
 def tool_call(call_id: str, name: str = "bash") -> dict[str, object]:
@@ -153,6 +158,71 @@ class ResumeTestCase(unittest.TestCase):
 
 
 class SessionResumeTests(ResumeTestCase):
+    def test_interrupted_code_run_closes_outer_and_recovers_nested_nodes(self) -> None:
+        self.start_turn(("outer",))
+        outer_event = self.store.load()[-1]
+        # Replace the generic helper's bash name with a run_code request in a
+        # fresh fixture so the recovery path owns the outer orchestration call.
+        self.store.close()
+        root = self.root / "code-recovery"
+        workspace = (root / "work").resolve()
+        workspace.mkdir(parents=True)
+        sessions = root / "sessions"
+        session_id = str(uuid.uuid4())
+        turn_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        with RolloutStore.create(sessions, session_id) as store:
+            store.append("session_created", {"cwd": str(workspace), "model": "m", "context_window": 4096})
+            store.append("turn_started", {"turn_id": turn_id, "user_input": "run"})
+            store.append("assistant_accepted", {"content": None, "tool_calls": [{"id": "outer", "type": "function", "function": {"name": "run_code", "arguments": "{}"}}]})
+            store.append("tool_started", {"call_key": "3:outer", "call_id": "outer"})
+            store.append("code_run_started", {"run_id": run_id, "turn_id": turn_id, "parent_call_key": "3:outer", "description": "work", "source_hash": "sha256:x"})
+            first = f"{run_id}:node:1"
+            second = f"{run_id}:node:2"
+            for ordinal, node_id in enumerate((first, second), 1):
+                store.append("code_node_planned", {"run_id": run_id, "node_id": node_id, "ordinal": ordinal, "name": "write_file", "arguments": "{}", "dependencies": []})
+            store.append("tool_started", {"call_key": first, "call_id": first, "origin": "code"})
+
+        with resume_session(sessions, session_id, workspace) as resumed:
+            self.assertIs(resumed.state.tool_calls[first].status, ToolStatus.OUTCOME_UNKNOWN)
+            self.assertIs(resumed.state.tool_calls[second].status, ToolStatus.NOT_EXECUTED)
+            self.assertIs(resumed.state.tool_calls["3:outer"].status, ToolStatus.FAILED)
+            self.assertIs(resumed.state.code_runs[run_id].status, CodeRunStatus.FAILED)
+            self.assertTrue(resumed.state.recovery_blocked)
+            self.assertEqual(
+                [event.type for event in resumed.store.load()[-4:]],
+                ["tool_finished", "tool_finished", "code_run_finished", "tool_finished"],
+            )
+
+    def test_active_code_run_is_closed_even_if_outer_call_already_failed(self) -> None:
+        self.store.close()
+        root = self.root / "orphan-code-run"
+        workspace = (root / "work").resolve()
+        workspace.mkdir(parents=True)
+        sessions = root / "sessions"
+        session_id = str(uuid.uuid4())
+        turn_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        with RolloutStore.create(sessions, session_id) as store:
+            store.append("session_created", {"cwd": str(workspace), "model": "m", "context_window": 4096})
+            store.append("turn_started", {"turn_id": turn_id, "user_input": "run"})
+            store.append("assistant_accepted", {"content": None, "tool_calls": [{"id": "outer", "type": "function", "function": {"name": "run_code", "arguments": "{}"}}]})
+            store.append("tool_started", {"call_key": "3:outer", "call_id": "outer"})
+            store.append("code_run_started", {"run_id": run_id, "turn_id": turn_id, "parent_call_key": "3:outer", "description": "work", "source_hash": "sha256:x"})
+            node = f"{run_id}:node:1"
+            store.append("code_node_planned", {"run_id": run_id, "node_id": node, "ordinal": 1, "name": "read_file", "arguments": "{}", "dependencies": []})
+            store.append("tool_finished", {"call_key": "3:outer", "call_id": "outer", "status": "failed", "result": "runtime crashed"})
+
+        with resume_session(sessions, session_id, workspace) as resumed:
+            self.assertEqual(resumed.state.code_runs[run_id].status.value, "failed")
+            self.assertEqual(resumed.state.code_nodes[node].status.value, "not_executed")
+            self.assertFalse(
+                any(
+                    call.status in {ToolStatus.REQUESTED, ToolStatus.STARTED}
+                    for call in resumed.state.tool_calls.values()
+                )
+            )
+
     def test_completed_session_replays_without_appending_recovery_events(self) -> None:
         self.start_turn()
         self.append(
@@ -308,6 +378,37 @@ class SessionResumeTests(ResumeTestCase):
             )
             with self.assertRaisesRegex(ReconciliationError, "blocked"):
                 continuable_turn_id(resumed.state)
+            with self.assertRaises(ProjectionBlockedError):
+                PromptProjector.project(
+                    resumed.store.load(), resumed.state, self.environment()
+                )
+
+    def test_multiple_started_calls_each_become_unknown_after_parallel_crash(self) -> None:
+        self.start_turn(("first", "second"))
+        for call_id in ("first", "second"):
+            self.append(
+                "tool_started",
+                {"call_key": f"3:{call_id}", "call_id": call_id},
+            )
+
+        with self.reopen() as resumed:
+            self.assertEqual(
+                [
+                    resumed.state.tool_calls[f"3:{call_id}"].status
+                    for call_id in ("first", "second")
+                ],
+                [ToolStatus.OUTCOME_UNKNOWN, ToolStatus.OUTCOME_UNKNOWN],
+            )
+            recovery = [
+                event
+                for event in resumed.store.load()
+                if event.type == "tool_finished"
+            ]
+            self.assertEqual(
+                [event.payload["call_id"] for event in recovery],
+                ["first", "second"],
+            )
+            self.assertTrue(resumed.state.recovery_blocked)
             with self.assertRaises(ProjectionBlockedError):
                 PromptProjector.project(
                     resumed.store.load(), resumed.state, self.environment()
@@ -832,6 +933,117 @@ class ReconciliationTests(ResumeTestCase):
 
             self.assertEqual(resumed.state, before)
             self.assertTrue(resumed.state.recovery_blocked)
+
+    def test_confirmed_successful_unknown_write_records_version_for_undo(self) -> None:
+        target = self.workspace / "recover.txt"
+        target.write_text("before", encoding="utf-8")
+        self.start_turn()
+        arguments = json.dumps({"path": "recover.txt", "content": "after"})
+        self.append("assistant_accepted", {"content": None, "tool_calls": [{"id": "write", "type": "function", "function": {"name": "write_file", "arguments": arguments}}]})
+
+        class Allow:
+            def decide(self, request):
+                return ApprovalDecision.ALLOW_ONCE
+
+        executor = ToolExecutor(
+            create_tool_registry(self.workspace), self.store, self.state,
+            Allow(), self.workspace,
+        )
+        call = AcceptedToolCall("3:write", "write", "write_file", arguments)
+        staged = executor.prepare_staged(call)
+        executor.start_staged(staged)
+        result = executor.dispatch_staged(staged)
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(target.read_text(encoding="utf-8"), "after")
+
+        with self.reopen() as resumed:
+            self.assertIs(resumed.state.tool_calls["3:write"].status, ToolStatus.OUTCOME_UNKNOWN)
+            reconcile_tool(
+                resumed.store, resumed.state, "3:write", "succeeded",
+                "verified workspace content",
+            )
+            snapshot = resumed.state.file_snapshots[(self.turn_id, str(target))]
+            self.assertIsNotNone(snapshot.after_version)
+            self.assertIsNotNone(snapshot.after_hash)
+            finish = resumed.store.append(
+                "turn_finished",
+                {"turn_id": self.turn_id, "status": "interrupted"},
+            )
+            SessionReducer.apply(resumed.state, finish)
+            undone = ManagedUndo(
+                resumed.store, resumed.state, self.workspace
+            ).undo_turn(self.turn_id)
+
+            self.assertEqual(undone.status, "succeeded")
+            self.assertEqual(target.read_text(encoding="utf-8"), "before")
+
+    def test_unknown_write_cannot_be_confirmed_if_content_mismatches_plan(self) -> None:
+        target = self.workspace / "recover.txt"
+        target.write_text("before", encoding="utf-8")
+        self.start_turn()
+        arguments = json.dumps({"path": "recover.txt", "content": "after"})
+        self.append("assistant_accepted", {"content": None, "tool_calls": [{"id": "write", "type": "function", "function": {"name": "write_file", "arguments": arguments}}]})
+
+        class Allow:
+            def decide(self, request):
+                return ApprovalDecision.ALLOW_ONCE
+
+        executor = ToolExecutor(
+            create_tool_registry(self.workspace), self.store, self.state,
+            Allow(), self.workspace,
+        )
+        call = AcceptedToolCall("3:write", "write", "write_file", arguments)
+        staged = executor.prepare_staged(call)
+        executor.start_staged(staged)
+        executor.dispatch_staged(staged)
+        target.write_text("external", encoding="utf-8")
+
+        with self.reopen() as resumed:
+            before = list(resumed.store.load())
+            with self.assertRaisesRegex(
+                ReconciliationError, "does not match the approved mutation"
+            ):
+                reconcile_tool(
+                    resumed.store, resumed.state, "3:write", "succeeded"
+                )
+
+            self.assertEqual(resumed.store.load(), before)
+            self.assertTrue(resumed.state.recovery_blocked)
+            snapshot = resumed.state.file_snapshots[(self.turn_id, str(target))]
+            self.assertIsNone(snapshot.after_version)
+
+    def test_reducer_rejects_successful_write_reconciliation_without_version(self) -> None:
+        target = self.workspace / "recover.txt"
+        target.write_text("before", encoding="utf-8")
+        self.start_turn()
+        arguments = json.dumps({"path": "recover.txt", "content": "after"})
+        self.append("assistant_accepted", {"content": None, "tool_calls": [{"id": "write", "type": "function", "function": {"name": "write_file", "arguments": arguments}}]})
+
+        class Allow:
+            def decide(self, request):
+                return ApprovalDecision.ALLOW_ONCE
+
+        executor = ToolExecutor(
+            create_tool_registry(self.workspace), self.store, self.state,
+            Allow(), self.workspace,
+        )
+        call = AcceptedToolCall("3:write", "write", "write_file", arguments)
+        staged = executor.prepare_staged(call)
+        executor.start_staged(staged)
+        unknown = Event.create(
+            seq=self.state.last_seq + 1, session_id=self.session_id,
+            event_type="tool_finished",
+            payload={"call_key": "3:write", "call_id": "write", "status": "outcome_unknown", "result": "unknown", "recovery_blocked": True},
+        )
+        SessionReducer.apply(self.state, unknown)
+        forged = Event.create(
+            seq=self.state.last_seq + 1, session_id=self.session_id,
+            event_type="tool_reconciled",
+            payload={"call_key": "3:write", "call_id": "write", "outcome": "succeeded", "note": "trust me"},
+        )
+
+        with self.assertRaisesRegex(DomainError, "file version"):
+            SessionReducer.apply(self.state, forged)
 
 
 if __name__ == "__main__":

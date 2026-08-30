@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import platform as platform_module
+import shutil
 import sys
 import uuid
 from collections.abc import Sequence
@@ -20,8 +21,10 @@ from pathlib import Path
 from .agent import AgentLoop, RecoveryBlockedError
 from .approval import InteractiveApprover, _escape_terminal_text
 from .compact import CompactionError, SessionCompactor
+from .code_runtime import CodeRuntimeConfig
+from .code_graph import project_code_graph
 from .config import Config
-from .domain import SessionReducer, SessionState, ToolStatus, TurnStatus
+from .domain import Event, SessionReducer, SessionState, ToolStatus, TurnStatus
 from .executor import ToolExecutor
 from .inspect import list_session_ids, render_transcript, summarize
 from .model import ModelClient
@@ -35,13 +38,39 @@ from .session import (
     resume_session,
 )
 from .store import RolloutCorruptionError, RolloutStore, SessionLockedError
-from .terminal import TerminalInputError, TerminalTheme, read_multiline_prompt
+from .terminal import (
+    TerminalInputError,
+    TerminalTheme,
+    read_multiline_prompt,
+    render_code_graph_ansi,
+    render_code_graph_plain,
+)
 from .tools import create_tool_registry
 from .undo import ManagedUndo, UndoError
 
 
 SESSIONS_ROOT = Path(".mca") / "sessions"
 _SUCCESS_STATUSES = {TurnStatus.COMPLETED, TurnStatus.MAX_STEPS_REACHED}
+_CODE_STATUS_LABELS = {
+    "planned": "PLANNED",
+    "started": "RUNNING",
+    "succeeded": "SUCCEEDED",
+    "user_confirmed_success": "CONFIRMED",
+    "failed": "FAILED",
+    "denied": "DENIED",
+    "invalid_arguments": "INVALID",
+    "unknown_tool": "UNKNOWN_TOOL",
+    "conflict": "CONFLICT",
+    "timed_out": "TIMED_OUT",
+    "interrupted": "INTERRUPTED",
+    "cancelled": "CANCELLED",
+    "not_executed": "NOT_EXECUTED",
+    "upstream_failed": "UPSTREAM_FAILED",
+    "outcome_unknown": "OUTCOME_UNKNOWN",
+    "abandoned": "ABANDONED",
+    "batch_limit_exceeded": "BATCH_LIMIT",
+    "user_confirmed_failure": "CONFIRMED_FAILED",
+}
 _REPL_HELP = (
     "Commands:\n"
     "  /help     show this help\n"
@@ -79,6 +108,10 @@ def _live_environment(workspace: Path) -> ProjectionEnvironment:
     )
 
 
+def _code_status_label(status: str) -> str:
+    return _CODE_STATUS_LABELS.get(status, status.upper())
+
+
 class _Console:
     """Stdout writer that also renders streamed assistant content."""
 
@@ -89,7 +122,11 @@ class _Console:
         self._streamed_assistant_text = ""
         self._separate_next_live_block = False
         enabled = sys.stdout.isatty() if color is None else color
+        self._interactive = bool(enabled)
         self.theme = TerminalTheme.auto(isatty=enabled)
+        self._code_graph_lines = 0
+        self._active_code_run_id: str | None = None
+        self._warned_code_runs: set[str] = set()
 
     def line(self, text: str = "", *, role: str | None = None) -> None:
         if self._streaming:
@@ -103,6 +140,7 @@ class _Console:
         )
 
     def approval(self, text: str) -> None:
+        self._pause_code_graph()
         self._start_live_block()
         self.badge("approval", text, role="approval")
         self._separate_next_live_block = True
@@ -157,6 +195,107 @@ class _Console:
             self.badge("tool call", f"{name} {arguments}", role="tool")
         self._separate_next_live_block = bool(calls)
 
+    def code_event(self, event: Event, state: SessionState) -> None:
+        """Render a durable Code Mode transition after state reduction."""
+
+        run_id = self._code_run_for_event(event, state)
+        if run_id is None:
+            return
+        graph = project_code_graph(state, run_id)
+        if not self._interactive:
+            line = self._plain_code_event_line(event, graph)
+            if line is not None:
+                self.line(f"[code-dag] {line}")
+            if graph.shell_mutation_warning and run_id not in self._warned_code_runs:
+                self.line(
+                    "[code-dag] warning parallel bash + file mutation may contend"
+                )
+                self._warned_code_runs.add(run_id)
+            return
+        self._active_code_run_id = run_id
+        width = max(20, shutil.get_terminal_size(fallback=(100, 24)).columns)
+        rendered = (
+            render_code_graph_ansi(graph, width=width, expanded=True)
+            if self.theme.enabled
+            else render_code_graph_plain(graph, width=width, expanded=True)
+        )
+        self._redraw_code_graph(rendered)
+        if event.type == "code_run_finished":
+            self._code_graph_lines = 0
+            self._active_code_run_id = None
+            self._separate_next_live_block = True
+
+    @staticmethod
+    def _code_run_for_event(event: Event, state: SessionState) -> str | None:
+        raw_run_id = event.payload.get("run_id")
+        if isinstance(raw_run_id, str) and raw_run_id in state.code_runs:
+            return raw_run_id
+        raw_call_key = event.payload.get("call_key")
+        if isinstance(raw_call_key, str):
+            call = state.tool_calls.get(raw_call_key)
+            if call is not None and call.origin == "code":
+                return call.code_run_id
+        return None
+
+    @staticmethod
+    def _plain_code_event_line(event: Event, graph: object) -> str | None:
+        if event.type in {"code_run_started", "code_run_finished"}:
+            if event.type == "code_run_started":
+                return (
+                    f"run {graph.status.upper()} "
+                    f"{_escape_terminal_text(graph.description)}"
+                )
+            counts = graph.summary
+            failed_statuses = (
+                "failed", "denied", "invalid_arguments", "unknown_tool",
+                "conflict", "timed_out", "interrupted", "cancelled",
+                "outcome_unknown", "abandoned", "batch_limit_exceeded",
+                "user_confirmed_failure",
+            )
+            return (
+                f"run {graph.status.upper()} "
+                f"succeeded={counts.get('succeeded', 0)} "
+                f"failed={sum(counts.get(name, 0) for name in failed_statuses)} "
+                f"skipped={counts.get('upstream_failed', 0) + counts.get('not_executed', 0)}"
+            )
+        call_key = event.payload.get("node_id", event.payload.get("call_key"))
+        node = next(
+            (item for item in graph.nodes if item.node_id == call_key), None
+        )
+        if node is None:
+            return None
+        if event.type == "approval_decided":
+            status = "APPROVED" if node.approval == "approved" else "DENIED"
+        elif event.type in {"code_node_planned", "tool_started", "tool_finished", "tool_reconciled"}:
+            status = _code_status_label(node.status)
+        else:
+            return None
+        target = f" {_escape_terminal_text(node.target)}" if node.target else ""
+        dependencies = ",".join(f"#{value}" for value in node.dependency_ordinals) or "-"
+        return (
+            f"#{node.ordinal} {status} {_escape_terminal_text(node.name)}"
+            f"{target} deps={dependencies}"
+        )
+
+    def _redraw_code_graph(self, rendered: str) -> None:
+        self._start_live_block()
+        if self._code_graph_lines:
+            sys.stdout.write(f"\x1b[{self._code_graph_lines}A")
+        lines = rendered.splitlines() or [""]
+        for line in lines:
+            sys.stdout.write("\r\x1b[2K" + line + "\n")
+        for _ in range(max(0, self._code_graph_lines - len(lines))):
+            sys.stdout.write("\r\x1b[2K\n")
+        if self._code_graph_lines > len(lines):
+            sys.stdout.write(f"\x1b[{self._code_graph_lines - len(lines)}A")
+        sys.stdout.flush()
+        self._code_graph_lines = len(lines)
+
+    def _pause_code_graph(self) -> None:
+        if self._code_graph_lines:
+            self._code_graph_lines = 0
+            self._separate_next_live_block = False
+
     def final_text_was_streamed(self, final_text: str) -> bool:
         streamed = bool(final_text) and self._streamed_assistant_text == final_text
         self._streamed_assistant_text = ""
@@ -198,6 +337,20 @@ class _Runtime:
             state=state,
             approver=approver,
             workspace=workspace,
+            code_runtime_config=CodeRuntimeConfig(
+                max_wall_seconds=config.code_max_wall_seconds,
+                max_cpu_seconds=config.code_max_cpu_seconds,
+                max_memory_mb=config.code_max_memory_mb,
+                max_source_bytes=config.code_max_source_bytes,
+                max_ast_nodes=config.code_max_ast_nodes,
+                max_eval_steps=config.code_max_eval_steps,
+                max_collection_items=config.code_max_collection_items,
+                max_output_bytes=config.code_max_output_bytes,
+                max_frame_bytes=max(config.code_max_output_bytes * 2, 1024 * 1024),
+            ),
+            code_max_parallel_nodes=config.code_max_parallel_nodes,
+            code_max_tool_nodes=config.code_max_tool_nodes,
+            event_observer=console.code_event,
         )
         self.compactor = SessionCompactor(
             store=store,
@@ -571,7 +724,13 @@ def _list_sessions(workspace: Path, console: _Console) -> int:
     return 0
 
 
-def _show_session(workspace: Path, session_id: str, console: _Console) -> int:
+def _show_session(
+    workspace: Path,
+    session_id: str,
+    console: _Console,
+    *,
+    expanded_graph: bool = False,
+) -> int:
     """Print a session transcript without taking any lock."""
 
     sessions_root = _sessions_root(workspace)
@@ -588,7 +747,7 @@ def _show_session(workspace: Path, session_id: str, console: _Console) -> int:
     except Exception as error:
         console.line(f"[error: session is corrupt: {error}]")
         return 1
-    console.line(render_transcript(state))
+    console.line(render_transcript(state, expanded_graph=expanded_graph))
     return 0
 
 
@@ -618,6 +777,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print a session transcript and exit (read-only)",
     )
     parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="expand Code Mode DAG edges and failure details with --show",
+    )
+    parser.add_argument(
         "--workspace",
         default=None,
         help="workspace directory (default: current directory)",
@@ -643,7 +807,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, assemble the runtime, and drive one session."""
 
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    if args.graph and args.show is None:
+        parser.error("--graph requires --show SESSION_ID")
     console = _Console(verbose=args.verbose)
 
     try:
@@ -658,7 +825,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.list:
         return _list_sessions(workspace, console)
     if args.show is not None:
-        return _show_session(workspace, args.show, console)
+        return _show_session(
+            workspace, args.show, console, expanded_graph=args.graph
+        )
 
     try:
         base_config = Config.from_env()

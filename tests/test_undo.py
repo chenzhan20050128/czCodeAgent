@@ -348,6 +348,46 @@ class ManagedUndoTests(UndoTestCase):
         self.assertTrue((self.workspace / "pkg").exists())
         self.assertEqual(sibling.read_text(encoding="utf-8"), "keep")
 
+    def test_undo_removes_shared_created_parent_after_all_files(self) -> None:
+        self.write_call("one", "pkg/a.txt", "first")
+        self.write_call("two", "pkg/b.txt", "second")
+        self.assertTrue((self.workspace / "pkg").is_dir())
+
+        result = self.undo()
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(
+            [item.status for item in result.files], ["deleted", "deleted"]
+        )
+        self.assertFalse((self.workspace / "pkg").exists())
+
+    def test_later_rewrite_preserves_created_directories_for_undo(self) -> None:
+        path = self.workspace / "pkg" / "sub" / "module.py"
+        self.write_call("one", "pkg/sub/module.py", "first")
+        first_snapshot = self.state.file_snapshots[
+            (self.turn_id, str(path.resolve()))
+        ]
+        self.assertEqual(
+            first_snapshot.created_directories,
+            (
+                str((self.workspace / "pkg").resolve()),
+                str((self.workspace / "pkg" / "sub").resolve()),
+            ),
+        )
+
+        self.write_call("two", "pkg/sub/module.py", "second")
+
+        latest_snapshot = self.state.file_snapshots[
+            (self.turn_id, str(path.resolve()))
+        ]
+        self.assertEqual(
+            latest_snapshot.created_directories,
+            first_snapshot.created_directories,
+        )
+        result = self.undo()
+        self.assertEqual(result.status, "succeeded")
+        self.assertFalse((self.workspace / "pkg").exists())
+
     def test_multiple_edits_restore_first_baseline(self) -> None:
         path = self.workspace / "many.txt"
         path.write_text("first", encoding="utf-8")

@@ -9,6 +9,7 @@ from ..approval import ApprovalRequest
 from .filesystem import FileSystemTools
 from .plan import prepare_exit_plan_mode
 from .registry import (
+    ExecutionMode,
     SideEffect,
     ToolRegistry,
     ToolResult,
@@ -26,6 +27,9 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
 
     Stateful handlers are bound to the canonical workspace at construction.
     """
+
+    from ..code_mode import prepare_code_program
+    from ..code_sdk import render_python_sdk
 
     filesystem = FileSystemTools(Path(workspace))
     search = SearchTools(Path(workspace))
@@ -53,6 +57,7 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             },
             handler=filesystem.read_file,
             side_effect=SideEffect.NONE,
+            is_concurrency_safe=lambda arguments: True,
         ),
         ToolSpec(
             name="list_dir",
@@ -76,6 +81,7 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             },
             handler=filesystem.list_dir,
             side_effect=SideEffect.NONE,
+            is_concurrency_safe=lambda arguments: True,
         ),
         ToolSpec(
             name="grep",
@@ -190,9 +196,30 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             ),
         ),
     ]
+    base_registry = ToolRegistry(specs, workspace=Path(workspace))
+    specs.append(ToolSpec(
+        name="run_code",
+        description=(
+            "Execute a Constrained Python program that composes MCA tools. "
+            "Only the program result and summary return to the model.\n\n"
+            + render_python_sdk(base_registry)
+        ),
+        schema={
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "minLength": 1},
+                "code": {"type": "string", "minLength": 1},
+            },
+            "required": ["description", "code"],
+            "additionalProperties": False,
+        },
+        prepare_handler=prepare_code_program,
+        side_effect=SideEffect.NONE,
+    ))
     return ToolRegistry(specs, workspace=Path(workspace))
 
 __all__ = [
+    "ExecutionMode",
     "SideEffect",
     "ToolRegistry",
     "ToolResult",

@@ -38,6 +38,17 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertGreater(config.max_steps, 0)
         self.assertIsInstance(config.max_tool_calls_per_batch, int)
         self.assertGreater(config.max_tool_calls_per_batch, 0)
+        self.assertEqual(config.max_parallel_tool_calls, 4)
+        self.assertEqual(config.code_max_parallel_nodes, 4)
+        self.assertEqual(config.code_max_tool_nodes, 64)
+        self.assertEqual(config.code_max_wall_seconds, 120.0)
+        self.assertEqual(config.code_max_cpu_seconds, 30)
+        self.assertEqual(config.code_max_memory_mb, 256)
+        self.assertEqual(config.code_max_source_bytes, 65_536)
+        self.assertEqual(config.code_max_ast_nodes, 10_000)
+        self.assertEqual(config.code_max_eval_steps, 100_000)
+        self.assertEqual(config.code_max_output_bytes, 65_536)
+        self.assertEqual(config.code_max_collection_items, 10_000)
         self.assertIsInstance(config.request_timeout, float)
         self.assertGreater(config.request_timeout, 0)
         self.assertIsInstance(config.max_attempts, int)
@@ -117,6 +128,17 @@ class ConfigFromEnvTests(unittest.TestCase):
                 "MCA_MAX_OUTPUT_TOKENS": "98304",
                 "MCA_THINKING": "enabled",
                 "MCA_MAX_STEPS": "96",
+                "MCA_MAX_PARALLEL_TOOL_CALLS": "3",
+                "MCA_CODE_MAX_PARALLEL_NODES": "2",
+                "MCA_CODE_MAX_TOOL_NODES": "12",
+                "MCA_CODE_MAX_WALL_SECONDS": "45",
+                "MCA_CODE_MAX_CPU_SECONDS": "7",
+                "MCA_CODE_MAX_MEMORY_MB": "384",
+                "MCA_CODE_MAX_SOURCE_BYTES": "1000",
+                "MCA_CODE_MAX_AST_NODES": "2000",
+                "MCA_CODE_MAX_EVAL_STEPS": "3000",
+                "MCA_CODE_MAX_OUTPUT_BYTES": "4000",
+                "MCA_CODE_MAX_COLLECTION_ITEMS": "5000",
                 "MCA_REQUEST_TIMEOUT": "750",
                 "MCA_RETRY_BUDGET_SECONDS": "1200",
             },
@@ -128,6 +150,17 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertEqual(config.thinking, "enabled")
         self.assertEqual(config.request_max_output_tokens, 98_304)
         self.assertEqual(config.max_steps, 96)
+        self.assertEqual(config.max_parallel_tool_calls, 3)
+        self.assertEqual(config.code_max_parallel_nodes, 2)
+        self.assertEqual(config.code_max_tool_nodes, 12)
+        self.assertEqual(config.code_max_wall_seconds, 45.0)
+        self.assertEqual(config.code_max_cpu_seconds, 7)
+        self.assertEqual(config.code_max_memory_mb, 384)
+        self.assertEqual(config.code_max_source_bytes, 1000)
+        self.assertEqual(config.code_max_ast_nodes, 2000)
+        self.assertEqual(config.code_max_eval_steps, 3000)
+        self.assertEqual(config.code_max_output_bytes, 4000)
+        self.assertEqual(config.code_max_collection_items, 5000)
         self.assertEqual(config.request_timeout, 750.0)
         self.assertEqual(config.retry_budget_seconds, 1200.0)
 
@@ -137,6 +170,17 @@ class ConfigFromEnvTests(unittest.TestCase):
             ({"MCA_MAX_OUTPUT_TOKENS": "lots"}, "MCA_MAX_OUTPUT_TOKENS"),
             ({"MCA_THINKING": "sometimes"}, "MCA_THINKING"),
             ({"MCA_MAX_STEPS": "0"}, "MCA_MAX_STEPS"),
+            ({"MCA_MAX_PARALLEL_TOOL_CALLS": "0"}, "MCA_MAX_PARALLEL_TOOL_CALLS"),
+            ({"MCA_CODE_MAX_PARALLEL_NODES": "0"}, "MCA_CODE_MAX_PARALLEL_NODES"),
+            ({"MCA_CODE_MAX_TOOL_NODES": "0"}, "MCA_CODE_MAX_TOOL_NODES"),
+            ({"MCA_CODE_MAX_WALL_SECONDS": "0"}, "MCA_CODE_MAX_WALL_SECONDS"),
+            ({"MCA_CODE_MAX_CPU_SECONDS": "0"}, "MCA_CODE_MAX_CPU_SECONDS"),
+            ({"MCA_CODE_MAX_MEMORY_MB": "many"}, "MCA_CODE_MAX_MEMORY_MB"),
+            ({"MCA_CODE_MAX_SOURCE_BYTES": "0"}, "MCA_CODE_MAX_SOURCE_BYTES"),
+            ({"MCA_CODE_MAX_AST_NODES": "0"}, "MCA_CODE_MAX_AST_NODES"),
+            ({"MCA_CODE_MAX_EVAL_STEPS": "0"}, "MCA_CODE_MAX_EVAL_STEPS"),
+            ({"MCA_CODE_MAX_OUTPUT_BYTES": "0"}, "MCA_CODE_MAX_OUTPUT_BYTES"),
+            ({"MCA_CODE_MAX_COLLECTION_ITEMS": "0"}, "MCA_CODE_MAX_COLLECTION_ITEMS"),
             ({"MCA_REQUEST_TIMEOUT": "0"}, "MCA_REQUEST_TIMEOUT"),
             ({"MCA_RETRY_BUDGET_SECONDS": "no"}, "MCA_RETRY_BUDGET_SECONDS"),
         )
