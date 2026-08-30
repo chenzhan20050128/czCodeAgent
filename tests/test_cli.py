@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -23,7 +24,7 @@ SRC_ROOT = PROJECT_ROOT / "src"
 sys.path.insert(0, str(SRC_ROOT))
 
 from mca import cli
-from mca.domain import SamplingOutcome, SessionReducer
+from mca.domain import Event, SamplingOutcome, SessionReducer, SessionState
 from mca.model import SampledToolCall, SamplingResult
 from mca.store import RolloutStore
 
@@ -111,6 +112,31 @@ class CliHelpTests(unittest.TestCase):
 
 
 class ConsoleFormattingTests(unittest.TestCase):
+    def _code_events(self, *, description="update service", path="a.txt"):
+        session_id = str(uuid.uuid4())
+        turn_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        state = SessionState()
+        events: list[Event] = []
+
+        def apply(event_type, payload):
+            event = Event.create(
+                seq=len(events) + 1, session_id=session_id,
+                event_type=event_type, payload=payload,
+            )
+            SessionReducer.apply(state, event)
+            events.append(event)
+            return event
+
+        apply("session_created", {"cwd": "/work", "model": "m", "context_window": 4096})
+        apply("turn_started", {"turn_id": turn_id, "user_input": "work"})
+        apply("assistant_accepted", {"content": None, "tool_calls": [{"id": "outer", "type": "function", "function": {"name": "run_code", "arguments": "{}"}}]})
+        apply("tool_started", {"call_key": "3:outer", "call_id": "outer"})
+        started = apply("code_run_started", {"run_id": run_id, "turn_id": turn_id, "parent_call_key": "3:outer", "description": description, "source_hash": "sha256:x"})
+        node_id = f"{run_id}:node:1"
+        planned = apply("code_node_planned", {"run_id": run_id, "node_id": node_id, "ordinal": 1, "name": "write_file", "arguments": json.dumps({"path": path, "content": "x"}), "dependencies": []})
+        return state, apply, started, planned, node_id
+
     def test_reasoning_is_hidden_without_verbose_mode(self) -> None:
         captured = io.StringIO()
         console = cli._Console(verbose=False, color=False)
@@ -176,6 +202,62 @@ class ConsoleFormattingTests(unittest.TestCase):
             "[approval] Tool: edit_file\nAllow?\n"
             "\n[thinking] Applying the approved change.",
         )
+
+    def test_tty_code_graph_redraws_and_resumes_below_approval(self) -> None:
+        state, apply, started, planned, node_id = self._code_events()
+        captured = io.StringIO()
+        console = cli._Console(verbose=False, color=True)
+
+        with contextlib.redirect_stdout(captured):
+            console.code_event(started, state)
+            console.code_event(planned, state)
+            console.approval("Tool: write_file\nAllow?")
+            approved = apply("approval_decided", {"call_key": node_id, "call_id": node_id, "approved": True, "scope": "once"})
+            console.code_event(approved, state)
+            running = apply("tool_started", {"call_key": node_id, "call_id": node_id, "origin": "code"})
+            console.code_event(running, state)
+
+        output = captured.getvalue()
+        self.assertIn("\x1b[2K", output)
+        self.assertIn("run_code: update service", output)
+        self.assertIn("CURRENT", output)
+        self.assertLess(output.rfind("[approval]"), output.rfind("CURRENT"))
+
+    def test_non_tty_code_graph_emits_stable_state_lines(self) -> None:
+        state, apply, started, planned, node_id = self._code_events()
+        captured = io.StringIO()
+        console = cli._Console(verbose=False, color=False)
+
+        with contextlib.redirect_stdout(captured):
+            console.code_event(started, state)
+            console.code_event(planned, state)
+            running = apply("tool_started", {"call_key": node_id, "call_id": node_id, "origin": "code"})
+            console.code_event(running, state)
+
+        self.assertEqual(
+            captured.getvalue().splitlines(),
+            [
+                "[code-dag] run ACTIVE update service",
+                "[code-dag] #1 PLANNED write_file a.txt deps=-",
+                "[code-dag] #1 RUNNING write_file a.txt deps=-",
+            ],
+        )
+
+    def test_non_tty_code_graph_escapes_untrusted_fields(self) -> None:
+        state, _, started, planned, _ = self._code_events(
+            description="safe\x1b[31m\nforged", path="a\nforged.txt"
+        )
+        captured = io.StringIO()
+        console = cli._Console(verbose=False, color=False)
+
+        with contextlib.redirect_stdout(captured):
+            console.code_event(started, state)
+            console.code_event(planned, state)
+
+        output = captured.getvalue()
+        self.assertNotIn("\x1b", output)
+        self.assertIn(r"safe\x1b[31m\nforged", output)
+        self.assertIn(r"a\nforged.txt", output)
 
 
 class CliRunTests(unittest.TestCase):
@@ -330,6 +412,82 @@ class CliRunTests(unittest.TestCase):
         transcript = captured.getvalue()
         self.assertIn("fix the bug", transcript)
         self.assertIn("all done", transcript)
+
+    def test_show_graph_expands_a_replayed_code_dag(self) -> None:
+        (self.workspace / "seed.txt").write_text("seed", encoding="utf-8")
+        code_call = SamplingResult(
+            SamplingOutcome.VALID_TOOL_BATCH,
+            tool_calls=(
+                SampledToolCall(
+                    0,
+                    "code-1",
+                    "function",
+                    "run_code",
+                    json.dumps(
+                        {
+                            "description": "inspect seed",
+                            "code": (
+                                'first = tools.list_dir({"path": "."})\n'
+                                'second = tools.read_file({"path": "seed.txt"}, after=[first])\n'
+                                "return await second"
+                            ),
+                        }
+                    ),
+                ),
+            ),
+            finish_reason="tool_calls",
+        )
+        code, _ = self._run(
+            ["inspect"], ScriptedModel(code_call, _text("done"))
+        )
+        self.assertEqual(code, 0)
+        session_id = next(
+            (self.workspace / ".mca" / "sessions").glob("*.jsonl")
+        ).stem
+
+        with patch.dict(os.environ, {}, clear=True):
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                shown = cli.main(
+                    ["--show", session_id, "--graph", "--workspace", str(self.workspace)]
+                )
+
+        self.assertEqual(shown, 0)
+        output = captured.getvalue()
+        self.assertIn("run_code: inspect seed SUCCEEDED", output)
+        self.assertIn("#1 ──▶ #2", output)
+
+    def test_live_non_tty_run_code_reports_each_dag_transition(self) -> None:
+        arguments = json.dumps(
+            {
+                "description": "inspect workspace",
+                "code": 'return await tools.list_dir({"path": "."})',
+            }
+        )
+        code_call = SamplingResult(
+            SamplingOutcome.VALID_TOOL_BATCH,
+            tool_calls=(
+                SampledToolCall(
+                    0, "code-1", "function", "run_code", arguments
+                ),
+            ),
+            finish_reason="tool_calls",
+        )
+
+        code, output = self._run(
+            ["inspect"], ScriptedModel(code_call, _text("done"))
+        )
+
+        self.assertEqual(code, 0)
+        self.assertIn("[code-dag] run ACTIVE inspect workspace", output)
+        self.assertIn("[code-dag] #1 PLANNED list_dir . deps=-", output)
+        self.assertIn("[code-dag] #1 RUNNING list_dir . deps=-", output)
+        self.assertIn("[code-dag] #1 SUCCEEDED list_dir . deps=-", output)
+        self.assertIn("[code-dag] run SUCCEEDED succeeded=1 failed=0 skipped=0", output)
+
+    def test_graph_flag_requires_show(self) -> None:
+        with self.assertRaises(SystemExit):
+            cli.main(["--graph", "--workspace", str(self.workspace)])
 
     def test_show_rejects_unknown_session(self) -> None:
         with patch.dict(os.environ, {}, clear=True):

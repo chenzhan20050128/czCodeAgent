@@ -16,7 +16,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from mca.approval import ApprovalDecision
 from mca.code_mode import CodeModeRunner
 from mca.code_scheduler import CodeDagScheduler
-from mca.domain import SessionReducer, SessionState, ToolStatus
+from mca.code_graph import CodeRunStatus
+from mca.domain import Event, SessionReducer, SessionState, ToolStatus
 from mca.executor import AcceptedToolCall, ToolExecutor
 from mca.store import RolloutStore
 from mca.tools import create_tool_registry
@@ -91,6 +92,48 @@ class CodeModeIntegrationTests(unittest.TestCase):
         self.assertEqual(result.status, "succeeded", result.output)
         self.assertEqual(json.loads(result.output)["result"], 1)
         self.assertIs(self.state.tool_calls["3:outer"].status, ToolStatus.SUCCEEDED)
+
+    def test_event_observer_sees_each_code_state_only_after_reduction(self) -> None:
+        observed: list[tuple[str, str]] = []
+
+        def observe(event: Event, state: SessionState) -> None:
+            if event.type == "code_run_started":
+                observed.append((event.type, state.code_runs[event.payload["run_id"]].status.value))
+            elif event.type in {"code_node_planned", "tool_started", "tool_finished"}:
+                call_key = event.payload.get("node_id", event.payload.get("call_key"))
+                if isinstance(call_key, str) and call_key in state.code_nodes:
+                    observed.append((event.type, state.code_nodes[call_key].status.value))
+            elif event.type == "code_run_finished":
+                observed.append((event.type, state.code_runs[event.payload["run_id"]].status.value))
+
+        executor = ToolExecutor(
+            registry=create_tool_registry(self.workspace),
+            store=self.store,
+            state=self.state,
+            approver=self.approver,
+            workspace=self.workspace,
+            event_observer=observe,
+        )
+
+        result = CodeModeRunner(
+            store=self.store, state=self.state, executor=executor
+        ).run(
+            self.outer,
+            description="observe graph",
+            code='return await tools.list_dir({"path": "."})',
+        )
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(
+            observed,
+            [
+                ("code_run_started", CodeRunStatus.ACTIVE.value),
+                ("code_node_planned", "planned"),
+                ("tool_started", "started"),
+                ("tool_finished", "succeeded"),
+                ("code_run_finished", CodeRunStatus.SUCCEEDED.value),
+            ],
+        )
 
     def test_nested_result_preserves_tool_metadata_for_program(self) -> None:
         result = CodeModeRunner(

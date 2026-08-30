@@ -128,6 +128,7 @@ class CodeModeRunner:
     def _append(self, event_type: str, payload: dict[str, object]) -> None:
         event = self.store.append(event_type, payload)
         SessionReducer.apply(self.state, event)
+        self.executor.observe_event(event)
 
 
 __all__ = ["CodeModeRunner", "PreparedCodeProgram", "prepare_code_program"]

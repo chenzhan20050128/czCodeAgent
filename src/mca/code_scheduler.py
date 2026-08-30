@@ -183,6 +183,7 @@ class CodeDagScheduler:
             },
         )
         SessionReducer.apply(self.state, event)
+        self.executor.observe_event(event)
         self.local_to_durable[local_id] = durable_id
 
     def _durable_id(self, local_id: object) -> str:

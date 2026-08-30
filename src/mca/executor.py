@@ -13,7 +13,7 @@ from typing import Any, Protocol
 
 from .approval import ApprovalDecision, ApprovalInterrupted, ApprovalRequest, _escape_terminal_text
 from .code_runtime import CodeRuntime
-from .domain import SessionReducer, SessionState, ToolCall, ToolStatus
+from .domain import Event, SessionReducer, SessionState, ToolCall, ToolStatus
 from .store import RolloutStore
 from .tools.filesystem import (
     ExecutedFileChange,
@@ -120,6 +120,7 @@ class ToolExecutor:
         code_runtime_config: object | None = None,
         code_max_parallel_nodes: int = 4,
         code_max_tool_nodes: int = 64,
+        event_observer: Callable[[Event, SessionState], object] | None = None,
     ) -> None:
         workspace_path = Path(workspace).resolve(strict=True)
         if not workspace_path.is_dir():
@@ -140,6 +141,7 @@ class ToolExecutor:
         self.code_runtime_config = code_runtime_config
         self.code_max_parallel_nodes = code_max_parallel_nodes
         self.code_max_tool_nodes = code_max_tool_nodes
+        self._event_observer = event_observer
         self._usable = True
         if registry.workspace is not None and registry.workspace != workspace_path:
             raise ValueError("registry workspace does not match executor workspace")
@@ -757,6 +759,22 @@ class ToolExecutor:
             raise ToolExecutorError(
                 f"durable event {event.seq} could not be applied to state"
             ) from error
+        self.observe_event(event)
+
+    def observe_event(self, event: Event) -> None:
+        """Notify presentation code after a durable fact is reduced.
+
+        Rendering is deliberately best-effort: a broken terminal projection
+        must not turn an already committed tool fact into an execution error.
+        """
+
+        observer = self._event_observer
+        if observer is None:
+            return
+        try:
+            observer(event, self.state)
+        except Exception:
+            self._event_observer = None
 
 
 def _error_result(name: str, status: ToolStatus, message: str) -> ToolResult:

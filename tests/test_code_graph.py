@@ -10,6 +10,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
+import mca.code_graph as code_graph
 from mca.code_graph import CodeNodeStatus, CodeRunStatus, graph_summary
 from mca.domain import DomainError, Event, SessionReducer, SessionState, ToolStatus
 from mca.projection import ProjectionEnvironment, PromptProjector
@@ -71,7 +72,11 @@ class CodeGraphDomainTests(unittest.TestCase):
         return event
 
     def plan(
-        self, ordinal: int, name: str, dependencies: list[str] | None = None
+        self,
+        ordinal: int,
+        name: str,
+        dependencies: list[str] | None = None,
+        arguments: str = "{}",
     ) -> str:
         node_id = f"{self.run_id}:node:{ordinal}"
         self.apply(
@@ -81,7 +86,7 @@ class CodeGraphDomainTests(unittest.TestCase):
                 "node_id": node_id,
                 "ordinal": ordinal,
                 "name": name,
-                "arguments": "{}",
+                "arguments": arguments,
                 "dependencies": dependencies or [],
             },
         )
@@ -286,6 +291,91 @@ class CodeGraphDomainTests(unittest.TestCase):
             self.state.code_nodes[node].status,
             CodeNodeStatus.USER_CONFIRMED_SUCCESS,
         )
+
+    def test_graph_projection_tracks_dependencies_and_live_state(self) -> None:
+        project = getattr(code_graph, "project_code_graph", None)
+        self.assertIsNotNone(project, "Code Mode needs a pure graph projection")
+        first = self.plan(
+            1, "read_file", arguments='{"path":"src/service.py"}'
+        )
+        second = self.plan(
+            2,
+            "bash",
+            [first],
+            arguments='{"command":"python3 -m unittest"}',
+        )
+
+        planned = project(self.state, self.run_id)
+        self.assertEqual(planned.description, "work")
+        self.assertEqual([node.ordinal for node in planned.nodes], [1, 2])
+        self.assertEqual(planned.nodes[1].dependency_ordinals, (1,))
+        self.assertEqual(planned.nodes[0].target, "src/service.py")
+        self.assertFalse(any(node.is_current for node in planned.nodes))
+
+        self.apply(
+            "tool_started",
+            {"call_key": first, "call_id": first, "origin": "code"},
+        )
+        running = project(self.state, self.run_id)
+        self.assertTrue(running.nodes[0].is_current)
+        self.assertEqual(running.nodes[0].status, "started")
+
+        self.apply(
+            "tool_finished",
+            {
+                "call_key": first,
+                "call_id": first,
+                "origin": "code",
+                "status": "succeeded",
+                "result": "ok",
+            },
+        )
+        finished = project(self.state, self.run_id)
+        self.assertEqual(finished.nodes[0].status, "succeeded")
+        self.assertFalse(finished.nodes[0].is_current)
+        self.assertEqual(finished.nodes[1].status, "planned")
+
+    def test_shell_mutation_warning_requires_observed_execution_overlap(self) -> None:
+        project = code_graph.project_code_graph
+        write = self.plan(1, "write_file")
+        shell = self.plan(2, "bash")
+
+        self.assertFalse(project(self.state, self.run_id).shell_mutation_warning)
+
+        self.apply("tool_started", {"call_key": write, "call_id": write, "origin": "code"})
+        self.apply("tool_finished", {"call_key": write, "call_id": write, "origin": "code", "status": "failed", "result": "write failed"})
+        self.apply("tool_started", {"call_key": shell, "call_id": shell, "origin": "code"})
+        self.assertFalse(project(self.state, self.run_id).shell_mutation_warning)
+
+    def test_shell_mutation_warning_is_retained_after_parallel_overlap(self) -> None:
+        project = code_graph.project_code_graph
+        write = self.plan(1, "write_file")
+        shell = self.plan(2, "bash")
+        self.apply("tool_started", {"call_key": write, "call_id": write, "origin": "code"})
+        self.apply("tool_started", {"call_key": shell, "call_id": shell, "origin": "code"})
+
+        self.assertTrue(project(self.state, self.run_id).shell_mutation_warning)
+
+        self.apply("tool_finished", {"call_key": write, "call_id": write, "origin": "code", "status": "failed", "result": "write failed"})
+        self.apply("tool_finished", {"call_key": shell, "call_id": shell, "origin": "code", "status": "failed", "result": "shell failed"})
+        self.assertTrue(project(self.state, self.run_id).shell_mutation_warning)
+
+    def test_plan_denied_mutation_is_not_labeled_waiting_for_approval(self) -> None:
+        node = self.plan(1, "write_file")
+        self.apply(
+            "tool_finished",
+            {
+                "call_key": node,
+                "call_id": node,
+                "origin": "code",
+                "status": "denied",
+                "result": "plan mode is active",
+            },
+        )
+
+        view = code_graph.project_code_graph(self.state, self.run_id)
+
+        self.assertIsNone(view.nodes[0].approval)
 
 
 if __name__ == "__main__":

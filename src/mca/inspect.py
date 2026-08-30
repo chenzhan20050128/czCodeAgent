@@ -14,7 +14,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from .code_graph import project_code_graph
 from .domain import SessionState, TurnStatus
+from .terminal import render_code_graph_plain
 
 
 _MAX_RENDERED_FIELD_CHARS = 500
@@ -68,7 +70,9 @@ def summarize(state: SessionState) -> SessionSummary:
     )
 
 
-def render_transcript(state: SessionState) -> str:
+def render_transcript(
+    state: SessionState, *, expanded_graph: bool = False
+) -> str:
     """Render the session's ordered facts as bounded, human-readable text."""
 
     if not isinstance(state, SessionState):
@@ -82,7 +86,7 @@ def render_transcript(state: SessionState) -> str:
         "",
     ]
     for event in state.events:
-        rendered = _render_event(event, state)
+        rendered = _render_event(event, state, expanded_graph=expanded_graph)
         if rendered is not None:
             lines.append(rendered)
     summary = summarize(state)
@@ -109,7 +113,9 @@ def list_session_ids(sessions_root: str | os.PathLike[str]) -> list[str]:
     return sorted(session_ids)
 
 
-def _render_event(event, state: SessionState) -> str | None:
+def _render_event(
+    event, state: SessionState, *, expanded_graph: bool
+) -> str | None:
     payload = event.payload
     if event.type == "turn_started":
         user_input = payload.get("user_input", payload.get("input", ""))
@@ -117,7 +123,21 @@ def _render_event(event, state: SessionState) -> str | None:
     if event.type == "assistant_accepted":
         return _render_assistant(payload)
     if event.type == "tool_finished":
+        call_key = payload.get("call_key")
+        if isinstance(call_key, str):
+            call = state.tool_calls.get(call_key)
+            if call is not None and call.origin == "code":
+                return None
         return _render_tool_finished(payload, state)
+    if event.type == "code_run_finished":
+        run_id = payload.get("run_id")
+        if not isinstance(run_id, str) or run_id not in state.code_runs:
+            return None
+        return render_code_graph_plain(
+            project_code_graph(state, run_id),
+            width=100,
+            expanded=expanded_graph,
+        )
     if event.type == "tool_reconciled":
         outcome = payload.get("outcome")
         return f"  [reconciled] {outcome}"
