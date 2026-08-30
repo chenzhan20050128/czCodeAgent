@@ -15,6 +15,7 @@ from types import MappingProxyType
 from typing import Any, Iterable
 
 from .conversation import ConversationError, validate_conversation
+from .file_versions import FileVersion
 
 
 EVENT_VERSION = 1
@@ -323,6 +324,7 @@ class FileSnapshot:
     after_hash: str | None = None
     source_call_key: str | None = None
     after_mode: int | None = None
+    after_version: FileVersion | None = None
     created_directories: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -361,6 +363,15 @@ class FileSnapshot:
             raise DomainError("after_mode must be permission bits or null")
         if self.after_hash is None and self.after_mode is not None:
             raise DomainError("after_mode requires after_hash")
+        if self.after_version is not None:
+            if not isinstance(self.after_version, FileVersion):
+                raise DomainError("after_version must be a FileVersion or null")
+            if not self.after_version.exists:
+                raise DomainError("after_version must describe an existing file")
+            if self.after_hash != self.after_version.sha256:
+                raise DomainError("after_version sha256 must match after_hash")
+            if self.after_mode != self.after_version.mode:
+                raise DomainError("after_version mode must match after_mode")
         if not isinstance(self.created_directories, tuple) or any(
             not isinstance(item, str) or not item
             for item in self.created_directories
@@ -370,6 +381,31 @@ class FileSnapshot:
             raise DomainError("created_directories requires a successful write")
         if self.created_directories and self.existed_before:
             raise DomainError("created_directories requires a new file")
+
+
+@dataclass(frozen=True)
+class FileMutationPlan:
+    """Durable approval-time provenance for one managed mutation call."""
+
+    turn_id: str
+    call_key: str
+    path: str
+    expected_version: FileVersion
+    proposed_hash: str
+    diff: str
+
+    def __post_init__(self) -> None:
+        _canonical_uuid(self.turn_id, field_name="turn_id")
+        if not isinstance(self.call_key, str) or not self.call_key:
+            raise DomainError("mutation plan call_key must be a non-empty string")
+        if not isinstance(self.path, str) or not self.path:
+            raise DomainError("mutation plan path must be a non-empty string")
+        if not isinstance(self.expected_version, FileVersion):
+            raise DomainError("mutation plan expected_version must be a FileVersion")
+        if not isinstance(self.proposed_hash, str) or not self.proposed_hash:
+            raise DomainError("mutation plan proposed_hash must be a non-empty string")
+        if not isinstance(self.diff, str):
+            raise DomainError("mutation plan diff must be a string")
 
 
 @dataclass
@@ -390,6 +426,7 @@ class SessionState:
     file_snapshots: dict[tuple[str, str], FileSnapshot] = field(
         default_factory=dict
     )
+    file_mutation_plans: dict[str, FileMutationPlan] = field(default_factory=dict)
     undo_results: dict[str, Event] = field(default_factory=dict)
     latest_checkpoint: Event | None = None
     pending_recovery_intent: Event | None = None
@@ -733,12 +770,14 @@ class SessionReducer:
         after_hash = event.payload.get("after_hash")
         after_mode = event.payload.get("after_mode")
         created_directories = event.payload.get("created_directories")
+        raw_after_version = event.payload.get("after_version")
         snapshot_update: tuple[tuple[str, str], FileSnapshot] | None = None
         if (
             path is not None
             or after_hash is not None
             or after_mode is not None
             or created_directories is not None
+            or raw_after_version is not None
         ):
             if status is not ToolStatus.SUCCEEDED:
                 raise DomainError("after_hash is only valid for a successful tool")
@@ -753,14 +792,33 @@ class SessionReducer:
             ):
                 raise DomainError("after_mode must be permission bits or null")
             directories = _normalized_created_directories(created_directories)
+            after_version: FileVersion | None = None
+            if raw_after_version is not None:
+                try:
+                    after_version = FileVersion.from_dict(raw_after_version)
+                except ValueError as error:
+                    raise DomainError(f"invalid after_version: {error}") from error
+                if not after_version.exists:
+                    raise DomainError("after_version must describe an existing file")
+                if after_version.sha256 != after_hash:
+                    raise DomainError("after_version sha256 must match after_hash")
+                if after_version.mode != after_mode:
+                    raise DomainError("after_version mode must match after_mode")
             key = (call.turn_id, path)
             snapshot = state.file_snapshots.get(key)
             if snapshot is None:
                 raise DomainError("successful write has no file baseline")
-            if (
+            mutation_plan = state.file_mutation_plans.get(call.call_key)
+            if mutation_plan is not None:
+                if mutation_plan.turn_id != call.turn_id or mutation_plan.path != path:
+                    raise DomainError("successful write does not match mutation plan")
+                if mutation_plan.proposed_hash != after_hash:
+                    raise DomainError("successful write hash does not match mutation plan")
+            elif (
                 snapshot.after_hash is None
                 and snapshot.source_call_key != call.call_key
             ):
+                # Compatibility for old rollouts written before per-call plans.
                 raise DomainError("successful write does not match snapshot source call")
             snapshot_update = (
                 key,
@@ -768,7 +826,12 @@ class SessionReducer:
                     snapshot,
                     after_hash=after_hash,
                     after_mode=after_mode,
-                    created_directories=directories,
+                    after_version=after_version,
+                    created_directories=tuple(
+                        dict.fromkeys(
+                            (*snapshot.created_directories, *directories)
+                        )
+                    ),
                 ),
             )
 
@@ -1015,6 +1078,43 @@ class SessionReducer:
                 state.file_snapshots[key] = snapshot
 
     @staticmethod
+    def _apply_file_mutation_planned(state: SessionState, event: Event) -> None:
+        SessionReducer._reject_pending_recovery_action(
+            state, "record a file mutation plan"
+        )
+        active_turn_id = SessionReducer._require_active_turn(state)
+        turn_id = _payload_uuid(event.payload, "turn_id")
+        if turn_id != active_turn_id:
+            raise DomainError("file mutation plan belongs to another turn")
+        call_key = _payload_string(event.payload, "call_key")
+        call = state.tool_calls.get(call_key)
+        if call is None:
+            raise DomainError(f"unknown mutation plan call_key: {call_key}")
+        if call.turn_id != turn_id or call.status is not ToolStatus.REQUESTED:
+            raise DomainError("mutation plan call_key is not an active requested call")
+        if call.name not in _MANAGED_WRITE_TOOL_NAMES:
+            raise DomainError("mutation plan call_key must identify a managed write")
+        if call.approved is not True:
+            raise DomainError("file mutation plan requires an approved call")
+        try:
+            expected_version = FileVersion.from_dict(
+                event.payload.get("expected_version")
+            )
+        except ValueError as error:
+            raise DomainError(f"invalid expected_version: {error}") from error
+        plan = FileMutationPlan(
+            turn_id=turn_id,
+            call_key=call_key,
+            path=_payload_string(event.payload, "path"),
+            expected_version=expected_version,
+            proposed_hash=_payload_string(event.payload, "proposed_hash"),
+            diff=event.payload.get("diff"),
+        )
+        if call_key in state.file_mutation_plans:
+            raise DomainError("file mutation plan already exists for call_key")
+        state.file_mutation_plans[call_key] = plan
+
+    @staticmethod
     def _apply_sampling_failed(state: SessionState, event: Event) -> None:
         SessionReducer._reject_pending_recovery_action(
             state, "record a sampling failure"
@@ -1148,6 +1248,7 @@ def reduce_event(state: SessionState, event: Event) -> SessionState:
         turn_inputs=dict(state.turn_inputs),
         tool_calls=dict(state.tool_calls),
         file_snapshots=dict(state.file_snapshots),
+        file_mutation_plans=dict(state.file_mutation_plans),
         undo_results=dict(state.undo_results),
         assistant_events=list(state.assistant_events),
         events=list(state.events),

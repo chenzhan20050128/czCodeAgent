@@ -13,6 +13,14 @@ from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
+from ..file_versions import (
+    DirectoryMutationLease,
+    FileMutationCoordinator,
+    FileVersion,
+    FileVersionError,
+    GLOBAL_FILE_MUTATION_COORDINATOR,
+    capture_file_version,
+)
 from .registry import ToolResult
 
 
@@ -139,6 +147,7 @@ class ExecutedFileChange:
     before_hash: str | None
     after_hash: str
     after_mode: int
+    after_version: FileVersion
     created_directories: tuple[str, ...] = ()
     durability_warning: bool = False
     interruption_warning: bool = False
@@ -154,21 +163,37 @@ class PreparedFileChange:
     existed_before: bool
     before_bytes: bytes
     before_mode: int | None
+    expected_version: FileVersion
     proposed_bytes: bytes
     requested_path: str
     _resolver: WorkspaceResolver = field(repr=False, compare=False)
     _max_file_bytes: int = field(repr=False, compare=False)
+    _coordinator: FileMutationCoordinator = field(repr=False, compare=False)
 
     def execute(self) -> ExecutedFileChange:
         """Atomically apply the approved bytes if path and hash still match."""
 
+        parent_directories = self._parent_directories()
+        with self._coordinator.mutation(
+            self.canonical_path, parent_directories
+        ) as directory_lease:
+            return self._execute_locked(directory_lease)
+
+    def _execute_locked(
+        self, directory_lease: DirectoryMutationLease
+    ) -> ExecutedFileChange:
+        """Apply one mutation while holding its canonical-path FIFO turn."""
+
         target = self._assert_unchanged()
-        created_directories = self._ensure_parent_directories(target)
+        created_directories = self._ensure_parent_directories(
+            target, directory_lease
+        )
         parent = target.parent
         temp_path: Path | None = None
         committed = False
         durability_warning = False
         interruption_warning = False
+        after_version: FileVersion | None = None
         try:
             descriptor, raw_temp_path = tempfile.mkstemp(
                 prefix=f".{target.name}.mca-", dir=parent
@@ -192,17 +217,25 @@ class PreparedFileChange:
                 try:
                     os.replace(temp_path, target)
                 except KeyboardInterrupt:
-                    if target.exists() and sha256_bytes(target.read_bytes()) == sha256_bytes(
-                        self.proposed_bytes
-                    ):
+                    try:
+                        observed, _ = capture_file_version(
+                            target, max_file_bytes=self._max_file_bytes
+                        )
+                    except FileVersionError:
+                        observed = FileVersion.absent()
+                    if observed.sha256 == sha256_bytes(self.proposed_bytes):
                         committed = True
                         temp_path = None
+                        after_version = observed
                         interruption_warning = True
                     else:
                         raise
                 else:
                     committed = True
                     temp_path = None
+                    after_version, _ = capture_file_version(
+                        target, max_file_bytes=self._max_file_bytes
+                    )
                 if committed:
                     try:
                         _fsync_directory(parent)
@@ -227,18 +260,37 @@ class PreparedFileChange:
                 except FileNotFoundError:
                     pass
             if not committed:
-                _remove_created_directories(created_directories)
+                directory_lease.cleanup_failed(created_directories)
+        if after_version is None:
+            after_version, _ = capture_file_version(
+                target, max_file_bytes=self._max_file_bytes
+            )
         return ExecutedFileChange(
             canonical_path=target,
             before_hash=self.before_hash,
-            after_hash=sha256_bytes(self.proposed_bytes),
-            after_mode=mode,
-            created_directories=created_directories,
+            after_hash=after_version.sha256 or sha256_bytes(self.proposed_bytes),
+            after_mode=after_version.mode if after_version.mode is not None else mode,
+            after_version=after_version,
+            created_directories=directory_lease.successful_provenance(
+                created_directories
+            ),
             durability_warning=durability_warning,
             interruption_warning=interruption_warning,
         )
 
-    def _ensure_parent_directories(self, target: Path) -> tuple[str, ...]:
+    def _parent_directories(self) -> tuple[Path, ...]:
+        workspace = self._resolver.workspace
+        parts = self.canonical_path.relative_to(workspace).parts[:-1]
+        current = workspace
+        directories: list[Path] = []
+        for part in parts:
+            current = current / part
+            directories.append(current)
+        return tuple(directories)
+
+    def _ensure_parent_directories(
+        self, target: Path, directory_lease: DirectoryMutationLease
+    ) -> tuple[str, ...]:
         """Create missing parent directories without following symlinks."""
 
         workspace = self._resolver.workspace
@@ -254,20 +306,38 @@ class PreparedFileChange:
                 entry_stat = current.lstat()
             except FileNotFoundError:
                 try:
-                    os.mkdir(current, 0o755)
-                    os.chmod(current, 0o755)
+                    created_now = directory_lease.create_directory(current, 0o755)
+                    if created_now:
+                        os.chmod(current, 0o755)
                 except BaseException:
-                    _remove_created_directories(tuple(created))
+                    directory_lease.cleanup_failed(tuple(created))
                     raise
+                if not created_now:
+                    try:
+                        entry_stat = current.lstat()
+                    except OSError:
+                        directory_lease.cleanup_failed(tuple(created))
+                        raise
+                    if stat.S_ISLNK(entry_stat.st_mode):
+                        directory_lease.cleanup_failed(tuple(created))
+                        raise PathSafetyError(
+                            f"write path contains a symbolic link: {self.requested_path}"
+                        )
+                    if not stat.S_ISDIR(entry_stat.st_mode):
+                        directory_lease.cleanup_failed(tuple(created))
+                        raise FileToolError(
+                            f"parent path is not a directory: {current}"
+                        )
+                    continue
                 created.append(str(current.resolve()))
                 continue
             if stat.S_ISLNK(entry_stat.st_mode):
-                _remove_created_directories(tuple(created))
+                directory_lease.cleanup_failed(tuple(created))
                 raise PathSafetyError(
                     f"write path contains a symbolic link: {self.requested_path}"
                 )
             if not stat.S_ISDIR(entry_stat.st_mode):
-                _remove_created_directories(tuple(created))
+                directory_lease.cleanup_failed(tuple(created))
                 raise FileToolError(f"parent path is not a directory: {current}")
         return tuple(created)
 
@@ -275,25 +345,21 @@ class PreparedFileChange:
         target = self._resolver.resolve_write(self.requested_path)
         if target != self.canonical_path:
             raise FileConflictError("path changed since preparation")
-        if self.existed_before:
-            if not target.exists():
-                raise FileConflictError("file changed since preparation")
-            try:
-                current_stat = target.stat()
-            except OSError as error:
-                raise FileConflictError("file changed since preparation") from error
-            if not stat.S_ISREG(current_stat.st_mode):
-                raise FileConflictError("file changed since preparation")
-            if current_stat.st_size > self._max_file_bytes:
-                raise FileConflictError("file changed since preparation")
-            try:
-                current = target.read_bytes()
-            except OSError as error:
-                raise FileConflictError("file changed since preparation") from error
-            if sha256_bytes(current) != self.before_hash:
-                raise FileConflictError("file changed since preparation")
-        elif target.exists():
-            raise FileConflictError("file changed since preparation")
+        try:
+            observed, _ = capture_file_version(
+                target, max_file_bytes=self._max_file_bytes
+            )
+        except FileVersionError as error:
+            raise FileConflictError(
+                "file changed since preparation: FILE_STALE_VERSION "
+                f"expected {self.expected_version.display()} observed <unreadable>"
+            ) from error
+        if observed != self.expected_version:
+            raise FileConflictError(
+                "file changed since preparation: FILE_STALE_VERSION "
+                f"expected {self.expected_version.display()} "
+                f"observed {observed.display()}"
+            )
         return target
 
 
@@ -308,6 +374,7 @@ class FileSystemTools:
         max_output_bytes: int = 64 * 1024,
         max_read_lines: int = DEFAULT_MAX_READ_LINES,
         max_list_entries: int = DEFAULT_MAX_LIST_ENTRIES,
+        mutation_coordinator: FileMutationCoordinator | None = None,
     ) -> None:
         if type(max_file_bytes) is not int or max_file_bytes < 1:
             raise ValueError("max_file_bytes must be a positive integer")
@@ -316,6 +383,9 @@ class FileSystemTools:
         self.max_output_bytes = max_output_bytes
         self.max_read_lines = max_read_lines
         self.max_list_entries = max_list_entries
+        self.mutation_coordinator = (
+            mutation_coordinator or GLOBAL_FILE_MUTATION_COORDINATOR
+        )
 
     def read_file(self, arguments: dict[str, Any]) -> ToolResult:
         path = self.resolver.resolve_read(_string_argument(arguments, "path"))
@@ -398,7 +468,7 @@ class FileSystemTools:
         if old_text == new_text:
             raise FileToolError("old_text and new_text must differ")
         path = self.resolver.resolve_write(requested)
-        before_text, before_bytes, _ = self._existing_regular_text(path)
+        before_text, before_bytes, _, before_version = self._existing_regular_text(path)
         occurrences = before_text.count(old_text)
         if occurrences == 0:
             raise FileToolError("old_text was not found")
@@ -406,7 +476,11 @@ class FileSystemTools:
             raise FileToolError("old_text appears more than once")
         proposed = self._encode_text(before_text.replace(old_text, new_text, 1))
         return self._prepare(
-            path, requested, proposed, known_before_bytes=before_bytes
+            path,
+            requested,
+            proposed,
+            known_before_bytes=before_bytes,
+            known_before_version=before_version,
         )
 
     def _prepare(
@@ -416,16 +490,26 @@ class FileSystemTools:
         proposed: bytes,
         *,
         known_before_bytes: bytes | None = None,
+        known_before_version: FileVersion | None = None,
     ) -> PreparedFileChange:
-        existed = path.exists()
-        before_mode: int | None = None
-        if existed:
-            _, before_bytes, before_mode = self._existing_regular_text(path)
-            if known_before_bytes is not None and before_bytes != known_before_bytes:
-                raise FileConflictError("file changed during preparation")
+        if known_before_bytes is not None and known_before_version is not None:
+            before_bytes = known_before_bytes
+            expected_version = known_before_version
         else:
-            before_bytes = b""
-        before_text = before_bytes.decode("utf-8")
+            try:
+                expected_version, before_bytes = capture_file_version(
+                    path, max_file_bytes=self.max_file_bytes
+                )
+            except FileVersionError as error:
+                raise FileToolError(str(error)) from error
+        existed = expected_version.exists
+        before_mode = expected_version.mode
+        try:
+            before_text = before_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise FileToolError("file is not valid UTF-8 text") from None
+        if "\0" in before_text:
+            raise FileToolError("binary files are not supported")
         proposed_text = proposed.decode("utf-8")
         diff = _unified_diff(
             before_text,
@@ -435,44 +519,41 @@ class FileSystemTools:
         )
         return PreparedFileChange(
             canonical_path=path,
-            before_hash=sha256_bytes(before_bytes) if existed else None,
+            before_hash=expected_version.sha256,
             diff=diff,
             existed_before=existed,
             before_bytes=before_bytes,
             before_mode=before_mode,
+            expected_version=expected_version,
             proposed_bytes=proposed,
             requested_path=requested,
             _resolver=self.resolver,
             _max_file_bytes=self.max_file_bytes,
+            _coordinator=self.mutation_coordinator,
         )
 
     def _read_regular_text(self, path: Path) -> tuple[str, bytes]:
-        text, content, _ = self._existing_regular_text(path)
+        text, content, _, _ = self._existing_regular_text(path)
         return text, content
 
-    def _existing_regular_text(self, path: Path) -> tuple[str, bytes, int]:
+    def _existing_regular_text(
+        self, path: Path
+    ) -> tuple[str, bytes, int, FileVersion]:
         try:
-            file_stat = path.stat()
-        except (FileNotFoundError, OSError) as error:
+            version, content = capture_file_version(
+                path, max_file_bytes=self.max_file_bytes
+            )
+        except (FileNotFoundError, FileVersionError, OSError) as error:
             raise FileToolError(f"file does not exist: {path}") from error
-        if not stat.S_ISREG(file_stat.st_mode):
-            raise FileToolError("path is not a regular file")
-        if file_stat.st_size > self.max_file_bytes:
-            raise FileToolError("file exceeds size limit")
-        try:
-            with path.open("rb") as stream:
-                content = stream.read(self.max_file_bytes + 1)
-        except OSError as error:
-            raise FileToolError(f"cannot read file: {path}") from error
-        if len(content) > self.max_file_bytes:
-            raise FileToolError("file exceeds size limit")
+        if not version.exists or version.mode is None:
+            raise FileToolError(f"file does not exist: {path}")
         try:
             text = content.decode("utf-8")
         except UnicodeDecodeError:
             raise FileToolError("file is not valid UTF-8 text") from None
         if "\0" in text:
             raise FileToolError("binary files are not supported")
-        return text, content, stat.S_IMODE(file_stat.st_mode)
+        return text, content, version.mode, version
 
     def _encode_text(self, content: str) -> bytes:
         if "\0" in content:

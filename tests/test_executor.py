@@ -498,6 +498,7 @@ class ToolExecutorTests(ExecutorTestCase):
             [event.type for event in events],
             [
                 "approval_decided",
+                "file_mutation_planned",
                 "file_snapshot",
                 "tool_started",
                 "tool_finished",
@@ -505,9 +506,20 @@ class ToolExecutorTests(ExecutorTestCase):
         )
         self.assertEqual(
             observed_before_effect,
-            ["approval_decided", "file_snapshot", "tool_started"],
+            [
+                "approval_decided",
+                "file_mutation_planned",
+                "file_snapshot",
+                "tool_started",
+            ],
         )
-        snapshot = events[1].payload
+        plan = events[1].payload
+        snapshot = events[2].payload
+        self.assertEqual(plan["call_key"], call.call_key)
+        self.assertEqual(plan["path"], str(path.resolve()))
+        self.assertEqual(plan["expected_version"]["sha256"], hashlib.sha256(before).hexdigest())
+        self.assertEqual(plan["proposed_hash"], hashlib.sha256(b"new\n").hexdigest())
+        self.assertIn("+new", plan["diff"])
         self.assertEqual(snapshot["path"], str(path.resolve()))
         self.assertEqual(snapshot["before_bytes"], base64.b64encode(before).decode())
         self.assertEqual(snapshot["before_mode"], 0o640)
@@ -526,6 +538,13 @@ class ToolExecutorTests(ExecutorTestCase):
             self.state.file_snapshots[(self.turn_id, str(path.resolve()))].after_mode,
             0o640,
         )
+        self.assertEqual(
+            self.state.file_snapshots[
+                (self.turn_id, str(path.resolve()))
+            ].after_version.sha256,
+            expected_hash,
+        )
+        self.assertIn(call.call_key, self.state.file_mutation_plans)
 
     def test_post_commit_interrupt_persists_success_then_propagates_signal(self) -> None:
         path = self.workspace / "interrupted.txt"
@@ -590,12 +609,109 @@ class ToolExecutorTests(ExecutorTestCase):
         executor.execute(second)
 
         snapshots = [event for event in self.store.load() if event.type == "file_snapshot"]
+        plans = [
+            event
+            for event in self.store.load()
+            if event.type == "file_mutation_planned"
+        ]
         self.assertEqual(len(snapshots), 1)
+        self.assertEqual(len(plans), 2)
+        self.assertEqual(
+            {event.payload["call_key"] for event in plans},
+            {first.call_key, second.call_key},
+        )
         state_snapshot = self.state.file_snapshots[(self.turn_id, str(path.resolve()))]
         self.assertEqual(state_snapshot.before_bytes, base64.b64encode(b"original").decode())
         self.assertEqual(
             state_snapshot.after_hash, hashlib.sha256(b"latest").hexdigest()
         )
+        self.assertEqual(
+            state_snapshot.after_version.sha256,
+            hashlib.sha256(b"latest").hexdigest(),
+        )
+
+    def test_successful_mutation_uses_its_own_plan_not_snapshot_source(self) -> None:
+        path = self.workspace / "notes.txt"
+        path.write_text("original", encoding="utf-8")
+        self.append(
+            "assistant_accepted",
+            {
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": "write_file",
+                            "arguments": '{"path":"notes.txt","content":"new"}',
+                        },
+                    }
+                    for call_id in ("one", "two")
+                ]
+            },
+        )
+        first_key = f"{self.state.last_seq}:one"
+        second_key = f"{self.state.last_seq}:two"
+        prepared = create_tool_registry(self.workspace).resolve(
+            "write_file"
+        ).prepare_handler({"path": "notes.txt", "content": "new"})
+        expected_version = prepared.expected_version.to_dict()
+        for call_key, call_id in ((first_key, "one"), (second_key, "two")):
+            self.append(
+                "approval_decided",
+                {
+                    "call_key": call_key,
+                    "call_id": call_id,
+                    "approved": True,
+                    "scope": "once",
+                },
+            )
+            self.append(
+                "file_mutation_planned",
+                {
+                    "turn_id": self.turn_id,
+                    "call_key": call_key,
+                    "path": str(path.resolve()),
+                    "expected_version": expected_version,
+                    "proposed_hash": hashlib.sha256(b"new").hexdigest(),
+                    "diff": prepared.diff,
+                },
+            )
+        self.append(
+            "file_snapshot",
+            {
+                "turn_id": self.turn_id,
+                "path": str(path.resolve()),
+                "existed_before": True,
+                "before_bytes": base64.b64encode(b"original").decode(),
+                "before_encoding": "base64",
+                "before_mode": 0o644,
+                "call_key": first_key,
+            },
+        )
+        self.append("tool_started", {"call_key": first_key})
+        self.append("tool_started", {"call_key": second_key})
+        after_version = {
+            **expected_version,
+            "sha256": hashlib.sha256(b"new").hexdigest(),
+            "size": len(b"new"),
+        }
+
+        self.append(
+            "tool_finished",
+            {
+                "call_key": second_key,
+                "status": "succeeded",
+                "result": "wrote",
+                "path": str(path.resolve()),
+                "after_hash": hashlib.sha256(b"new").hexdigest(),
+                "after_mode": 0o644,
+                "after_version": after_version,
+            },
+        )
+
+        snapshot = self.state.file_snapshots[(self.turn_id, str(path.resolve()))]
+        self.assertEqual(snapshot.source_call_key, first_key)
+        self.assertEqual(snapshot.after_version.sha256, hashlib.sha256(b"new").hexdigest())
 
     def test_failed_first_write_does_not_freeze_a_stale_undo_baseline(self) -> None:
         path = self.workspace / "notes.txt"

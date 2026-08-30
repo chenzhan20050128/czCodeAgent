@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -249,6 +250,7 @@ class ToolExecutor:
                 )
 
         if isinstance(prepared, PreparedFileChange):
+            self._append_mutation_plan(state_call, prepared)
             self._append_first_snapshot(state_call, prepared)
 
         self._append_and_reduce(
@@ -506,6 +508,23 @@ class ToolExecutor:
             },
         )
 
+    def _append_mutation_plan(
+        self, call: ToolCall, prepared: PreparedFileChange
+    ) -> None:
+        self._append_and_reduce(
+            "file_mutation_planned",
+            {
+                "turn_id": call.turn_id,
+                "call_key": call.call_key,
+                "path": str(prepared.canonical_path),
+                "expected_version": prepared.expected_version.to_dict(),
+                "proposed_hash": hashlib.sha256(
+                    prepared.proposed_bytes
+                ).hexdigest(),
+                "diff": prepared.diff,
+            },
+        )
+
     def _finish_requested_error(
         self, call: ToolCall, status: ToolStatus, message: str
     ) -> ToolResult:
@@ -555,12 +574,15 @@ class ToolExecutor:
         path = result.metadata.get("path")
         after_hash = result.metadata.get("after_hash")
         after_mode = result.metadata.get("after_mode")
+        after_version = result.metadata.get("after_version")
         if status is ToolStatus.SUCCEEDED and isinstance(path, str) and isinstance(
             after_hash, str
         ) and type(after_mode) is int:
             payload["path"] = path
             payload["after_hash"] = after_hash
             payload["after_mode"] = after_mode
+            if isinstance(after_version, dict):
+                payload["after_version"] = after_version
             created = result.metadata.get("created_directories")
             if isinstance(created, tuple) and created:
                 payload["created_directories"] = list(created)
@@ -587,6 +609,7 @@ class ToolExecutor:
                     "before_hash": raw_result.before_hash,
                     "after_hash": raw_result.after_hash,
                     "after_mode": raw_result.after_mode,
+                    "after_version": raw_result.after_version.to_dict(),
                     "created_directories": raw_result.created_directories,
                     "durability_warning": raw_result.durability_warning,
                     "interruption_warning": raw_result.interruption_warning,
