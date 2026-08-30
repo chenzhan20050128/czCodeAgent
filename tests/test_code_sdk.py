@@ -25,6 +25,11 @@ class CodeSdkTests(unittest.TestCase):
         self.assertIn("after: list[ToolNode] | None", text)
         self.assertIn("await gather", text)
         self.assertIn("UPSTREAM_FAILED", text)
+        self.assertIn('ToolResult = {"status": str, "output": str', text)
+        self.assertIn('readme_text = results[0]["output"]', text)
+        self.assertIn("return {", text)
+        self.assertIn("Imports and json.dumps/json.dump are unavailable", text)
+        self.assertIn("A final bare expression is discarded", text)
 
     def test_run_code_description_contains_the_generated_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

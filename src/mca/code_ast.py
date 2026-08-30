@@ -288,6 +288,15 @@ class Evaluator:
 
     def _sync_expr(self, node: ast.expr) -> Any:
         self.tick()
+        if isinstance(node, ast.Call):
+            function = self._sync_expr(node.func)
+            args = [self._sync_expr(argument) for argument in node.args]
+            kwargs = {
+                item.arg: self._sync_expr(item.value)
+                for item in node.keywords
+                if item.arg is not None
+            }
+            return function(*args, **kwargs)
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, ast.Name):

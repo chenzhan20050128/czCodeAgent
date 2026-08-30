@@ -33,8 +33,13 @@ def render_python_sdk(registry: ToolRegistry) -> str:
         "await gather(a, b) for declared parallel work, and after=[a, b] to",
         "prevent downstream execution when an upstream node fails. Failures use",
         "ToolCallError; blocked descendants report UPSTREAM_FAILED.",
+        "Every awaited tool returns a ToolResult object; read its output field",
+        "instead of treating the whole object as text. End with an explicit",
+        "return of a JSON-compatible value. A final bare expression is discarded.",
+        "Imports and json.dumps/json.dump are unavailable and unnecessary.",
         "",
         "JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]",
+        'ToolResult = {"status": str, "output": str, "exit_code": int | None, "truncated": bool, "metadata": dict[str, JsonValue]}',
         "",
         "class ToolNode:",
         "    id: str",
@@ -65,8 +70,16 @@ def render_python_sdk(registry: ToolRegistry) -> str:
         [
             "",
             "tools: Tools",
-            "async def gather(*nodes: ToolNode) -> list[JsonValue]: ...",
-            "async def execute(*nodes: ToolNode) -> list[JsonValue]: ...",
+        "async def gather(*nodes: ToolNode) -> list[ToolResult]: ...",
+        "async def execute(*nodes: ToolNode) -> list[ToolResult]: ...",
+        "",
+        "Example (two independent reads, one explicit JSON-compatible return):",
+        'readme = tools.read_file({"path": "README.md"})',
+        'config = tools.read_file({"path": ".env.example"})',
+        "results = await gather(readme, config)",
+        'readme_text = results[0]["output"]',
+        'config_text = results[1]["output"]',
+        'return {"readme_length": len(readme_text), "has_config": "MCA_" in config_text}',
         ]
     )
     return "\n".join(lines)

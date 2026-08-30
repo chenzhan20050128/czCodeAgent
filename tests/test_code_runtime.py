@@ -202,6 +202,40 @@ return {"final": final}
         bash = next(node for node in second_nodes if node["name"] == "bash")
         self.assertEqual(len(bash["dependencies"]), 2)
 
+    def test_safe_calls_work_inside_returned_json_composites(self) -> None:
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            targets = request["targets"]
+            return {
+                "results": {
+                    target: {
+                        "ok": True,
+                        "value": {
+                            "status": "succeeded",
+                            "output": "Hello Agent",
+                            "exit_code": None,
+                            "truncated": False,
+                            "metadata": {},
+                        },
+                    }
+                    for target in targets
+                }
+            }
+
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            """
+node = tools.read_file({"path": "README.txt"})
+tool_result = await node
+text = tool_result["output"]
+return {"length": len(text), "normalized": text.lower()}
+""",
+            execute_graph=execute_graph,
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.value, {"length": 11, "normalized": "hello agent"}
+        )
+
     def test_failed_target_raises_structured_graph_error_inside_program(self) -> None:
         def execute_graph(request: dict[str, object]) -> dict[str, object]:
             target = request["targets"][0]
