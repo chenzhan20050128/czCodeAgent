@@ -136,7 +136,10 @@ class PreparedShellCommand:
     termination_grace_seconds: float = field(repr=False)
 
     def execute(
-        self, *, output_channel: BoundedOutputChannel | None = None
+        self,
+        *,
+        output_channel: BoundedOutputChannel | None = None,
+        cancellation_event: threading.Event | None = None,
     ) -> ToolResult:
         if (
             output_channel is not None
@@ -212,12 +215,25 @@ class PreparedShellCommand:
         timed_out = False
         interrupted = False
         try:
-            process.wait(timeout=self.timeout_seconds)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _stop_process_group(
-                process, signal.SIGTERM, self.termination_grace_seconds
-            )
+            deadline = time.monotonic() + self.timeout_seconds
+            while process.poll() is None:
+                if cancellation_event is not None and cancellation_event.is_set():
+                    interrupted = True
+                    _stop_process_group(
+                        process, signal.SIGTERM, self.termination_grace_seconds
+                    )
+                    break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    _stop_process_group(
+                        process, signal.SIGTERM, self.termination_grace_seconds
+                    )
+                    break
+                try:
+                    process.wait(timeout=min(0.05, remaining))
+                except subprocess.TimeoutExpired:
+                    continue
         except KeyboardInterrupt:
             interrupted = True
             _stop_process_group(

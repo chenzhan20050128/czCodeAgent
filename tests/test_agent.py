@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import dataclasses
 import concurrent.futures
+import dataclasses
+import json
 import sys
 import tempfile
 import threading
@@ -36,6 +37,7 @@ from mca.domain import (
     TurnStatus,
 )
 from mca.executor import ToolExecutor
+from mca.code_mode import prepare_code_program
 from mca.model import SampledToolCall, SamplingResult
 from mca.projection import ProjectionEnvironment, PromptProjector
 from mca.store import RolloutStore
@@ -272,6 +274,51 @@ class AgentLoopTestCase(unittest.TestCase):
 
 
 class AgentLoopTests(AgentLoopTestCase):
+    def test_run_code_returns_only_curated_outer_result_to_next_sample(self) -> None:
+        list_spec = ToolSpec(
+            "list_dir",
+            "List.",
+            EMPTY_SCHEMA,
+            handler=lambda arguments: ToolResult(
+                title="list", output="a.py\nb.py", metadata={"count": 2}
+            ),
+            is_concurrency_safe=lambda arguments: True,
+        )
+        run_code_spec = ToolSpec(
+            "run_code",
+            "Run constrained Python.",
+            {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string"},
+                    "code": {"type": "string"},
+                },
+                "required": ["description", "code"],
+                "additionalProperties": False,
+            },
+            prepare_handler=prepare_code_program,
+        )
+        arguments = json.dumps({
+            "description": "list files",
+            "code": 'return await tools.list_dir({})',
+        })
+        runtime = self.make_runtime(
+            tool_batch(call("code", "run_code", arguments)),
+            text("There are two files."),
+            specs=[list_spec, run_code_spec],
+        )
+
+        result = runtime.loop.run_turn("count files")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        next_messages = runtime.model.requests[1][0]
+        tool_messages = [item for item in next_messages if item["role"] == "tool"]
+        self.assertEqual(len(tool_messages), 1)
+        self.assertEqual(tool_messages[0]["tool_call_id"], "code")
+        self.assertIn('\"count\": 2', tool_messages[0]["content"] )
+        self.assertNotIn("a.py\nb.py", tool_messages[0]["content"] )
+        self.assertTrue(any(event.type == "code_node_planned" for event in runtime.store.load()))
+
     def test_parallel_limit_must_be_positive_at_loop_construction(self) -> None:
         with self.assertRaisesRegex(ValueError, "max_parallel_tool_calls"):
             self.make_runtime(

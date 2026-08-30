@@ -20,6 +20,7 @@ from pathlib import Path
 from .agent import AgentLoop, RecoveryBlockedError
 from .approval import InteractiveApprover, _escape_terminal_text
 from .compact import CompactionError, SessionCompactor
+from .code_runtime import CodeRuntimeConfig
 from .config import Config
 from .domain import SessionReducer, SessionState, ToolStatus, TurnStatus
 from .executor import ToolExecutor
@@ -198,6 +199,16 @@ class _Runtime:
             state=state,
             approver=approver,
             workspace=workspace,
+            code_runtime_config=CodeRuntimeConfig(
+                max_wall_seconds=config.code_max_wall_seconds,
+                max_source_bytes=config.code_max_source_bytes,
+                max_ast_nodes=config.code_max_ast_nodes,
+                max_eval_steps=config.code_max_eval_steps,
+                max_collection_items=config.code_max_collection_items,
+                max_frame_bytes=max(config.code_max_output_bytes * 2, 1024 * 1024),
+            ),
+            code_max_parallel_nodes=config.code_max_parallel_nodes,
+            code_max_tool_nodes=config.code_max_tool_nodes,
         )
         self.compactor = SessionCompactor(
             store=store,

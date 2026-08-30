@@ -140,15 +140,20 @@ class _GraphClient:
 
     def _closure(self, targets: tuple[ToolNode, ...]) -> list[ToolNode]:
         included: set[str] = set()
+        visiting: set[str] = set()
 
         def visit(node: ToolNode) -> None:
             if node.node_id in included or node.submitted:
                 return
+            if node.node_id in visiting:
+                raise RuntimeError("CYCLIC_DEPENDENCY")
+            visiting.add(node.node_id)
             for dependency_id in node.dependencies:
                 dependency = self.nodes.get(dependency_id)
                 if dependency is None:
                     raise RuntimeError("UNKNOWN_NODE_REFERENCE")
                 visit(dependency)
+            visiting.remove(node.node_id)
             included.add(node.node_id)
 
         for target in targets:
@@ -169,7 +174,7 @@ class _GraphClient:
             error = {"message": "tool call failed"}
         error_type = (
             GraphExecutionError
-            if error.get("code") == "UPSTREAM_FAILED"
+            if error.get("code") in {"UPSTREAM_FAILED", "GRAPH_REJECTED"}
             else ToolCallError
         )
         raise error_type(node.name, node.node_id, error)

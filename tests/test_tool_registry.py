@@ -304,6 +304,7 @@ class BuiltinToolSpecTests(unittest.TestCase):
                 "edit_file",
                 "bash",
                 "exit_plan_mode",
+                "run_code",
             ],
         )
         for schema in schemas:
@@ -353,6 +354,7 @@ class BuiltinToolSpecTests(unittest.TestCase):
                 "edit_file": ExecutionMode.EXCLUSIVE,
                 "bash": ExecutionMode.EXCLUSIVE,
                 "exit_plan_mode": ExecutionMode.EXCLUSIVE,
+                "run_code": ExecutionMode.EXCLUSIVE,
             }
             arguments = {
                 "read_file": '{"path":"missing.txt"}',
@@ -362,6 +364,7 @@ class BuiltinToolSpecTests(unittest.TestCase):
                 "edit_file": '{"path":"a","old_text":"x","new_text":"y"}',
                 "bash": '{"command":"true"}',
                 "exit_plan_mode": '{"plan":"# Plan"}',
+                "run_code": '{"description":"work","code":"return 1"}',
             }
 
             self.assertEqual(

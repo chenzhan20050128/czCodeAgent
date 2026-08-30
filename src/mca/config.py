@@ -27,6 +27,14 @@ class Config:
     max_steps: int = 64
     max_tool_calls_per_batch: int = 8
     max_parallel_tool_calls: int = 4
+    code_max_parallel_nodes: int = 4
+    code_max_tool_nodes: int = 64
+    code_max_wall_seconds: float = 120.0
+    code_max_source_bytes: int = 65_536
+    code_max_ast_nodes: int = 10_000
+    code_max_eval_steps: int = 100_000
+    code_max_output_bytes: int = 65_536
+    code_max_collection_items: int = 10_000
     request_timeout: float = 600.0
     max_attempts: int = 3
     retry_budget_seconds: float = 900.0
@@ -96,6 +104,20 @@ class Config:
         max_parallel_tool_calls = _positive_int_from_env(
             "MCA_MAX_PARALLEL_TOOL_CALLS", 4
         )
+        code_max_parallel_nodes = _positive_int_from_env(
+            "MCA_CODE_MAX_PARALLEL_NODES", 4
+        )
+        code_max_tool_nodes = _positive_int_from_env(
+            "MCA_CODE_MAX_TOOL_NODES", 64
+        )
+        code_max_wall_seconds = _positive_float_from_env(
+            "MCA_CODE_MAX_WALL_SECONDS", 120.0
+        )
+        code_max_source_bytes = _positive_int_from_env("MCA_CODE_MAX_SOURCE_BYTES", 65_536)
+        code_max_ast_nodes = _positive_int_from_env("MCA_CODE_MAX_AST_NODES", 10_000)
+        code_max_eval_steps = _positive_int_from_env("MCA_CODE_MAX_EVAL_STEPS", 100_000)
+        code_max_output_bytes = _positive_int_from_env("MCA_CODE_MAX_OUTPUT_BYTES", 65_536)
+        code_max_collection_items = _positive_int_from_env("MCA_CODE_MAX_COLLECTION_ITEMS", 10_000)
         request_timeout = _positive_float_from_env("MCA_REQUEST_TIMEOUT", 600.0)
         retry_budget_seconds = _positive_float_from_env(
             "MCA_RETRY_BUDGET_SECONDS", 900.0
@@ -110,6 +132,14 @@ class Config:
             thinking=thinking,
             max_steps=max_steps,
             max_parallel_tool_calls=max_parallel_tool_calls,
+            code_max_parallel_nodes=code_max_parallel_nodes,
+            code_max_tool_nodes=code_max_tool_nodes,
+            code_max_wall_seconds=code_max_wall_seconds,
+            code_max_source_bytes=code_max_source_bytes,
+            code_max_ast_nodes=code_max_ast_nodes,
+            code_max_eval_steps=code_max_eval_steps,
+            code_max_output_bytes=code_max_output_bytes,
+            code_max_collection_items=code_max_collection_items,
             request_timeout=request_timeout,
             retry_budget_seconds=retry_budget_seconds,
         )
@@ -125,6 +155,14 @@ class Config:
             "max_tool_calls_per_batch="
             f"{self.max_tool_calls_per_batch!r}, "
             f"max_parallel_tool_calls={self.max_parallel_tool_calls!r}, "
+            f"code_max_parallel_nodes={self.code_max_parallel_nodes!r}, "
+            f"code_max_tool_nodes={self.code_max_tool_nodes!r}, "
+            f"code_max_wall_seconds={self.code_max_wall_seconds!r}, "
+            f"code_max_source_bytes={self.code_max_source_bytes!r}, "
+            f"code_max_ast_nodes={self.code_max_ast_nodes!r}, "
+            f"code_max_eval_steps={self.code_max_eval_steps!r}, "
+            f"code_max_output_bytes={self.code_max_output_bytes!r}, "
+            f"code_max_collection_items={self.code_max_collection_items!r}, "
             f"request_timeout={self.request_timeout!r}, "
             f"max_attempts={self.max_attempts!r}, "
             f"retry_budget_seconds={self.retry_budget_seconds!r}, "

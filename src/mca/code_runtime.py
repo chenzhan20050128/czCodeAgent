@@ -60,12 +60,15 @@ class CodeRuntime:
         code: str,
         *,
         execute_graph: Callable[[dict[str, object]], dict[str, object]],
+        cancellation_event: threading.Event | None = None,
     ) -> CodeRuntimeResult:
         if not isinstance(code, str):
             raise TypeError("code must be a string")
         if len(code.encode("utf-8")) > self.config.max_source_bytes:
             return CodeRuntimeResult(error=CodeRuntimeError("SOURCE_LIMIT", "code exceeds source byte limit"))
         worker = Path(__file__).with_name("code_worker.py")
+        cancel = cancellation_event or threading.Event()
+        deadline_expired = threading.Event()
         with tempfile.TemporaryDirectory(prefix="mca-code-") as temporary:
             process = subprocess.Popen(
                 [sys.executable, "-I", "-S", "-u", str(worker)],
@@ -112,6 +115,13 @@ class CodeRuntime:
             process.stdin.flush()
             result: CodeRuntimeResult | None = None
             deadline = time.monotonic() + self.config.max_wall_seconds
+            def expire() -> None:
+                deadline_expired.set()
+                cancel.set()
+
+            timer = threading.Timer(self.config.max_wall_seconds, expire)
+            timer.daemon = True
+            timer.start()
             try:
                 while result is None:
                     remaining = deadline - time.monotonic()
@@ -140,7 +150,30 @@ class CodeRuntime:
                         result = CodeRuntimeResult(error=CodeRuntimeError("PROTOCOL_ERROR", str(error)))
                         break
                     if frame.get("type") == "execute_graph":
-                        response = execute_graph(frame)
+                        try:
+                            response = execute_graph(frame)
+                        except Exception as error:
+                            targets = frame.get("targets", [])
+                            response = {
+                                "results": {
+                                    target: {
+                                        "ok": False,
+                                        "error": {
+                                            "code": "GRAPH_REJECTED",
+                                            "status": "failed",
+                                            "message": str(error) or type(error).__name__,
+                                        },
+                                    }
+                                    for target in targets
+                                    if isinstance(target, str)
+                                }
+                            }
+                        if deadline_expired.is_set():
+                            self._stop(process)
+                            return CodeRuntimeResult(
+                                error=CodeRuntimeError("WALL_TIMEOUT", "code runtime exceeded wall timeout"),
+                                stderr=b"".join(stderr_chunks).decode("utf-8", errors="replace"),
+                            )
                         process.stdin.write(encode_frame({"type": "graph_result", **response}, max_bytes=self.config.max_frame_bytes))
                         process.stdin.flush()
                         continue
@@ -159,6 +192,7 @@ class CodeRuntime:
                 self._stop(process, signal.SIGINT)
                 raise
             finally:
+                timer.cancel()
                 if process.poll() is None:
                     self._stop(process)
                 try:

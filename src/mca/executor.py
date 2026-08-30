@@ -5,12 +5,14 @@ from __future__ import annotations
 import base64
 import hashlib
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from .approval import ApprovalDecision, ApprovalInterrupted, ApprovalRequest, _escape_terminal_text
+from .code_runtime import CodeRuntime
 from .domain import SessionReducer, SessionState, ToolCall, ToolStatus
 from .store import RolloutStore
 from .tools.filesystem import (
@@ -24,6 +26,7 @@ from .tools.registry import (
     SideEffect,
     ToolRegistry,
     ToolResult,
+    ToolSpec,
     ToolValidationError,
     UnknownToolError,
 )
@@ -92,6 +95,16 @@ class PreparedParallelCall:
     handler: Callable[[dict[str, Any]], object]
 
 
+@dataclass(frozen=True)
+class PreparedStagedCall:
+    """A validated and approved call awaiting its durable start."""
+
+    call: ToolCall
+    spec: ToolSpec
+    arguments: dict[str, Any]
+    prepared: object | None
+
+
 class ToolExecutor:
     """Execute each accepted call at most once through durable lifecycle facts."""
 
@@ -104,6 +117,9 @@ class ToolExecutor:
         workspace: str | os.PathLike[str],
         *,
         output_channel: BoundedOutputChannel | None = None,
+        code_runtime_config: object | None = None,
+        code_max_parallel_nodes: int = 4,
+        code_max_tool_nodes: int = 64,
     ) -> None:
         workspace_path = Path(workspace).resolve(strict=True)
         if not workspace_path.is_dir():
@@ -121,11 +137,40 @@ class ToolExecutor:
         self.approver = approver
         self.workspace = workspace_path
         self.output_channel = output_channel
+        self.code_runtime_config = code_runtime_config
+        self.code_max_parallel_nodes = code_max_parallel_nodes
+        self.code_max_tool_nodes = code_max_tool_nodes
         self._usable = True
         if registry.workspace is not None and registry.workspace != workspace_path:
             raise ValueError("registry workspace does not match executor workspace")
 
     def execute(self, accepted: AcceptedToolCall | ToolCall) -> ToolResult:
+        staged = self.prepare_staged(accepted)
+        if isinstance(staged, ToolResult):
+            return staged
+        self.start_staged(staged)
+        if staged.spec.side_effect is SideEffect.PLAN_EXIT:
+            self._append_and_reduce("plan_mode_set", {"active": False})
+            result = ToolResult.bounded(
+                title="exit_plan_mode",
+                output="plan approved; plan mode exited",
+            )
+        else:
+            result = self.dispatch_staged(staged)
+        self.commit_staged(staged, result)
+        if result.metadata.get("interruption_warning") is True:
+            raise PostCommitInterrupted from None
+        return result
+
+    def prepare_staged(
+        self,
+        accepted: AcceptedToolCall | ToolCall,
+        *,
+        allow_code_concurrency: bool = False,
+    ) -> PreparedStagedCall | ToolResult:
+        """Validate, prepare, approve, and snapshot without starting the body."""
+
+        del allow_code_concurrency
         if not self._usable:
             raise ToolExecutorError("executor is unusable after reducer divergence")
         call = (
@@ -253,33 +298,74 @@ class ToolExecutor:
             self._append_mutation_plan(state_call, prepared)
             self._append_first_snapshot(state_call, prepared)
 
+        return PreparedStagedCall(state_call, spec, arguments, prepared)
+
+    def start_staged(self, staged: PreparedStagedCall) -> None:
+        """Persist the side-effect boundary for one prepared call."""
+
+        if not isinstance(staged, PreparedStagedCall):
+            raise TypeError("staged must be a PreparedStagedCall")
         self._append_and_reduce(
             "tool_started",
             {
-                "call_key": call.call_key,
-                "call_id": call.provider_call_id,
-                "name": call.name,
-                "arguments": arguments,
+                "call_key": staged.call.call_key,
+                "call_id": staged.call.provider_call_id,
+                "name": staged.call.name,
+                "arguments": staged.arguments,
+                **({"origin": "code"} if staged.call.origin == "code" else {}),
             },
         )
-        if spec.side_effect is SideEffect.PLAN_EXIT:
-            # Approval of exit_plan_mode is the user's decision to leave plan
-            # mode; record it as a durable fact between started and finished so
-            # the tool result reflects a completed transition.
-            self._append_and_reduce("plan_mode_set", {"active": False})
-            result = ToolResult.bounded(
-                title="exit_plan_mode",
-                output="plan approved; plan mode exited",
-            )
-            self._finish_started(state_call, result)
-            return result
+
+    def dispatch_staged(self, staged: PreparedStagedCall) -> ToolResult:
+        """Run only the tool body; this method never writes session state."""
+
+        if not isinstance(staged, PreparedStagedCall):
+            raise TypeError("staged must be a PreparedStagedCall")
+        return self.dispatch_staged_with_cancel(staged)
+
+    def dispatch_staged_with_cancel(
+        self,
+        staged: PreparedStagedCall,
+        cancellation_event: threading.Event | None = None,
+    ) -> ToolResult:
+        """Run a staged body with optional run-scoped cancellation."""
+
+        if not isinstance(staged, PreparedStagedCall):
+            raise TypeError("staged must be a PreparedStagedCall")
+        spec = staged.spec
+        prepared = staged.prepared
+        call = staged.call
         try:
+            from .code_mode import PreparedCodeProgram
+
+            if isinstance(prepared, PreparedCodeProgram):
+                from .code_mode import CodeModeRunner
+
+                return CodeModeRunner(
+                    store=self.store,
+                    state=self.state,
+                    executor=self,
+                    runtime=(
+                        None
+                        if self.code_runtime_config is None
+                        else CodeRuntime(self.code_runtime_config)
+                    ),
+                    max_parallel=self.code_max_parallel_nodes,
+                    max_nodes=self.code_max_tool_nodes,
+                ).run(
+                    call,
+                    description=prepared.description,
+                    code=prepared.code,
+                )
             if spec.handler is not None:
-                raw_result = spec.handler(arguments)
+                raw_result = spec.handler(staged.arguments)
             else:
                 assert prepared is not None
                 if isinstance(prepared, PreparedShellCommand):
-                    raw_result = prepared.execute(output_channel=self.output_channel)
+                    raw_result = prepared.execute(
+                        output_channel=self.output_channel,
+                        cancellation_event=cancellation_event,
+                    )
                 else:
                     raw_result = prepared.execute()  # type: ignore[attr-defined]
             result = self._normalize_result(call.name, raw_result)
@@ -313,20 +399,26 @@ class ToolExecutor:
                 _safe_error("tool execution failed", error),
             )
 
+        return result
+
+    def commit_staged(
+        self, staged: PreparedStagedCall, result: ToolResult
+    ) -> None:
+        """Persist a settled staged result on the coordinator thread."""
+
+        if not isinstance(staged, PreparedStagedCall):
+            raise TypeError("staged must be a PreparedStagedCall")
         try:
-            self._finish_started(state_call, result)
+            self._finish_started(staged.call, result)
         except ToolExecutorError:
             raise
         except Exception as error:
             result = _error_result(
-                call.name,
+                staged.call.name,
                 ToolStatus.FAILED,
                 _safe_error("tool result handling failed", error),
             )
-            self._finish_started(state_call, result)
-        if result.metadata.get("interruption_warning") is True:
-            raise PostCommitInterrupted from None
-        return result
+            self._finish_started(staged.call, result)
 
     def execute_call(self, accepted: AcceptedToolCall | ToolCall) -> ToolResult:
         """Compatibility spelling for callers that name the unit explicitly."""
@@ -526,20 +618,51 @@ class ToolExecutor:
         )
 
     def _finish_requested_error(
-        self, call: ToolCall, status: ToolStatus, message: str
+        self,
+        call: ToolCall,
+        status: ToolStatus,
+        message: str,
+        *,
+        extra: dict[str, Any] | None = None,
     ) -> ToolResult:
         result = _error_result(call.name, status, message)
+        payload: dict[str, Any] = {
+            "call_key": call.call_key,
+            "call_id": call.provider_call_id,
+            "status": status.value,
+            "result": result.output,
+            "truncated": bool(result.metadata["truncated"]),
+            **({"origin": "code"} if call.origin == "code" else {}),
+            **(
+                {"result_metadata": dict(result.metadata)}
+                if call.origin == "code"
+                else {}
+            ),
+        }
+        if extra:
+            payload.update(extra)
         self._append_and_reduce(
             "tool_finished",
-            {
-                "call_key": call.call_key,
-                "call_id": call.provider_call_id,
-                "status": status.value,
-                "result": result.output,
-                "truncated": bool(result.metadata["truncated"]),
-            },
+            payload,
         )
         return result
+
+    def finish_unstarted(
+        self,
+        accepted: AcceptedToolCall | ToolCall,
+        status: ToolStatus,
+        message: str,
+        *,
+        extra: dict[str, Any] | None = None,
+    ) -> ToolResult:
+        """Close one requested call without dispatching its body."""
+
+        call = (
+            accepted
+            if isinstance(accepted, ToolCall)
+            else self._require_accepted_identity(accepted)
+        )
+        return self._finish_requested_error(call, status, message, extra=extra)
 
     def _finish_started(self, call: ToolCall, result: ToolResult) -> None:
         try:
@@ -567,6 +690,12 @@ class ToolExecutor:
             "status": status.value,
             "result": result.output,
             "truncated": bool(result.metadata.get("truncated", False)),
+            **({"origin": "code"} if call.origin == "code" else {}),
+            **(
+                {"result_metadata": dict(result.metadata)}
+                if call.origin == "code"
+                else {}
+            ),
         }
         exit_code = result.metadata.get("exit_code")
         if type(exit_code) is int:
@@ -652,6 +781,7 @@ def _safe_error(prefix: str, error: BaseException) -> str:
 __all__ = [
     "AcceptedToolCall",
     "PreparedParallelCall",
+    "PreparedStagedCall",
     "PostCommitInterrupted",
     "ToolExecutor",
     "ToolExecutorError",

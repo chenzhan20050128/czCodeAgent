@@ -28,6 +28,9 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
     Stateful handlers are bound to the canonical workspace at construction.
     """
 
+    from ..code_mode import prepare_code_program
+    from ..code_sdk import render_python_sdk
+
     filesystem = FileSystemTools(Path(workspace))
     search = SearchTools(Path(workspace))
     shell = ShellRunner(Path(workspace))
@@ -193,6 +196,26 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             ),
         ),
     ]
+    base_registry = ToolRegistry(specs, workspace=Path(workspace))
+    specs.append(ToolSpec(
+        name="run_code",
+        description=(
+            "Execute a Constrained Python program that composes MCA tools. "
+            "Only the program result and summary return to the model.\n\n"
+            + render_python_sdk(base_registry)
+        ),
+        schema={
+            "type": "object",
+            "properties": {
+                "description": {"type": "string", "minLength": 1},
+                "code": {"type": "string", "minLength": 1},
+            },
+            "required": ["description", "code"],
+            "additionalProperties": False,
+        },
+        prepare_handler=prepare_code_program,
+        side_effect=SideEffect.NONE,
+    ))
     return ToolRegistry(specs, workspace=Path(workspace))
 
 __all__ = [

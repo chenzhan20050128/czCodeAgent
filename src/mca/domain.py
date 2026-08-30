@@ -285,6 +285,7 @@ class ToolCall:
     result: str | None = None
     exit_code: int | None = None
     truncated: bool = False
+    result_metadata: Mapping[str, Any] = field(default_factory=dict)
     recovery_blocked: bool = False
     reconciliation_note: str | None = None
     requested_seq: int | None = None
@@ -307,6 +308,9 @@ class ToolCall:
             raise DomainError("tool arguments must be a JSON string")
         if not isinstance(self.status, ToolStatus):
             raise DomainError("status must be a ToolStatus")
+        if not isinstance(self.result_metadata, Mapping):
+            raise DomainError("result_metadata must be an object")
+        object.__setattr__(self, "result_metadata", _freeze_json(self.result_metadata))
         if self.origin not in {"model", "code"}:
             raise DomainError("tool origin must be model or code")
         if self.origin == "code":
@@ -862,6 +866,7 @@ class SessionReducer:
             result=result,
             exit_code=exit_code,
             truncated=truncated,
+            result_metadata=event.payload.get("result_metadata", {}),
             recovery_blocked=recovery_blocked,
             finished_seq=event.seq,
         )

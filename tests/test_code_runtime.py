@@ -142,6 +142,48 @@ except GraphExecutionError as error:
 
         self.assertEqual(result.value, {"code": "UPSTREAM_FAILED", "blocked_by": ["node-1"]})
 
+    def test_cycle_is_rejected_before_graph_dispatch(self) -> None:
+        calls = 0
+
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            nonlocal calls
+            calls += 1
+            return {}
+
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            """
+a = tools.read_file({"path": "a"})
+b = tools.read_file({"path": "b"}, after=[a])
+a.after(b)
+return await a
+""",
+            execute_graph=execute_graph,
+        )
+
+        self.assertEqual(result.error.code, "CODE_EXCEPTION")
+        self.assertIn("CYCLIC_DEPENDENCY", result.error.message)
+        self.assertEqual(calls, 0)
+
+    def test_parent_graph_validation_failure_is_structured_in_program(self) -> None:
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            raise ValueError("code graph exceeds node limit")
+
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            """
+node = tools.read_file({"path": "a"})
+try:
+    await node
+except GraphExecutionError as error:
+    return {"code": error.code, "message": error.message}
+""",
+            execute_graph=execute_graph,
+        )
+
+        self.assertEqual(result.value, {
+            "code": "GRAPH_REJECTED",
+            "message": "code graph exceeds node limit",
+        })
+
     def test_runtime_has_empty_environment(self) -> None:
         secret_name = "MCA_CODE_RUNTIME_TEST_SECRET"
         with patch.dict(os.environ, {secret_name: "must-not-leak"}):

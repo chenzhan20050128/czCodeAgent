@@ -106,6 +106,36 @@ class ExecutorTestCase(unittest.TestCase):
 
 
 class ToolExecutorTests(ExecutorTestCase):
+    def test_staged_write_keeps_control_plane_order_and_worker_body_pure(self) -> None:
+        path = self.workspace / "staged.txt"
+        path.write_text("before", encoding="utf-8")
+        call = self.accept(
+            "write_file", '{"path":"staged.txt","content":"after"}'
+        )
+        executor = self.executor()
+
+        prepared = executor.prepare_staged(call, allow_code_concurrency=True)
+
+        self.assertEqual(
+            [event.type for event in self.events_after_acceptance()],
+            ["approval_decided", "file_mutation_planned", "file_snapshot"],
+        )
+        self.assertEqual(path.read_text(encoding="utf-8"), "before")
+
+        executor.start_staged(prepared)
+        self.assertEqual(self.events_after_acceptance()[-1].type, "tool_started")
+
+        before_dispatch_events = len(self.store.load())
+        result = executor.dispatch_staged(prepared)
+        self.assertEqual(len(self.store.load()), before_dispatch_events)
+        self.assertEqual(path.read_text(encoding="utf-8"), "after")
+
+        executor.commit_staged(prepared, result)
+        self.assertEqual(self.events_after_acceptance()[-1].type, "tool_finished")
+        self.assertIs(
+            self.state.tool_calls[call.call_key].status, ToolStatus.SUCCEEDED
+        )
+
     def test_unknown_tool_finishes_without_approval_or_start(self) -> None:
         call = self.accept("missing", "{}")
         approver = Mock(side_effect=AssertionError("approval must not run"))
