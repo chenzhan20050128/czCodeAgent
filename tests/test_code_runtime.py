@@ -3,20 +3,22 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from mca.code_ast import CodeValidationError, validate_code
+from mca.code_ast import CollectionLimitError, CodeValidationError, validate_code
 from mca.code_protocol import ProtocolFrameError, decode_frame, encode_frame
 from mca.code_runtime import CodeRuntime, CodeRuntimeConfig
 import mca.code_runtime as code_runtime
+import mca.code_ast as code_ast
 import mca.code_worker as code_worker
 
 
@@ -101,6 +103,66 @@ class CodeRuntimeTests(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertEqual(captured[0]["max_cpu_seconds"], 7)
         self.assertEqual(captured[0]["max_memory_mb"], 384)
+
+    def test_oversized_start_frame_fails_before_worker_spawn(self) -> None:
+        with patch("mca.code_runtime.subprocess.Popen") as popen:
+            result = CodeRuntime(
+                CodeRuntimeConfig(max_wall_seconds=2, max_frame_bytes=16)
+            ).run("return 1", execute_graph=lambda request: {})
+
+        self.assertEqual(result.error.code, "PROTOCOL_ERROR")
+        popen.assert_not_called()
+
+    def test_worker_start_failure_reaps_spawned_process(self) -> None:
+        process = Mock()
+        process.stdin = Mock()
+        process.stdout = Mock()
+        process.stderr = Mock()
+        process.poll.return_value = None
+        with patch("mca.code_runtime.subprocess.Popen", return_value=process), patch(
+            "mca.code_runtime.threading.Thread.start",
+            side_effect=RuntimeError("thread start failed"),
+        ), patch.object(CodeRuntime, "_stop") as stop:
+            with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+                    "return 1", execute_graph=lambda request: {}
+                )
+
+        stop.assert_called_once_with(process)
+        process.stdin.close.assert_called_once()
+
+    def test_initial_protocol_write_failure_reaps_spawned_process(self) -> None:
+        process = Mock()
+        process.stdin = Mock()
+        process.stdin.write.side_effect = BrokenPipeError("worker exited")
+        process.stdout = Mock()
+        process.stdout.readline.return_value = b""
+        process.stderr = Mock()
+        process.stderr.read.return_value = b""
+        process.poll.return_value = None
+
+        with patch("mca.code_runtime.subprocess.Popen", return_value=process), patch.object(
+            CodeRuntime, "_stop"
+        ) as stop:
+            with self.assertRaises(BrokenPipeError):
+                CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+                    "return 1", execute_graph=lambda request: {}
+                )
+
+        stop.assert_called_once_with(process)
+        process.stdin.close.assert_called_once()
+
+    def test_worker_never_retains_more_than_one_node_over_parent_limit(self) -> None:
+        client = code_worker._GraphClient(
+            ("read_file",), max_frame_bytes=1024, max_nodes=1
+        )
+        client.create("read_file", {"path": "a"}, ())
+        client.create("read_file", {"path": "b"}, ())
+
+        with self.assertRaises(code_worker.NodeLimitError):
+            client.create("read_file", {"path": "c"}, ())
+
+        self.assertEqual(len(client.nodes), 2)
 
     def test_worker_tightens_posix_cpu_and_address_space_limits(self) -> None:
         fake_resource = unittest.mock.Mock()
@@ -266,6 +328,36 @@ except GraphExecutionError as error:
 
         self.assertEqual(result.value, {"code": "UPSTREAM_FAILED", "blocked_by": ["node-1"]})
 
+    def test_tool_call_error_handler_catches_graph_execution_subclass(self) -> None:
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            target = request["targets"][0]
+            return {
+                "results": {
+                    target: {
+                        "ok": False,
+                        "error": {
+                            "code": "UPSTREAM_FAILED",
+                            "message": "dependency failed",
+                            "status": "upstream_failed",
+                        },
+                    }
+                }
+            }
+
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            """
+node = tools.bash({"command": "test"})
+try:
+    await node
+except ToolCallError as error:
+    return {"caught": error.code}
+""",
+            execute_graph=execute_graph,
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.value, {"caught": "UPSTREAM_FAILED"})
+
     def test_cycle_is_rejected_before_graph_dispatch(self) -> None:
         calls = 0
 
@@ -307,6 +399,37 @@ except GraphExecutionError as error:
             "code": "GRAPH_REJECTED",
             "message": "code graph exceeds node limit",
         })
+
+    def test_parent_rejection_covers_target_dependency_closure(self) -> None:
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            raise ValueError("batch rejected")
+
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            """
+first = tools.read_file({"path": "a"})
+second = tools.read_file({"path": "b"}, after=[first])
+try:
+    return await second
+except GraphExecutionError as error:
+    return {"code": error.code, "message": error.message}
+""",
+            execute_graph=execute_graph,
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(
+            result.value, {"code": "GRAPH_REJECTED", "message": "batch rejected"}
+        )
+
+    def test_unexpected_parent_callback_error_is_not_downgraded_to_graph_rejection(self) -> None:
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            raise RuntimeError("parent state diverged")
+
+        with self.assertRaisesRegex(RuntimeError, "parent state diverged"):
+            CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+                'return await tools.read_file({"path": "a"})',
+                execute_graph=execute_graph,
+            )
 
     def test_runtime_has_empty_environment(self) -> None:
         secret_name = "MCA_CODE_RUNTIME_TEST_SECRET"
@@ -368,6 +491,70 @@ return [a, b]
         )
 
         self.assertEqual(result.error.code, "COLLECTION_LIMIT")
+
+    def test_collection_limit_blocks_multiplication_and_mutating_methods(self) -> None:
+        programs = (
+            "return [0] * 100",
+            'return "x" * 100',
+            "items = [1, 2, 3]\nitems.extend([4, 5, 6])\nreturn items",
+            "items = {}\nfor item in range(6):\n    items[item] = item\nreturn items",
+        )
+        for source in programs:
+            with self.subTest(source=source):
+                result = CodeRuntime(
+                    CodeRuntimeConfig(
+                        max_wall_seconds=2, max_collection_items=5
+                    )
+                ).run(source, execute_graph=lambda request: {})
+                self.assertEqual(result.error.code, "COLLECTION_LIMIT")
+
+    def test_oversized_sequence_multiplication_is_rejected_before_allocation(self) -> None:
+        validated = validate_code("return [0] * 1000000000")
+        multiply = Mock(side_effect=AssertionError("must reject before allocation"))
+
+        with patch("mca.code_ast.operator.mul", multiply):
+            with self.assertRaises(CollectionLimitError):
+                asyncio.run(
+                    code_ast.Evaluator(
+                        {}, max_steps=100, max_collection_items=5
+                    ).run(validated)
+                )
+
+        multiply.assert_not_called()
+
+    def test_worker_protocol_uses_configured_frame_limit_for_graph_results(self) -> None:
+        payload = "x" * (1024 * 1024 + 32)
+
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            target = request["targets"][0]
+            return {"results": {target: {"ok": True, "value": payload}}}
+
+        result = CodeRuntime(
+            CodeRuntimeConfig(
+                max_wall_seconds=3,
+                max_output_bytes=2 * 1024 * 1024,
+                max_frame_bytes=3 * 1024 * 1024,
+            )
+        ).run(
+            'return await tools.read_file({"path": "large.txt"})',
+            execute_graph=execute_graph,
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.value, payload)
+
+    def test_configured_frame_limit_also_applies_to_initial_source_frame(self) -> None:
+        source = "#" + ("x" * (1024 * 1024 + 32)) + "\nreturn 1"
+        result = CodeRuntime(
+            CodeRuntimeConfig(
+                max_wall_seconds=3,
+                max_source_bytes=2 * 1024 * 1024,
+                max_frame_bytes=3 * 1024 * 1024,
+            )
+        ).run(source, execute_graph=lambda request: {})
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.value, 1)
 
 
 if __name__ == "__main__":

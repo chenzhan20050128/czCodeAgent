@@ -18,7 +18,9 @@ from .domain import (
     reduce_event,
 )
 from .code_graph import CodeRunStatus, graph_summary
+from .file_versions import FileVersionError, capture_file_version
 from .store import RolloutStore
+from .tools.filesystem import DEFAULT_MAX_FILE_BYTES, WorkspaceResolver
 
 
 class ResumeError(RuntimeError):
@@ -251,7 +253,7 @@ def _recover_code_runs(store: RolloutStore, state: SessionState) -> None:
 
     for run_id, run in tuple(state.code_runs.items()):
         parent = state.tool_calls.get(run.parent_call_key)
-        if parent is None or parent.is_terminal:
+        if parent is None:
             continue
         if run.status is CodeRunStatus.ACTIVE:
             candidates: list[Event] = []
@@ -427,18 +429,44 @@ def reconcile_tool(
             )
         return durable[0]
 
+    reconciliation_payload: dict[str, object] = {
+        "call_key": target.call_key,
+        "call_id": target.provider_call_id,
+        "outcome": outcome,
+        "note": note,
+    }
+    if outcome == "succeeded" and target.call_key in state.file_mutation_plans:
+        plan = state.file_mutation_plans[target.call_key]
+        assert state.cwd is not None
+        try:
+            path = WorkspaceResolver(state.cwd).resolve_write(plan.path)
+            observed, _ = capture_file_version(
+                path, max_file_bytes=DEFAULT_MAX_FILE_BYTES
+            )
+        except (OSError, ValueError, FileVersionError) as error:
+            raise ReconciliationError(
+                f"cannot verify successful file mutation: {error}"
+            ) from error
+        if not observed.exists or observed.sha256 != plan.proposed_hash:
+            raise ReconciliationError(
+                "current file does not match the approved mutation"
+            )
+        reconciliation_payload.update(
+            {
+                "path": str(path),
+                "after_hash": observed.sha256,
+                "after_mode": observed.mode,
+                "after_version": observed.to_dict(),
+            }
+        )
+
     candidates: list[Event] = []
     candidates.append(
         Event.create(
             seq=state.last_seq + 1,
             session_id=state.session_id,
             event_type="tool_reconciled",
-            payload={
-                "call_key": target.call_key,
-                "call_id": target.provider_call_id,
-                "outcome": outcome,
-                "note": note,
-            },
+            payload=reconciliation_payload,
         )
     )
 

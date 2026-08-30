@@ -6,12 +6,12 @@ import hashlib
 import json
 import uuid
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
-from .code_graph import CodeRunStatus, graph_summary
+from .code_graph import CodeNodeStatus, CodeRunStatus, graph_summary
 from .code_runtime import CodeRuntime, CodeRuntimeConfig
 from .code_scheduler import CodeDagScheduler
-from .domain import SessionReducer, SessionState, ToolCall
+from .domain import SessionReducer, SessionState, ToolCall, ToolStatus
 from .executor import AcceptedToolCall, ToolExecutor
 from .store import RolloutStore
 from .tools.registry import ToolResult
@@ -84,19 +84,39 @@ class CodeModeRunner:
             max_nodes=self.max_nodes,
             cancellation_event=cancellation_event,
         )
-        runtime_result = self.runtime.run(
-            code,
-            execute_graph=scheduler.execute_graph,
-            cancellation_event=cancellation_event,
-        )
-        summary = graph_summary(self.state, run_id)
-        failed = any(
-            summary.get(key, 0)
-            for key in (
-                "failed", "denied", "invalid_arguments", "unknown_tool",
-                "conflict", "timed_out", "interrupted",
-                "upstream_failed", "outcome_unknown", "abandoned",
+        try:
+            runtime_result = self.runtime.run(
+                code,
+                execute_graph=scheduler.execute_graph,
+                cancellation_event=cancellation_event,
+                max_tool_nodes=self.max_nodes,
             )
+        except KeyboardInterrupt:
+            cancellation_event.set()
+            self._synchronize_state_from_store()
+            self._close_aborted_run(
+                run_id,
+                run_status=CodeRunStatus.INTERRUPTED,
+                message="code runtime interrupted",
+            )
+            raise
+        except Exception:
+            cancellation_event.set()
+            self._synchronize_state_from_store()
+            self._close_aborted_run(
+                run_id,
+                run_status=CodeRunStatus.FAILED,
+                message="code runtime failed before completion",
+            )
+            raise
+        summary = graph_summary(self.state, run_id)
+        successful_nodes = {
+            CodeNodeStatus.SUCCEEDED,
+            CodeNodeStatus.USER_CONFIRMED_SUCCESS,
+        }
+        failed = any(
+            self.state.code_nodes[node_id].status not in successful_nodes
+            for node_id in self.state.code_runs[run_id].node_ids
         )
         status = CodeRunStatus.FAILED if runtime_result.error or failed else CodeRunStatus.SUCCEEDED
         payload = {
@@ -124,6 +144,46 @@ class CodeModeRunner:
             output=rendered,
             status=("failed" if status is CodeRunStatus.FAILED else "succeeded"),
         )
+
+    def _close_aborted_run(
+        self, run_id: str, *, run_status: CodeRunStatus, message: str
+    ) -> None:
+        run = self.state.code_runs[run_id]
+        for node_id in run.node_ids:
+            call = self.state.tool_calls[node_id]
+            if call.is_terminal:
+                continue
+            if call.status is ToolStatus.STARTED:
+                self.executor.finish_unstarted(
+                    call,
+                    ToolStatus.OUTCOME_UNKNOWN,
+                    "code node was interrupted after execution began",
+                    extra={"recovery_blocked": True},
+                )
+            else:
+                self.executor.finish_unstarted(
+                    call,
+                    ToolStatus.NOT_EXECUTED,
+                    "code node was not started before interruption",
+                )
+        self._append(
+            "code_run_finished",
+            {
+                "run_id": run_id,
+                "status": run_status.value,
+                "result": message,
+                "summary": graph_summary(self.state, run_id),
+            },
+        )
+
+    def _synchronize_state_from_store(self) -> None:
+        synchronized = SessionReducer.replay(self.store.load())
+        for state_field in fields(SessionState):
+            setattr(
+                self.state,
+                state_field.name,
+                getattr(synchronized, state_field.name),
+            )
 
     def _append(self, event_type: str, payload: dict[str, object]) -> None:
         event = self.store.append(event_type, payload)

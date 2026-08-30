@@ -37,12 +37,14 @@ def render_python_sdk(registry: ToolRegistry) -> str:
         "instead of treating the whole object as text. End with an explicit",
         "return of a JSON-compatible value. A final bare expression is discarded.",
         "Imports and json.dumps/json.dump are unavailable and unnecessary.",
+        "read_file output is line-numbered for display. For edit_file, use a",
+        "known unique source substring as old_text; do not submit line prefixes.",
         "",
         "JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]",
         'ToolResult = {"status": str, "output": str, "exit_code": int | None, "truncated": bool, "metadata": dict[str, JsonValue]}',
         "",
         "class ToolNode:",
-        "    id: str",
+        "    node_id: str",
         "    def after(self, *dependencies: ToolNode) -> ToolNode: ...",
         "    def __await__(self): ...",
         "",
@@ -63,7 +65,7 @@ def render_python_sdk(registry: ToolRegistry) -> str:
         lines.extend(
             [
                 f"    # {function['description']}",
-                f"    def {name}(self, args: dict[str, JsonValue], *, after: list[ToolNode] | None = None) -> ToolNode: ...  # {fields}",
+                f"    def {name}(self, args: dict[str, JsonValue], *, after: list[ToolNode] = []) -> ToolNode: ...  # {fields}",
             ]
         )
     lines.extend(

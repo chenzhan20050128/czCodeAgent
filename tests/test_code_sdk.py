@@ -22,7 +22,10 @@ class CodeSdkTests(unittest.TestCase):
             self.assertIn(f"def {name}(", text)
         self.assertNotIn("def exit_plan_mode(", text)
         self.assertNotIn("def run_code(", text)
-        self.assertIn("after: list[ToolNode] | None", text)
+        self.assertIn("node_id: str", text)
+        self.assertNotIn("    id: str", text)
+        self.assertIn("after: list[ToolNode] = []", text)
+        self.assertNotIn("after: list[ToolNode] | None", text)
         self.assertIn("await gather", text)
         self.assertIn("UPSTREAM_FAILED", text)
         self.assertIn('ToolResult = {"status": str, "output": str', text)
@@ -30,6 +33,7 @@ class CodeSdkTests(unittest.TestCase):
         self.assertIn("return {", text)
         self.assertIn("Imports and json.dumps/json.dump are unavailable", text)
         self.assertIn("A final bare expression is discarded", text)
+        self.assertIn("read_file output is line-numbered", text)
 
     def test_run_code_description_contains_the_generated_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

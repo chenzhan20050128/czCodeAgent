@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
 import json
 import os
 import sys
@@ -28,7 +29,7 @@ from mca.code_ast import (
     ensure_json_value,
     validate_code,
 )
-from mca.code_protocol import decode_frame, encode_frame
+from mca.code_protocol import DEFAULT_MAX_FRAME_BYTES, decode_frame, encode_frame
 
 
 class _ReturnStream:
@@ -48,6 +49,10 @@ class _ReturnStream:
 
 class OutputLimitError(RuntimeError):
     """The program attempted to return or log too many UTF-8 bytes."""
+
+
+class NodeLimitError(RuntimeError):
+    """The program attempted to create too many lazy tool nodes."""
 
 
 @dataclass
@@ -95,14 +100,20 @@ class _Tools:
 
 
 class _GraphClient:
-    def __init__(self, names: tuple[str, ...]) -> None:
+    def __init__(
+        self, names: tuple[str, ...], max_frame_bytes: int, max_nodes: int
+    ) -> None:
         self.names = names
+        self.max_frame_bytes = max_frame_bytes
+        self.max_nodes = max_nodes
         self.nodes: dict[str, ToolNode] = {}
         self.next_ordinal = 1
 
     def create(
         self, name: str, arguments: dict[str, Any], after: list[ToolNode] | tuple[ToolNode, ...]
     ) -> ToolNode:
+        if len(self.nodes) > self.max_nodes:
+            raise NodeLimitError("tool node limit exceeded")
         if not isinstance(arguments, dict):
             raise TypeError("tool arguments must be an object")
         ensure_json_value(arguments)
@@ -139,8 +150,8 @@ class _GraphClient:
                     for node in pending
                 ],
             }
-            _send(request)
-            response = _read()
+            _send(request, max_bytes=self.max_frame_bytes)
+            response = _read(max_bytes=self.max_frame_bytes)
             if response.get("type") != "graph_result":
                 raise RuntimeError("invalid graph result frame")
             results = response.get("results")
@@ -197,16 +208,18 @@ class _GraphClient:
         raise error_type(node.name, node.node_id, error)
 
 
-def _send(value: dict[str, Any]) -> None:
-    sys.stdout.buffer.write(encode_frame(value))
+def _send(
+    value: dict[str, Any], *, max_bytes: int = DEFAULT_MAX_FRAME_BYTES
+) -> None:
+    sys.stdout.buffer.write(encode_frame(value, max_bytes=max_bytes))
     sys.stdout.buffer.flush()
 
 
-def _read() -> dict[str, Any]:
-    raw = sys.stdin.buffer.readline(1024 * 1024 + 1)
+def _read(*, max_bytes: int = DEFAULT_MAX_FRAME_BYTES) -> dict[str, Any]:
+    raw = sys.stdin.buffer.readline(max_bytes + 1)
     if not raw:
         raise EOFError("parent closed protocol")
-    return decode_frame(raw)
+    return decode_frame(raw, max_bytes=max_bytes)
 
 
 async def _main(request: dict[str, Any]) -> dict[str, Any]:
@@ -218,10 +231,16 @@ async def _main(request: dict[str, Any]) -> dict[str, Any]:
         raise CodeValidationError("invalid initial request")
     _apply_resource_limits(request)
     validated = validate_code(source, max_nodes=int(request["max_ast_nodes"]))
-    client = _GraphClient(tuple(tools))
     max_output_bytes = request.get("max_output_bytes")
     if type(max_output_bytes) is not int or max_output_bytes < 1:
         raise CodeValidationError("max_output_bytes must be a positive integer")
+    max_frame_bytes = request.get("max_frame_bytes")
+    if type(max_frame_bytes) is not int or max_frame_bytes < 1:
+        raise CodeValidationError("max_frame_bytes must be a positive integer")
+    max_tool_nodes = request.get("max_tool_nodes")
+    if type(max_tool_nodes) is not int or max_tool_nodes < 1:
+        raise CodeValidationError("max_tool_nodes must be a positive integer")
+    client = _GraphClient(tuple(tools), max_frame_bytes, max_tool_nodes)
     output = _ReturnStream(max_output_bytes)
 
     async def gather(*nodes: ToolNode) -> list[Any]:
@@ -256,6 +275,10 @@ async def _main(request: dict[str, Any]) -> dict[str, Any]:
         max_steps=int(request["max_eval_steps"]),
         max_collection_items=int(request["max_collection_items"]),
     ).run(validated))
+    if len(client.nodes) > client.max_nodes and any(
+        not node.submitted for node in client.nodes.values()
+    ):
+        raise NodeLimitError("tool node limit exceeded")
     encoded_value = json.dumps(
         value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
     ).encode("utf-8")
@@ -300,9 +323,22 @@ def _tighten_limit(limits: Any, kind: int, requested: int) -> None:
     limits.setrlimit(kind, (soft, current_hard))
 
 
-def main() -> int:
+def _bootstrap_frame_limit(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--max-frame-bytes", type=int, default=DEFAULT_MAX_FRAME_BYTES)
+    arguments = parser.parse_args(argv)
+    if arguments.max_frame_bytes < 1:
+        parser.error("--max-frame-bytes must be positive")
+    return arguments.max_frame_bytes
+
+
+def main(argv: list[str] | None = None) -> int:
+    max_frame_bytes = _bootstrap_frame_limit(argv)
     try:
-        request = _read()
+        request = _read(max_bytes=max_frame_bytes)
+        configured_frame_bytes = request.get("max_frame_bytes")
+        if type(configured_frame_bytes) is int and configured_frame_bytes > 0:
+            max_frame_bytes = configured_frame_bytes
         result = asyncio.run(_main(request))
     except EvaluationLimitError as error:
         result = {"type": "done", "error": {"code": "EVAL_STEP_LIMIT", "message": str(error)}, "logs": []}
@@ -310,11 +346,13 @@ def main() -> int:
         result = {"type": "done", "error": {"code": "COLLECTION_LIMIT", "message": str(error)}, "logs": []}
     except OutputLimitError as error:
         result = {"type": "done", "error": {"code": "OUTPUT_LIMIT", "message": str(error)}, "logs": []}
+    except NodeLimitError as error:
+        result = {"type": "done", "error": {"code": "NODE_LIMIT", "message": str(error)}, "logs": []}
     except CodeValidationError as error:
         result = {"type": "done", "error": {"code": "INVALID_CODE", "message": str(error)}, "logs": []}
     except BaseException as error:
         result = {"type": "done", "error": {"code": "CODE_EXCEPTION", "message": f"{type(error).__name__}: {error}"}, "logs": []}
-    _send(result)
+    _send(result, max_bytes=max_frame_bytes)
     return 0
 
 

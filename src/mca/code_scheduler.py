@@ -12,6 +12,7 @@ from typing import Any
 from .code_graph import CodeNodeStatus
 from .domain import Event, SessionReducer, SessionState, ToolCall, ToolStatus
 from .executor import AcceptedToolCall, PreparedStagedCall, ToolExecutor
+from .tools.filesystem import PreparedFileChange
 from .store import RolloutStore
 from .tools.registry import ToolResult
 
@@ -66,6 +67,7 @@ class CodeDagScheduler:
         normalized = self._normalize_nodes(nodes)
         ordered = self._topological(normalized)
         self._validate_batch(ordered)
+        self._validate_targets(targets, normalized)
         for node in ordered:
             self._plan(node)
         target_ids = [self._durable_id(value) for value in targets]
@@ -132,6 +134,16 @@ class CodeDagScheduler:
                 raise ValueError(
                     f"tool {node['name']!r} is not available in Code Mode"
                 )
+
+    def _validate_targets(
+        self, targets: list[object], nodes: dict[str, dict[str, Any]]
+    ) -> None:
+        if any(
+            not isinstance(target, str)
+            or (target not in nodes and target not in self.local_to_durable)
+            for target in targets
+        ):
+            raise ValueError("UNKNOWN_NODE_REFERENCE")
 
     def _topological(
         self, nodes: dict[str, dict[str, Any]]
@@ -285,6 +297,40 @@ class CodeDagScheduler:
             staged.append(_PreparedNode(self._local_id(node.node_id), node.node_id, prepared))
         if not staged:
             return
+        while staged:
+            if self.cancellation_event.is_set():
+                for item in staged:
+                    self.executor.finish_unstarted(
+                        self.state.tool_calls[item.durable_id],
+                        ToolStatus.NOT_EXECUTED,
+                        "node was not started because the code run was cancelled",
+                    )
+                return
+            wave, staged = self._next_execution_wave(staged)
+            self._execute_staged_wave(wave)
+
+    def _next_execution_wave(
+        self, staged: list[_PreparedNode]
+    ) -> tuple[list[_PreparedNode], list[_PreparedNode]]:
+        wave: list[_PreparedNode] = []
+        deferred: list[_PreparedNode] = []
+        mutation_paths: set[str] = set()
+        for item in staged:
+            prepared = item.staged.prepared
+            path = (
+                str(prepared.canonical_path)
+                if isinstance(prepared, PreparedFileChange)
+                else None
+            )
+            if path is not None and path in mutation_paths:
+                deferred.append(item)
+                continue
+            if path is not None:
+                mutation_paths.add(path)
+            wave.append(item)
+        return wave, deferred
+
+    def _execute_staged_wave(self, staged: list[_PreparedNode]) -> None:
         with ThreadPoolExecutor(
             max_workers=min(self.max_parallel, len(staged)),
             thread_name_prefix="mca-code-node",
@@ -299,6 +345,18 @@ class CodeDagScheduler:
                     item = staged[next_to_start]
                     self.executor.start_staged(item.staged)
                     if self.cancellation_event.is_set():
+                        self.executor.commit_staged(
+                            item.staged,
+                            ToolResult.bounded(
+                                title=f"{item.staged.call.name} cancelled",
+                                output=(
+                                    "tool body was not dispatched because the "
+                                    "code run was cancelled"
+                                ),
+                                status=ToolStatus.CANCELLED.value,
+                            ),
+                        )
+                        next_to_start += 1
                         break
                     future = pool.submit(
                         self.executor.dispatch_staged_with_cancel,
@@ -309,11 +367,19 @@ class CodeDagScheduler:
                     next_to_start += 1
                 if not in_flight:
                     break
-                done, _ = wait(
-                    tuple(in_flight),
-                    timeout=0.05,
-                    return_when=FIRST_COMPLETED,
-                )
+                try:
+                    done, _ = wait(
+                        tuple(in_flight),
+                        timeout=0.05,
+                        return_when=FIRST_COMPLETED,
+                    )
+                except KeyboardInterrupt:
+                    self.cancellation_event.set()
+                    wait(tuple(in_flight))
+                    for future, item in tuple(in_flight.items()):
+                        in_flight.pop(future)
+                        self.executor.commit_staged(item.staged, future.result())
+                    raise
                 if not done:
                     continue
                 for future in done:

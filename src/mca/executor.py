@@ -371,6 +371,8 @@ class ToolExecutor:
                 else:
                     raw_result = prepared.execute()  # type: ignore[attr-defined]
             result = self._normalize_result(call.name, raw_result)
+        except ToolExecutorError:
+            raise
         except (FileConflictError, PathSafetyError) as error:
             # A side-effecting prepared write that fails path/hash revalidation at
             # commit time is a genuine time-of-check/time-of-use conflict. A

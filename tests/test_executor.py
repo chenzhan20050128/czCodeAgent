@@ -106,6 +106,23 @@ class ExecutorTestCase(unittest.TestCase):
 
 
 class ToolExecutorTests(ExecutorTestCase):
+    def test_nested_executor_invariant_failure_is_never_downgraded(self) -> None:
+        from mca.code_mode import CodeModeRunner
+
+        arguments = json.dumps({"description": "fail stop", "code": "return 1"})
+        call = self.accept("run_code", arguments)
+        executor = self.executor()
+
+        with patch.object(
+            CodeModeRunner,
+            "run",
+            side_effect=ToolExecutorError("durable state diverged"),
+        ):
+            with self.assertRaisesRegex(ToolExecutorError, "durable state diverged"):
+                executor.execute(call)
+
+        self.assertIs(self.state.tool_calls[call.call_key].status, ToolStatus.STARTED)
+
     def test_staged_write_keeps_control_plane_order_and_worker_body_pure(self) -> None:
         path = self.workspace / "staged.txt"
         path.write_text("before", encoding="utf-8")

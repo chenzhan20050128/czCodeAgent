@@ -1087,6 +1087,53 @@ class SessionReducer:
         note = event.payload.get("note", "")
         if not isinstance(note, str):
             raise DomainError("reconciliation note must be a string")
+        snapshot_update: tuple[tuple[str, str], FileSnapshot] | None = None
+        raw_after_version = event.payload.get("after_version")
+        mutation_plan = state.file_mutation_plans.get(call.call_key)
+        if (
+            raw_outcome in {"succeeded", "user_confirmed_success"}
+            and mutation_plan is not None
+            and raw_after_version is None
+        ):
+            raise DomainError(
+                "successful file reconciliation requires an observed file version"
+            )
+        if raw_after_version is not None:
+            if raw_outcome not in {"succeeded", "user_confirmed_success"}:
+                raise DomainError(
+                    "reconciled file version requires a successful outcome"
+                )
+            plan = mutation_plan
+            if plan is None:
+                raise DomainError("reconciled file version requires a mutation plan")
+            path = _payload_string(event.payload, "path")
+            after_hash = _payload_string(event.payload, "after_hash")
+            after_mode = event.payload.get("after_mode")
+            try:
+                after_version = FileVersion.from_dict(raw_after_version)
+            except ValueError as error:
+                raise DomainError(f"invalid after_version: {error}") from error
+            if (
+                path != plan.path
+                or after_hash != plan.proposed_hash
+                or not after_version.exists
+                or after_version.sha256 != after_hash
+                or after_version.mode != after_mode
+            ):
+                raise DomainError("reconciled file version does not match mutation plan")
+            key = (call.turn_id, path)
+            snapshot = state.file_snapshots.get(key)
+            if snapshot is None:
+                raise DomainError("reconciled write has no file baseline")
+            snapshot_update = (
+                key,
+                replace(
+                    snapshot,
+                    after_hash=after_hash,
+                    after_mode=after_mode,
+                    after_version=after_version,
+                ),
+            )
         state.tool_calls[call.call_key] = replace(
             call,
             status=statuses[raw_outcome],
@@ -1094,6 +1141,8 @@ class SessionReducer:
             reconciliation_note=note,
             finished_seq=event.seq,
         )
+        if snapshot_update is not None:
+            state.file_snapshots[snapshot_update[0]] = snapshot_update[1]
         if call.origin == "code":
             node = state.code_nodes[call.call_key]
             state.code_nodes[call.call_key] = replace(

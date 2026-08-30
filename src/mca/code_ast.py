@@ -216,7 +216,11 @@ class Evaluator:
                     if handler.type is None:
                         matched = True
                     elif isinstance(handler.type, ast.Name):
-                        matched = handler.type.id == type(error).__name__
+                        exception_type = self.environment.get(handler.type.id)
+                        matched = (
+                            exception_type in {ToolCallError, GraphExecutionError}
+                            and isinstance(error, exception_type)
+                        )
                     else:
                         matched = False
                     if matched:
@@ -254,6 +258,7 @@ class Evaluator:
             container = self._sync_expr(target.value)
             key = self._sync_expr(target.slice)
             container[key] = value
+            self._bounded_collection(container)
             return
         raise CodeValidationError("unsupported assignment target")
 
@@ -266,7 +271,7 @@ class Evaluator:
             function = await self._expr(node.func)
             args = [await self._expr(arg) for arg in node.args]
             kwargs = {item.arg: await self._expr(item.value) for item in node.keywords if item.arg}
-            return function(*args, **kwargs)
+            return self._invoke_bounded(function, args, kwargs)
         if isinstance(node, ast.ListComp):
             return await self._list_comp(node)
         if isinstance(node, ast.DictComp):
@@ -296,7 +301,7 @@ class Evaluator:
                 for item in node.keywords
                 if item.arg is not None
             }
-            return function(*args, **kwargs)
+            return self._invoke_bounded(function, args, kwargs)
         if isinstance(node, ast.Constant):
             return node.value
         if isinstance(node, ast.Name):
@@ -337,7 +342,13 @@ class Evaluator:
             operation = operations.get(type(node.op))
             if operation is None:
                 raise CodeValidationError("unsupported binary operator")
-            return operation(self._sync_expr(node.left), self._sync_expr(node.right))
+            left = self._sync_expr(node.left)
+            right = self._sync_expr(node.right)
+            if isinstance(node.op, ast.Mult):
+                self._reject_oversized_repetition(left, right)
+            return self._bounded_collection(
+                operation(left, right)
+            )
         if isinstance(node, ast.UnaryOp):
             value = self._sync_expr(node.operand)
             if isinstance(node.op, ast.Not): return not value
@@ -364,6 +375,33 @@ class Evaluator:
                     parts.append(str(self._sync_expr(item.value)))
             return "".join(parts)
         raise CodeValidationError(f"unsupported expression: {type(node).__name__}")
+
+    def _bounded_collection(self, value: Any) -> Any:
+        if (
+            type(value) in {str, list, tuple, dict, range}
+            and len(value) > self.max_collection_items
+        ):
+            raise CollectionLimitError("collection item limit exceeded")
+        return value
+
+    def _invoke_bounded(
+        self, function: Any, args: list[Any], kwargs: dict[str, Any]
+    ) -> Any:
+        result = function(*args, **kwargs)
+        receiver = getattr(function, "__self__", None)
+        if type(receiver) in {list, dict}:
+            self._bounded_collection(receiver)
+        return self._bounded_collection(result)
+
+    def _reject_oversized_repetition(self, left: Any, right: Any) -> None:
+        sequence: Any = None
+        multiplier: Any = None
+        if type(left) in {str, list, tuple} and type(right) is int:
+            sequence, multiplier = left, right
+        elif type(right) in {str, list, tuple} and type(left) is int:
+            sequence, multiplier = right, left
+        if sequence is not None and len(sequence) * max(0, multiplier) > self.max_collection_items:
+            raise CollectionLimitError("collection item limit exceeded")
 
     async def _list_comp(self, node: ast.ListComp) -> list[Any]:
         return await self._comprehension(node.generators, node.elt)
