@@ -102,4 +102,3 @@ Non-TTY output emits stable `[code-dag]` lines. `mca --show` reconstructs a comp
 ## Verification requirements
 
 Tests cover AST rejection, JSONL framing, runtime budgets, dynamic planning, cycle rejection, gather ordering, dependency propagation, unrelated-branch continuation, all six nested tools, ordered approvals, Plan Mode denial, session always/yolo behavior, same-file stale conflicts, different-file overlap, shared-directory creation, parallel shell cleanup, every crash boundary, nested reconciliation, undo, colored TTY rendering, plain output, cold replay, full regression, and one real-provider end-to-end task.
-
