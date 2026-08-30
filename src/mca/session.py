@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -16,6 +17,7 @@ from .domain import (
     plan_recovery_events,
     reduce_event,
 )
+from .code_graph import CodeRunStatus, graph_summary
 from .store import RolloutStore
 
 
@@ -210,6 +212,8 @@ def _recover_open_calls(store: RolloutStore, state: SessionState) -> None:
         )
         return
 
+    _recover_code_runs(store, state)
+
     has_requested = any(
         call.status is ToolStatus.REQUESTED for call in state.tool_calls.values()
     )
@@ -240,6 +244,81 @@ def _recover_open_calls(store: RolloutStore, state: SessionState) -> None:
     candidates = plan_recovery_events(state)
     if candidates:
         _append_candidates(store, state, candidates, error_type=ResumeError)
+
+
+def _recover_code_runs(store: RolloutStore, state: SessionState) -> None:
+    """Close interrupted orchestration shells without replaying Python."""
+
+    for run_id, run in tuple(state.code_runs.items()):
+        parent = state.tool_calls.get(run.parent_call_key)
+        if parent is None or parent.is_terminal:
+            continue
+        if run.status is CodeRunStatus.ACTIVE:
+            candidates: list[Event] = []
+            next_seq = state.last_seq + 1
+            for node_id in run.node_ids:
+                call = state.tool_calls[node_id]
+                if call.status is ToolStatus.STARTED:
+                    status = ToolStatus.OUTCOME_UNKNOWN
+                    result = "code node began but no terminal result was recorded"
+                    blocked = True
+                elif call.status is ToolStatus.REQUESTED:
+                    status = ToolStatus.NOT_EXECUTED
+                    result = "code node was not started before recovery"
+                    blocked = False
+                else:
+                    continue
+                candidates.append(
+                    Event.create(
+                        seq=next_seq,
+                        session_id=store.session_id,
+                        event_type="tool_finished",
+                        payload={
+                            "call_key": node_id,
+                            "call_id": node_id,
+                            "origin": "code",
+                            "status": status.value,
+                            "result": result,
+                            "recovery_blocked": blocked,
+                        },
+                    )
+                )
+                next_seq += 1
+            if candidates:
+                _append_candidates(store, state, candidates, error_type=ResumeError)
+            finish_run = Event.create(
+                seq=state.last_seq + 1,
+                session_id=store.session_id,
+                event_type="code_run_finished",
+                payload={
+                    "run_id": run_id,
+                    "status": CodeRunStatus.FAILED.value,
+                    "result": "code runtime was interrupted and was not replayed",
+                    "summary": graph_summary(state, run_id),
+                },
+            )
+            _append_candidates(store, state, [finish_run], error_type=ResumeError)
+        parent = state.tool_calls[run.parent_call_key]
+        if parent.status is ToolStatus.STARTED:
+            finish_parent = Event.create(
+                seq=state.last_seq + 1,
+                session_id=store.session_id,
+                event_type="tool_finished",
+                payload={
+                    "call_key": parent.call_key,
+                    "call_id": parent.provider_call_id,
+                    "status": ToolStatus.FAILED.value,
+                    "result": json.dumps(
+                        {
+                            "error": "code runtime was interrupted and was not replayed",
+                            "execution_summary": graph_summary(state, run_id),
+                        },
+                        sort_keys=True,
+                    ),
+                    "truncated": False,
+                },
+            )
+            _append_candidates(store, state, [finish_parent], error_type=ResumeError)
 
 
 def resume_session(

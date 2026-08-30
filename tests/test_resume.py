@@ -22,6 +22,7 @@ from mca.domain import (
     ToolStatus,
     TurnStatus,
 )
+from mca.code_graph import CodeRunStatus
 from mca.projection import (
     ProjectionBlockedError,
     ProjectionEnvironment,
@@ -153,6 +154,42 @@ class ResumeTestCase(unittest.TestCase):
 
 
 class SessionResumeTests(ResumeTestCase):
+    def test_interrupted_code_run_closes_outer_and_recovers_nested_nodes(self) -> None:
+        self.start_turn(("outer",))
+        outer_event = self.store.load()[-1]
+        # Replace the generic helper's bash name with a run_code request in a
+        # fresh fixture so the recovery path owns the outer orchestration call.
+        self.store.close()
+        root = self.root / "code-recovery"
+        workspace = (root / "work").resolve()
+        workspace.mkdir(parents=True)
+        sessions = root / "sessions"
+        session_id = str(uuid.uuid4())
+        turn_id = str(uuid.uuid4())
+        run_id = str(uuid.uuid4())
+        with RolloutStore.create(sessions, session_id) as store:
+            store.append("session_created", {"cwd": str(workspace), "model": "m", "context_window": 4096})
+            store.append("turn_started", {"turn_id": turn_id, "user_input": "run"})
+            store.append("assistant_accepted", {"content": None, "tool_calls": [{"id": "outer", "type": "function", "function": {"name": "run_code", "arguments": "{}"}}]})
+            store.append("tool_started", {"call_key": "3:outer", "call_id": "outer"})
+            store.append("code_run_started", {"run_id": run_id, "turn_id": turn_id, "parent_call_key": "3:outer", "description": "work", "source_hash": "sha256:x"})
+            first = f"{run_id}:node:1"
+            second = f"{run_id}:node:2"
+            for ordinal, node_id in enumerate((first, second), 1):
+                store.append("code_node_planned", {"run_id": run_id, "node_id": node_id, "ordinal": ordinal, "name": "write_file", "arguments": "{}", "dependencies": []})
+            store.append("tool_started", {"call_key": first, "call_id": first, "origin": "code"})
+
+        with resume_session(sessions, session_id, workspace) as resumed:
+            self.assertIs(resumed.state.tool_calls[first].status, ToolStatus.OUTCOME_UNKNOWN)
+            self.assertIs(resumed.state.tool_calls[second].status, ToolStatus.NOT_EXECUTED)
+            self.assertIs(resumed.state.tool_calls["3:outer"].status, ToolStatus.FAILED)
+            self.assertIs(resumed.state.code_runs[run_id].status, CodeRunStatus.FAILED)
+            self.assertTrue(resumed.state.recovery_blocked)
+            self.assertEqual(
+                [event.type for event in resumed.store.load()[-4:]],
+                ["tool_finished", "tool_finished", "code_run_finished", "tool_finished"],
+            )
+
     def test_completed_session_replays_without_appending_recovery_events(self) -> None:
         self.start_turn()
         self.append(

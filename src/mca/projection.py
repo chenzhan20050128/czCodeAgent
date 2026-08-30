@@ -322,12 +322,16 @@ def _project_event(
         call_tracker.add_assistant_calls(event, message.get("tool_calls", ()))
         return message
     if event.type == "tool_finished":
+        if event.payload.get("origin") == "code":
+            return None
         occurrence = call_tracker.resolve(event)
         message = _tool_result_message(event, occurrence)
         if message is not None:
             call_tracker.close(occurrence)
         return message
     if event.type == "tool_reconciled":
+        if event.payload.get("origin") == "code":
+            return None
         occurrence = call_tracker.resolve(event)
         message = _reconciled_result_message(event, occurrence)
         call_tracker.close(occurrence)
