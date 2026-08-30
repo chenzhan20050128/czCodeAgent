@@ -10,6 +10,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -137,6 +138,33 @@ class ConsoleFormattingTests(unittest.TestCase):
         planned = apply("code_node_planned", {"run_id": run_id, "node_id": node_id, "ordinal": 1, "name": "write_file", "arguments": json.dumps({"path": path, "content": "x"}), "dependencies": []})
         return state, apply, started, planned, node_id
 
+    def _diamond_code_events(self):
+        state, apply, started, _, first_id = self._code_events(
+            description="inspect, update, and verify", path="src/a.py"
+        )
+        run_id = first_id.split(":node:", 1)[0]
+        second_id = f"{run_id}:node:2"
+        third_id = f"{run_id}:node:3"
+        fourth_id = f"{run_id}:node:4"
+        second = apply("code_node_planned", {
+            "run_id": run_id, "node_id": second_id, "ordinal": 2,
+            "name": "grep",
+            "arguments": json.dumps({"pattern": "TODO", "path": "src"}),
+            "dependencies": [],
+        })
+        third = apply("code_node_planned", {
+            "run_id": run_id, "node_id": third_id, "ordinal": 3,
+            "name": "edit_file",
+            "arguments": json.dumps({"path": "src/a.py", "old_text": "x", "new_text": "y"}),
+            "dependencies": [first_id, second_id],
+        })
+        fourth = apply("code_node_planned", {
+            "run_id": run_id, "node_id": fourth_id, "ordinal": 4,
+            "name": "bash", "arguments": json.dumps({"command": "python3 -m unittest"}),
+            "dependencies": [third_id],
+        })
+        return state, apply, started, (second, third, fourth), third_id
+
     def test_reasoning_is_shown_without_verbose_mode(self) -> None:
         captured = io.StringIO()
         console = cli._Console(verbose=False, color=False)
@@ -145,6 +173,19 @@ class ConsoleFormattingTests(unittest.TestCase):
             console.reasoning("inspect\nrepository")
 
         self.assertEqual(captured.getvalue(), "[thinking] inspect\nrepository")
+
+    def test_default_reasoning_uses_the_muted_terminal_color(self) -> None:
+        captured = io.StringIO()
+        console = cli._Console(verbose=False, color=True)
+
+        with contextlib.redirect_stdout(captured):
+            console.reasoning("checking")
+
+        self.assertEqual(
+            captured.getvalue(),
+            console.theme.style("[thinking] ", "muted")
+            + console.theme.style("checking", "muted"),
+        )
 
     def test_verbose_reasoning_preserves_lines_and_separates_tool_calls(self) -> None:
         captured = io.StringIO()
@@ -222,6 +263,26 @@ class ConsoleFormattingTests(unittest.TestCase):
         self.assertIn("run_code: update service", output)
         self.assertIn("CURRENT", output)
         self.assertLess(output.rfind("[approval]"), output.rfind("CURRENT"))
+
+    def test_tty_redraws_a_connected_diamond_below_approval(self) -> None:
+        state, _, started, planned, _ = self._diamond_code_events()
+        captured = io.StringIO()
+        console = cli._Console(verbose=False, color=True)
+
+        with patch.object(cli.shutil, "get_terminal_size", return_value=os.terminal_size((100, 30))):
+            with contextlib.redirect_stdout(captured):
+                console.code_event(started, state)
+                for event in planned:
+                    console.code_event(event, state)
+                console.approval("Tool: edit_file\nAllow?")
+                console.code_event(planned[-1], state)
+
+        output = re.sub(r"\x1b\[[0-9;]*m", "", captured.getvalue())
+        final_graph = output[output.rfind("[approval]"):]
+        self.assertIn("DAG · left to right", final_graph)
+        self.assertIn("▶ [○ #3", final_graph)
+        self.assertTrue(any(character in final_graph for character in "├┤┬┴┼"))
+        self.assertNotRegex(final_graph, r"(?m)^│  #\d+ ──▶ #\d+$")
 
     def test_non_tty_code_graph_emits_stable_state_lines(self) -> None:
         state, apply, started, planned, node_id = self._code_events()
@@ -455,7 +516,8 @@ class CliRunTests(unittest.TestCase):
         self.assertEqual(shown, 0)
         output = captured.getvalue()
         self.assertIn("run_code: inspect seed SUCCEEDED", output)
-        self.assertIn("#1 ──▶ #2", output)
+        self.assertRegex(output, r"\[✓ #1 [^]]+\]─+▶ \[✓ #2 [^]]+\]")
+        self.assertNotRegex(output, r"(?m)^│  #\d+ ──▶ #\d+$")
 
     def test_live_non_tty_run_code_reports_each_dag_transition(self) -> None:
         arguments = json.dumps(
