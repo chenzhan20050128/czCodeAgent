@@ -137,14 +137,14 @@ class ConsoleFormattingTests(unittest.TestCase):
         planned = apply("code_node_planned", {"run_id": run_id, "node_id": node_id, "ordinal": 1, "name": "write_file", "arguments": json.dumps({"path": path, "content": "x"}), "dependencies": []})
         return state, apply, started, planned, node_id
 
-    def test_reasoning_is_hidden_without_verbose_mode(self) -> None:
+    def test_reasoning_is_shown_without_verbose_mode(self) -> None:
         captured = io.StringIO()
         console = cli._Console(verbose=False, color=False)
 
         with contextlib.redirect_stdout(captured):
             console.reasoning("inspect\nrepository")
 
-        self.assertEqual(captured.getvalue(), "")
+        self.assertEqual(captured.getvalue(), "[thinking] inspect\nrepository")
 
     def test_verbose_reasoning_preserves_lines_and_separates_tool_calls(self) -> None:
         captured = io.StringIO()
