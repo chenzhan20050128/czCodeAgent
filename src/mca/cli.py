@@ -174,7 +174,7 @@ class _Console:
     def reasoning(self, delta: str) -> None:
         """Show only provider-supplied reasoning deltas in a muted stream."""
 
-        if not self.verbose or not delta:
+        if not delta:
             return
         if not self._reasoning_streaming:
             self._start_live_block()

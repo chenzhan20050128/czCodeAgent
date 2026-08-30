@@ -1,12 +1,14 @@
 # CLI Output Formatting Design
 
+> Superseded for reasoning visibility by `2026-08-30-responsive-code-dag-cli-design.md`: provider reasoning is now shown by default.
+
 ## Goal
 
 Make live MCA output readable without changing the agent loop, persisted events, or non-interactive transcript format.
 
 ## Behavior
 
-- Provider reasoning is displayed only with `--verbose`.
+- Provider reasoning is displayed by default; `--verbose` controls additional turn diagnostics.
 - Displayed reasoning preserves line breaks while terminal control characters remain escaped.
 - Transitions between reasoning, tool calls, approvals, and assistant output have one blank separator line.
 - Accepted assistant text that was already streamed is not printed again by the final turn report.

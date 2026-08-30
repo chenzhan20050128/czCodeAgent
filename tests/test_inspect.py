@@ -193,8 +193,8 @@ class RenderTranscriptTests(InspectTestCase):
         text = render_transcript(self.state)
 
         self.assertIn("run_code: inspect and test FAILED", text)
-        self.assertIn("#1 ✓ SUCCEEDED  read_file", text)
-        self.assertIn("#2 ✗ FAILED  APPROVED  bash", text)
+        self.assertIn("[✓ #1 read_file(src/a.py)]", text)
+        self.assertIn("[✗ #2 bash(python3 -m unittest)]", text)
         self.assertNotIn("#1 ──▶ #2", text)
         self.assertNotIn("nested read output", text)
 
@@ -206,7 +206,8 @@ class RenderTranscriptTests(InspectTestCase):
         cold = render_transcript(replayed, expanded_graph=True)
 
         self.assertEqual(cold, live)
-        self.assertIn("#1 ──▶ #2", cold)
+        self.assertRegex(cold, r"\[✓ #1 [^]]+\]─+▶ \[✗ #2 [^]]+\]")
+        self.assertIn("│  Details", cold)
         self.assertIn("tests failed", cold)
 
 
