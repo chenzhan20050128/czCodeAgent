@@ -26,11 +26,12 @@ class CodeRuntimeConfig:
     max_ast_nodes: int = 10_000
     max_eval_steps: int = 100_000
     max_collection_items: int = 10_000
+    max_output_bytes: int = 64 * 1024
     max_frame_bytes: int = DEFAULT_MAX_FRAME_BYTES
     max_stderr_bytes: int = 16 * 1024
 
     def __post_init__(self) -> None:
-        for name in ("max_cpu_seconds", "max_memory_mb", "max_source_bytes", "max_ast_nodes", "max_eval_steps", "max_collection_items", "max_frame_bytes", "max_stderr_bytes"):
+        for name in ("max_cpu_seconds", "max_memory_mb", "max_source_bytes", "max_ast_nodes", "max_eval_steps", "max_collection_items", "max_output_bytes", "max_frame_bytes", "max_stderr_bytes"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if not isinstance(self.max_wall_seconds, (int, float)) or isinstance(self.max_wall_seconds, bool) or self.max_wall_seconds <= 0:
@@ -113,6 +114,7 @@ class CodeRuntime:
                 "max_ast_nodes": self.config.max_ast_nodes,
                 "max_eval_steps": self.config.max_eval_steps,
                 "max_collection_items": self.config.max_collection_items,
+                "max_output_bytes": self.config.max_output_bytes,
                 "max_cpu_seconds": self.config.max_cpu_seconds,
                 "max_memory_mb": self.config.max_memory_mb,
             }, max_bytes=self.config.max_frame_bytes))

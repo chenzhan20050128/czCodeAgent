@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 from dataclasses import dataclass, field
@@ -31,11 +32,22 @@ from mca.code_protocol import decode_frame, encode_frame
 
 
 class _ReturnStream:
-    def __init__(self) -> None:
+    def __init__(self, max_bytes: int) -> None:
         self.logs: list[str] = []
+        self.max_bytes = max_bytes
+        self.used_bytes = 0
 
     def print(self, *values: object) -> None:
-        self.logs.append(" ".join(str(value) for value in values))
+        rendered = " ".join(str(value) for value in values)
+        size = len(rendered.encode("utf-8"))
+        if self.used_bytes + size > self.max_bytes:
+            raise OutputLimitError("program output byte limit exceeded")
+        self.logs.append(rendered)
+        self.used_bytes += size
+
+
+class OutputLimitError(RuntimeError):
+    """The program attempted to return or log too many UTF-8 bytes."""
 
 
 @dataclass
@@ -207,7 +219,10 @@ async def _main(request: dict[str, Any]) -> dict[str, Any]:
     _apply_resource_limits(request)
     validated = validate_code(source, max_nodes=int(request["max_ast_nodes"]))
     client = _GraphClient(tuple(tools))
-    output = _ReturnStream()
+    max_output_bytes = request.get("max_output_bytes")
+    if type(max_output_bytes) is not int or max_output_bytes < 1:
+        raise CodeValidationError("max_output_bytes must be a positive integer")
+    output = _ReturnStream(max_output_bytes)
 
     async def gather(*nodes: ToolNode) -> list[Any]:
         value = await client.execute(tuple(nodes))
@@ -236,12 +251,17 @@ async def _main(request: dict[str, Any]) -> dict[str, Any]:
         return value
 
     environment["range"] = bounded_range
-    value = await Evaluator(
+    value = ensure_json_value(await Evaluator(
         environment,
         max_steps=int(request["max_eval_steps"]),
         max_collection_items=int(request["max_collection_items"]),
-    ).run(validated)
-    return {"type": "done", "value": ensure_json_value(value), "logs": output.logs}
+    ).run(validated))
+    encoded_value = json.dumps(
+        value, ensure_ascii=False, allow_nan=False, separators=(",", ":")
+    ).encode("utf-8")
+    if output.used_bytes + len(encoded_value) > max_output_bytes:
+        raise OutputLimitError("program output byte limit exceeded")
+    return {"type": "done", "value": value, "logs": output.logs}
 
 
 def _apply_resource_limits(
@@ -288,6 +308,8 @@ def main() -> int:
         result = {"type": "done", "error": {"code": "EVAL_STEP_LIMIT", "message": str(error)}, "logs": []}
     except CollectionLimitError as error:
         result = {"type": "done", "error": {"code": "COLLECTION_LIMIT", "message": str(error)}, "logs": []}
+    except OutputLimitError as error:
+        result = {"type": "done", "error": {"code": "OUTPUT_LIMIT", "message": str(error)}, "logs": []}
     except CodeValidationError as error:
         result = {"type": "done", "error": {"code": "INVALID_CODE", "message": str(error)}, "logs": []}
     except BaseException as error:

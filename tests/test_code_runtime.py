@@ -140,6 +140,28 @@ class CodeRuntimeTests(unittest.TestCase):
 
         self.assertEqual(fake_resource.setrlimit.call_count, 2)
 
+    def test_program_logs_are_bounded_by_utf8_output_bytes(self) -> None:
+        result = CodeRuntime(
+            CodeRuntimeConfig(max_wall_seconds=2, max_output_bytes=8)
+        ).run(
+            'print("你好你好")\nreturn 1',
+            execute_graph=lambda request: {},
+        )
+
+        self.assertEqual(result.error.code, "OUTPUT_LIMIT")
+        self.assertEqual(result.logs, ())
+
+    def test_program_return_value_is_bounded_by_output_bytes(self) -> None:
+        result = CodeRuntime(
+            CodeRuntimeConfig(max_wall_seconds=2, max_output_bytes=32)
+        ).run(
+            'return {"payload": "x" * 100}',
+            execute_graph=lambda request: {},
+        )
+
+        self.assertEqual(result.error.code, "OUTPUT_LIMIT")
+        self.assertIsNone(result.value)
+
     def test_runs_program_and_exchanges_dynamic_graph(self) -> None:
         seen: list[dict[str, object]] = []
 

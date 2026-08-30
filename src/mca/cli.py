@@ -345,6 +345,7 @@ class _Runtime:
                 max_ast_nodes=config.code_max_ast_nodes,
                 max_eval_steps=config.code_max_eval_steps,
                 max_collection_items=config.code_max_collection_items,
+                max_output_bytes=config.code_max_output_bytes,
                 max_frame_bytes=max(config.code_max_output_bytes * 2, 1024 * 1024),
             ),
             code_max_parallel_nodes=config.code_max_parallel_nodes,
