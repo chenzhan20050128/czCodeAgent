@@ -269,6 +269,27 @@ class ShellRunnerTests(unittest.TestCase):
         else:
             self.fail(f"child process {child_pid} survived timeout cleanup")
 
+    def test_cancellation_never_runs_commands_after_blocked_child(self) -> None:
+        runner = ShellRunner(self.workspace, termination_grace_seconds=0.05)
+        for attempt in range(12):
+            marker = self.workspace / f"too-late-{attempt}"
+            cancellation = threading.Event()
+            timer = threading.Timer(0.05, cancellation.set)
+            timer.start()
+            try:
+                result = runner.prepare(
+                    {
+                        "command": f"sleep 5; touch {shlex.quote(str(marker))}",
+                        "timeout_seconds": 10,
+                    }
+                ).execute(cancellation_event=cancellation)
+            finally:
+                timer.cancel()
+                timer.join()
+
+            self.assertEqual(result.status, "interrupted")
+            self.assertFalse(marker.exists(), f"attempt {attempt} ran trailing command")
+
     def test_parent_exit_with_descendant_holding_pipes_is_bounded_and_cleaned(self) -> None:
         command = (
             "(trap '' TERM; sleep 60) & child=$!; "

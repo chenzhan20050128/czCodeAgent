@@ -54,6 +54,17 @@ return {"result": result, "count": len([a, b])}
                 with self.assertRaises(CodeValidationError):
                     validate_code(source)
 
+    def test_rejects_starred_values_outside_calls_and_double_star_kwargs(self) -> None:
+        cases = (
+            "values = [1, 2]\ncopy = [*values]\nreturn copy",
+            "values = {\"path\": \"a.py\"}\nreturn tools.read_file(**values)",
+            "async for item in values:\n    pass",
+        )
+        for source in cases:
+            with self.subTest(source=source):
+                with self.assertRaises(CodeValidationError):
+                    validate_code(source)
+
     def test_rejects_oversized_ast(self) -> None:
         source = "\n".join(f"x{i} = {i}" for i in range(10))
         with self.assertRaisesRegex(CodeValidationError, "AST node limit"):
@@ -76,6 +87,71 @@ class CodeProtocolTests(unittest.TestCase):
 
 
 class CodeRuntimeTests(unittest.TestCase):
+    def test_multiline_string_literal_preserves_exact_content(self) -> None:
+        expected = (
+            '\n"""Generated module."""\n\n'
+            'def calculate(value):\n'
+            '    return value + 1\n'
+        )
+        source = (
+            "content = '''" + expected + "'''\n"
+            "return content"
+        )
+
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            source, execute_graph=lambda request: {}
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.value, expected)
+
+    def test_starred_nodes_expand_in_gather(self) -> None:
+        def execute_graph(request: dict[str, object]) -> dict[str, object]:
+            return {
+                "results": {
+                    node["node_id"]: {"ok": True, "value": node["name"]}
+                    for node in request["nodes"]
+                }
+            }
+
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            """
+first = tools.read_file({"path": "a.py"})
+second = tools.list_dir({"path": "."})
+nodes = [first, second]
+return await gather(*nodes)
+""",
+            execute_graph=execute_graph,
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.value, ["read_file", "list_dir"])
+
+    def test_starred_call_expansion_respects_collection_limit(self) -> None:
+        result = CodeRuntime(
+            CodeRuntimeConfig(max_wall_seconds=2, max_collection_items=2)
+        ).run(
+            """
+values = [1, 2, 3]
+return max(*values)
+""",
+            execute_graph=lambda request: {},
+        )
+
+        self.assertEqual(result.error.code, "COLLECTION_LIMIT")
+
+    def test_list_comprehension_works_inside_returned_dict(self) -> None:
+        result = CodeRuntime(CodeRuntimeConfig(max_wall_seconds=2)).run(
+            """
+values = [1, 2, 3]
+return {"doubled": [value * 2 for value in values]}
+""",
+            execute_graph=lambda request: {},
+        )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.value, {"doubled": [2, 4, 6]})
+
     def test_runtime_config_validates_cpu_and_memory_limits(self) -> None:
         config = CodeRuntimeConfig(max_cpu_seconds=7, max_memory_mb=384)
         self.assertEqual(config.max_cpu_seconds, 7)
