@@ -34,6 +34,13 @@ class CodeSdkTests(unittest.TestCase):
         self.assertIn("Imports and json.dumps/json.dump are unavailable", text)
         self.assertIn("A final bare expression is discarded", text)
         self.assertIn("read_file output is line-numbered", text)
+        self.assertIn("Triple-quoted multiline strings preserve exact content", text)
+        self.assertIn("gather(*nodes)", text)
+        self.assertIn("list/dict comprehensions", text)
+        self.assertIn("Function/class definitions, imports, lambda", text)
+        self.assertIn("may already have succeeded", text)
+        self.assertIn("execution_summary", text)
+        self.assertIn("retry only failed or skipped work", text)
 
     def test_run_code_description_contains_the_generated_sdk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

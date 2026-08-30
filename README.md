@@ -60,7 +60,9 @@ return await verify
 
 工具调用先生成惰性 `ToolNode`。`await node` 执行其依赖闭包，`await gather(a, b)` 或 `execute(a, b)` 表示并行分支，`after=[...]` 表示依赖。父进程使用动态 Kahn 调度器执行 ready frontier，并受 `MCA_CODE_MAX_PARALLEL_NODES` 限制。模型声明无依赖的读、写和 Bash 可以并行；所有副作用仍逐节点经过参数校验、Plan Mode、审批、快照、执行和结果持久化。
 
-一个节点失败后，其后代不会执行，而是得到结构化 `UPSTREAM_FAILED`、直接 blocker 和根失败链；无关分支继续。程序可以捕获工具错误，但外层 `execution_summary` 由 runtime 强制生成，不能隐藏失败或拒绝。模型下一轮只看到精简后的外层 `run_code` 结果，内部节点仍完整保存在审计日志中。
+受限语言支持三引号多行字符串且保持内容原样，也支持列表/字典推导、`gather(*nodes)`、条件、循环和 `try/except`。它仍明确拒绝 import、函数/类/lambda 定义、反射、`**kwargs` 和任意方法调用；要生成包含普通 Python 函数或 import 的源码，应把它们放在传给 `write_file` 的字符串中。
+
+一个节点失败后，其后代不会执行，而是得到结构化 `UPSTREAM_FAILED`、直接 blocker 和根失败链；无关分支继续。程序可以捕获工具错误，但外层 `execution_summary` 由 runtime 强制生成，不能隐藏失败或拒绝。一次失败的 Code Run 仍可能已经完成部分写入或命令，因此模型应读取 DAG/summary，只重试失败或跳过的分支。模型下一轮只看到精简后的外层 `run_code` 结果，内部节点仍完整保存在审计日志中。
 
 ### 并行写与文件 CAS
 

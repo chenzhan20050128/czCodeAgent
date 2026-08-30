@@ -73,6 +73,73 @@ class CancelledGraphRuntime:
 
 
 class CodeModeIntegrationTests(unittest.TestCase):
+    def test_multiline_string_is_written_without_parser_indentation(self) -> None:
+        expected = (
+            '"""Generated module."""\n\n'
+            'def calculate(value):\n'
+            '    return value + 1\n'
+        )
+        source = (
+            "content = '''" + expected + "'''\n"
+            'write = tools.write_file({"path": "generated.py", "content": content})\n'
+            "return await write"
+        )
+
+        result = CodeModeRunner(
+            store=self.store, state=self.state, executor=self.executor
+        ).run(self.outer, description="write multiline source", code=source)
+
+        self.assertEqual(result.status, "succeeded", result.output)
+        self.assertEqual(
+            (self.workspace / "generated.py").read_text(encoding="utf-8"),
+            expected,
+        )
+
+    def test_realistic_multifile_codegen_uses_multiline_starred_and_comprehension(self) -> None:
+        module_one = (
+            '"""First generated module."""\n\n'
+            'def add(a, b):\n'
+            '    return a + b\n'
+        )
+        module_two = (
+            '"""Second generated module."""\n\n'
+            'def multiply(a, b):\n'
+            '    return a * b\n'
+        )
+        test_source = (
+            'import unittest\n'
+            'from one import add\n'
+            'from two import multiply\n\n'
+            'class GeneratedTests(unittest.TestCase):\n'
+            '    def test_values(self):\n'
+            '        self.assertEqual(add(2, 3), 5)\n'
+            '        self.assertEqual(multiply(2, 3), 6)\n'
+        )
+        source = (
+            "ONE = '''" + module_one + "'''\n"
+            "TWO = '''" + module_two + "'''\n"
+            "TEST = '''" + test_source + "'''\n"
+            'one = tools.write_file({"path": "one.py", "content": ONE})\n'
+            'two = tools.write_file({"path": "two.py", "content": TWO})\n'
+            'test = tools.write_file({"path": "test_generated.py", "content": TEST})\n'
+            'writes = [one, two, test]\n'
+            'verify = tools.bash({"command": "python3 -m unittest -v"}, after=writes)\n'
+            'results = await gather(*writes, verify)\n'
+            'return {"statuses": [result["status"] for result in results], "exit_code": results[-1]["exit_code"]}'
+        )
+
+        result = CodeModeRunner(
+            store=self.store, state=self.state, executor=self.executor
+        ).run(self.outer, description="realistic codegen", code=source)
+
+        self.assertEqual(result.status, "succeeded", result.output)
+        payload = json.loads(result.output)
+        self.assertEqual(payload["result"]["statuses"], ["succeeded"] * 4)
+        self.assertEqual(payload["result"]["exit_code"], 0)
+        self.assertEqual((self.workspace / "one.py").read_text(), module_one)
+        self.assertEqual((self.workspace / "two.py").read_text(), module_two)
+        self.assertEqual((self.workspace / "test_generated.py").read_text(), test_source)
+
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

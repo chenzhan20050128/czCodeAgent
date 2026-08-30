@@ -220,14 +220,14 @@ class PreparedShellCommand:
                 if cancellation_event is not None and cancellation_event.is_set():
                     interrupted = True
                     _stop_process_group(
-                        process, signal.SIGTERM, self.termination_grace_seconds
+                        process, signal.SIGKILL, self.termination_grace_seconds
                     )
                     break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     timed_out = True
                     _stop_process_group(
-                        process, signal.SIGTERM, self.termination_grace_seconds
+                        process, signal.SIGKILL, self.termination_grace_seconds
                     )
                     break
                 try:
@@ -237,7 +237,7 @@ class PreparedShellCommand:
         except KeyboardInterrupt:
             interrupted = True
             _stop_process_group(
-                process, signal.SIGINT, self.termination_grace_seconds
+                process, signal.SIGKILL, self.termination_grace_seconds
             )
         finally:
             if process.poll() is None:
@@ -402,6 +402,18 @@ def _drain_pipe(
 def _stop_process_group(
     process: subprocess.Popen[bytes], first_signal: signal.Signals, grace: float
 ) -> None:
+    if first_signal is signal.SIGKILL:
+        # Kill and reap the command interpreter before its children. If the
+        # blocked child dies first, /bin/sh may briefly resume and execute the
+        # next command in a sequence such as `sleep; destructive-command`.
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        _wait_process_bounded(process, grace)
+        _signal_process_group(process.pid, signal.SIGKILL)
+        _wait_process_bounded(process, grace)
+        return
     group_signalled = _signal_process_group(process.pid, first_signal)
     if not group_signalled and process.poll() is None:
         try:

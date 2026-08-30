@@ -45,7 +45,7 @@ class ValidatedCode:
 _FORBIDDEN = (
     ast.Import, ast.ImportFrom, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
     ast.Lambda, ast.Global, ast.Nonlocal, ast.With, ast.AsyncWith, ast.Delete,
-    ast.Yield, ast.YieldFrom, ast.NamedExpr, ast.Match,
+    ast.Yield, ast.YieldFrom, ast.NamedExpr, ast.Match, ast.AsyncFor,
 )
 _ALLOWED_NAMES = {
     "tools", "gather", "execute", "print", "ToolCallError",
@@ -66,19 +66,19 @@ def validate_code(source: str, *, max_nodes: int = 10_000) -> ValidatedCode:
         raise CodeValidationError("code must be a non-empty string")
     if type(max_nodes) is not int or max_nodes < 1:
         raise ValueError("max_nodes must be positive")
-    wrapped = "async def __mca_main__():\n" + "".join(
-        f"    {line}\n" for line in source.splitlines()
-    )
     try:
-        module = ast.parse(wrapped, mode="exec")
+        module = ast.parse(source, mode="exec")
     except SyntaxError as error:
-        line = max(1, (error.lineno or 2) - 1)
+        line = max(1, error.lineno or 1)
         raise CodeValidationError(
             f"invalid code at line {line}: {error.msg}"
         ) from None
-    function = module.body[0]
-    assert isinstance(function, ast.AsyncFunctionDef)
-    nodes = [node for statement in function.body for node in ast.walk(statement)]
+    nodes = [node for statement in module.body for node in ast.walk(statement)]
+    parents = {
+        child: parent
+        for parent in nodes
+        for child in ast.iter_child_nodes(parent)
+    }
     if len(nodes) > max_nodes:
         raise CodeValidationError("code exceeds AST node limit")
     for node in nodes:
@@ -88,6 +88,12 @@ def validate_code(source: str, *, max_nodes: int = 10_000) -> ValidatedCode:
             )
         if isinstance(node, ast.Name) and node.id.startswith("_"):
             raise CodeValidationError("private names are not allowed")
+        if isinstance(node, ast.Starred):
+            parent = parents.get(node)
+            if not isinstance(parent, ast.Call) or node not in parent.args:
+                raise CodeValidationError(
+                    "starred expressions are only allowed in call arguments"
+                )
         if isinstance(node, ast.Attribute):
             if node.attr.startswith("_"):
                 raise CodeValidationError("private attributes are not allowed")
@@ -100,6 +106,8 @@ def validate_code(source: str, *, max_nodes: int = 10_000) -> ValidatedCode:
                     f"unsupported attribute: {node.attr}"
                 )
         if isinstance(node, ast.Call):
+            if any(keyword.arg is None for keyword in node.keywords):
+                raise CodeValidationError("double-star keyword expansion is not allowed")
             if isinstance(node.func, ast.Name):
                 if node.func.id not in _ALLOWED_NAMES:
                     raise CodeValidationError(
@@ -115,7 +123,7 @@ def validate_code(source: str, *, max_nodes: int = 10_000) -> ValidatedCode:
                     )
             else:
                 raise CodeValidationError("dynamic calls are not allowed")
-    return ValidatedCode(source, tuple(function.body), len(nodes))
+    return ValidatedCode(source, tuple(module.body), len(nodes))
 
 
 class _ReturnSignal(BaseException):
@@ -269,9 +277,30 @@ class Evaluator:
             return await value
         if isinstance(node, ast.Call):
             function = await self._expr(node.func)
-            args = [await self._expr(arg) for arg in node.args]
+            args: list[Any] = []
+            for argument in node.args:
+                if isinstance(argument, ast.Starred):
+                    expanded = await self._expr(argument.value)
+                    args.extend(self._bounded_collection(list(expanded)))
+                else:
+                    args.append(await self._expr(argument))
             kwargs = {item.arg: await self._expr(item.value) for item in node.keywords if item.arg}
             return self._invoke_bounded(function, args, kwargs)
+        if isinstance(node, ast.List):
+            if len(node.elts) > self.max_collection_items:
+                raise CollectionLimitError("collection item limit exceeded")
+            return [await self._expr(item) for item in node.elts]
+        if isinstance(node, ast.Tuple):
+            if len(node.elts) > self.max_collection_items:
+                raise CollectionLimitError("collection item limit exceeded")
+            return tuple([await self._expr(item) for item in node.elts])
+        if isinstance(node, ast.Dict):
+            if len(node.keys) > self.max_collection_items:
+                raise CollectionLimitError("collection item limit exceeded")
+            result: dict[Any, Any] = {}
+            for key, value in zip(node.keys, node.values, strict=True):
+                result[await self._expr(key)] = await self._expr(value)
+            return result
         if isinstance(node, ast.ListComp):
             return await self._list_comp(node)
         if isinstance(node, ast.DictComp):
@@ -411,7 +440,10 @@ class Evaluator:
 
         async def visit(index: int) -> None:
             if index == len(generators):
-                values = tuple(await self._expr(expression) for expression in expressions)
+                resolved: list[Any] = []
+                for expression in expressions:
+                    resolved.append(await self._expr(expression))
+                values = tuple(resolved)
                 output.append(values[0] if len(values) == 1 else values)
                 return
             generator = generators[index]
@@ -423,7 +455,12 @@ class Evaluator:
                     raise CollectionLimitError("collection item limit exceeded")
                 self.tick()
                 self._assign(generator.target, item)
-                if all(await self._expr(condition) for condition in generator.ifs):
+                conditions_match = True
+                for condition in generator.ifs:
+                    if not await self._expr(condition):
+                        conditions_match = False
+                        break
+                if conditions_match:
                     await visit(index + 1)
 
         await visit(0)
