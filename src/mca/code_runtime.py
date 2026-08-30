@@ -20,6 +20,8 @@ from .code_protocol import DEFAULT_MAX_FRAME_BYTES, ProtocolFrameError, decode_f
 @dataclass(frozen=True)
 class CodeRuntimeConfig:
     max_wall_seconds: float = 120.0
+    max_cpu_seconds: int = 30
+    max_memory_mb: int = 256
     max_source_bytes: int = 64 * 1024
     max_ast_nodes: int = 10_000
     max_eval_steps: int = 100_000
@@ -28,7 +30,7 @@ class CodeRuntimeConfig:
     max_stderr_bytes: int = 16 * 1024
 
     def __post_init__(self) -> None:
-        for name in ("max_source_bytes", "max_ast_nodes", "max_eval_steps", "max_collection_items", "max_frame_bytes", "max_stderr_bytes"):
+        for name in ("max_cpu_seconds", "max_memory_mb", "max_source_bytes", "max_ast_nodes", "max_eval_steps", "max_collection_items", "max_frame_bytes", "max_stderr_bytes"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
         if not isinstance(self.max_wall_seconds, (int, float)) or isinstance(self.max_wall_seconds, bool) or self.max_wall_seconds <= 0:
@@ -111,6 +113,8 @@ class CodeRuntime:
                 "max_ast_nodes": self.config.max_ast_nodes,
                 "max_eval_steps": self.config.max_eval_steps,
                 "max_collection_items": self.config.max_collection_items,
+                "max_cpu_seconds": self.config.max_cpu_seconds,
+                "max_memory_mb": self.config.max_memory_mb,
             }, max_bytes=self.config.max_frame_bytes))
             process.stdin.flush()
             result: CodeRuntimeResult | None = None

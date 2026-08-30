@@ -30,6 +30,8 @@ class Config:
     code_max_parallel_nodes: int = 4
     code_max_tool_nodes: int = 64
     code_max_wall_seconds: float = 120.0
+    code_max_cpu_seconds: int = 30
+    code_max_memory_mb: int = 256
     code_max_source_bytes: int = 65_536
     code_max_ast_nodes: int = 10_000
     code_max_eval_steps: int = 100_000
@@ -113,6 +115,12 @@ class Config:
         code_max_wall_seconds = _positive_float_from_env(
             "MCA_CODE_MAX_WALL_SECONDS", 120.0
         )
+        code_max_cpu_seconds = _positive_int_from_env(
+            "MCA_CODE_MAX_CPU_SECONDS", 30
+        )
+        code_max_memory_mb = _positive_int_from_env(
+            "MCA_CODE_MAX_MEMORY_MB", 256
+        )
         code_max_source_bytes = _positive_int_from_env("MCA_CODE_MAX_SOURCE_BYTES", 65_536)
         code_max_ast_nodes = _positive_int_from_env("MCA_CODE_MAX_AST_NODES", 10_000)
         code_max_eval_steps = _positive_int_from_env("MCA_CODE_MAX_EVAL_STEPS", 100_000)
@@ -135,6 +143,8 @@ class Config:
             code_max_parallel_nodes=code_max_parallel_nodes,
             code_max_tool_nodes=code_max_tool_nodes,
             code_max_wall_seconds=code_max_wall_seconds,
+            code_max_cpu_seconds=code_max_cpu_seconds,
+            code_max_memory_mb=code_max_memory_mb,
             code_max_source_bytes=code_max_source_bytes,
             code_max_ast_nodes=code_max_ast_nodes,
             code_max_eval_steps=code_max_eval_steps,
@@ -158,6 +168,8 @@ class Config:
             f"code_max_parallel_nodes={self.code_max_parallel_nodes!r}, "
             f"code_max_tool_nodes={self.code_max_tool_nodes!r}, "
             f"code_max_wall_seconds={self.code_max_wall_seconds!r}, "
+            f"code_max_cpu_seconds={self.code_max_cpu_seconds!r}, "
+            f"code_max_memory_mb={self.code_max_memory_mb!r}, "
             f"code_max_source_bytes={self.code_max_source_bytes!r}, "
             f"code_max_ast_nodes={self.code_max_ast_nodes!r}, "
             f"code_max_eval_steps={self.code_max_eval_steps!r}, "

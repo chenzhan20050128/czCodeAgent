@@ -339,6 +339,8 @@ class _Runtime:
             workspace=workspace,
             code_runtime_config=CodeRuntimeConfig(
                 max_wall_seconds=config.code_max_wall_seconds,
+                max_cpu_seconds=config.code_max_cpu_seconds,
+                max_memory_mb=config.code_max_memory_mb,
                 max_source_bytes=config.code_max_source_bytes,
                 max_ast_nodes=config.code_max_ast_nodes,
                 max_eval_steps=config.code_max_eval_steps,

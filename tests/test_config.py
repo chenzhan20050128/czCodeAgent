@@ -42,6 +42,8 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertEqual(config.code_max_parallel_nodes, 4)
         self.assertEqual(config.code_max_tool_nodes, 64)
         self.assertEqual(config.code_max_wall_seconds, 120.0)
+        self.assertEqual(config.code_max_cpu_seconds, 30)
+        self.assertEqual(config.code_max_memory_mb, 256)
         self.assertEqual(config.code_max_source_bytes, 65_536)
         self.assertEqual(config.code_max_ast_nodes, 10_000)
         self.assertEqual(config.code_max_eval_steps, 100_000)
@@ -130,6 +132,8 @@ class ConfigFromEnvTests(unittest.TestCase):
                 "MCA_CODE_MAX_PARALLEL_NODES": "2",
                 "MCA_CODE_MAX_TOOL_NODES": "12",
                 "MCA_CODE_MAX_WALL_SECONDS": "45",
+                "MCA_CODE_MAX_CPU_SECONDS": "7",
+                "MCA_CODE_MAX_MEMORY_MB": "384",
                 "MCA_CODE_MAX_SOURCE_BYTES": "1000",
                 "MCA_CODE_MAX_AST_NODES": "2000",
                 "MCA_CODE_MAX_EVAL_STEPS": "3000",
@@ -150,6 +154,8 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertEqual(config.code_max_parallel_nodes, 2)
         self.assertEqual(config.code_max_tool_nodes, 12)
         self.assertEqual(config.code_max_wall_seconds, 45.0)
+        self.assertEqual(config.code_max_cpu_seconds, 7)
+        self.assertEqual(config.code_max_memory_mb, 384)
         self.assertEqual(config.code_max_source_bytes, 1000)
         self.assertEqual(config.code_max_ast_nodes, 2000)
         self.assertEqual(config.code_max_eval_steps, 3000)
@@ -168,6 +174,8 @@ class ConfigFromEnvTests(unittest.TestCase):
             ({"MCA_CODE_MAX_PARALLEL_NODES": "0"}, "MCA_CODE_MAX_PARALLEL_NODES"),
             ({"MCA_CODE_MAX_TOOL_NODES": "0"}, "MCA_CODE_MAX_TOOL_NODES"),
             ({"MCA_CODE_MAX_WALL_SECONDS": "0"}, "MCA_CODE_MAX_WALL_SECONDS"),
+            ({"MCA_CODE_MAX_CPU_SECONDS": "0"}, "MCA_CODE_MAX_CPU_SECONDS"),
+            ({"MCA_CODE_MAX_MEMORY_MB": "many"}, "MCA_CODE_MAX_MEMORY_MB"),
             ({"MCA_CODE_MAX_SOURCE_BYTES": "0"}, "MCA_CODE_MAX_SOURCE_BYTES"),
             ({"MCA_CODE_MAX_AST_NODES": "0"}, "MCA_CODE_MAX_AST_NODES"),
             ({"MCA_CODE_MAX_EVAL_STEPS": "0"}, "MCA_CODE_MAX_EVAL_STEPS"),

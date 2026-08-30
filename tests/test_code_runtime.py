@@ -16,6 +16,8 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from mca.code_ast import CodeValidationError, validate_code
 from mca.code_protocol import ProtocolFrameError, decode_frame, encode_frame
 from mca.code_runtime import CodeRuntime, CodeRuntimeConfig
+import mca.code_runtime as code_runtime
+import mca.code_worker as code_worker
 
 
 class CodeAstTests(unittest.TestCase):
@@ -72,6 +74,72 @@ class CodeProtocolTests(unittest.TestCase):
 
 
 class CodeRuntimeTests(unittest.TestCase):
+    def test_runtime_config_validates_cpu_and_memory_limits(self) -> None:
+        config = CodeRuntimeConfig(max_cpu_seconds=7, max_memory_mb=384)
+        self.assertEqual(config.max_cpu_seconds, 7)
+        self.assertEqual(config.max_memory_mb, 384)
+        for kwargs in ({"max_cpu_seconds": 0}, {"max_memory_mb": 0}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    CodeRuntimeConfig(**kwargs)
+
+    def test_start_frame_carries_worker_resource_budgets(self) -> None:
+        captured: list[dict[str, object]] = []
+        real_encode = encode_frame
+
+        def recording_encode(value, **kwargs):
+            captured.append(value)
+            return real_encode(value, **kwargs)
+
+        with patch("mca.code_runtime.encode_frame", side_effect=recording_encode):
+            result = CodeRuntime(
+                CodeRuntimeConfig(
+                    max_wall_seconds=2, max_cpu_seconds=7, max_memory_mb=384
+                )
+            ).run("return 1", execute_graph=lambda request: {})
+
+        self.assertIsNone(result.error)
+        self.assertEqual(captured[0]["max_cpu_seconds"], 7)
+        self.assertEqual(captured[0]["max_memory_mb"], 384)
+
+    def test_worker_tightens_posix_cpu_and_address_space_limits(self) -> None:
+        fake_resource = unittest.mock.Mock()
+        fake_resource.RLIMIT_CPU = 1
+        fake_resource.RLIMIT_AS = 2
+        fake_resource.RLIM_INFINITY = -1
+        fake_resource.getrlimit.side_effect = [(-1, -1), (-1, -1)]
+
+        with patch.object(code_worker, "_resource", fake_resource, create=True):
+            code_worker._apply_resource_limits(
+                {"max_cpu_seconds": 7, "max_memory_mb": 384}
+            )
+
+        self.assertEqual(
+            fake_resource.setrlimit.call_args_list,
+            [
+                unittest.mock.call(1, (7, -1)),
+                unittest.mock.call(2, (384 * 1024 * 1024, -1)),
+            ],
+        )
+
+    def test_worker_degrades_if_address_space_limit_is_unsupported(self) -> None:
+        fake_resource = unittest.mock.Mock()
+        fake_resource.RLIMIT_CPU = 1
+        fake_resource.RLIMIT_AS = 2
+        fake_resource.RLIM_INFINITY = -1
+        fake_resource.getrlimit.side_effect = [(-1, -1), (-1, -1)]
+        fake_resource.setrlimit.side_effect = [
+            None,
+            ValueError("current limit exceeds maximum limit"),
+        ]
+
+        code_worker._apply_resource_limits(
+            {"max_cpu_seconds": 7, "max_memory_mb": 384},
+            resource_module=fake_resource,
+        )
+
+        self.assertEqual(fake_resource.setrlimit.call_count, 2)
+
     def test_runs_program_and_exchanges_dynamic_graph(self) -> None:
         seen: list[dict[str, object]] = []
 

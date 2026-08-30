@@ -9,6 +9,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+try:
+    import resource as _resource
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    _resource = None
+
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -199,6 +204,7 @@ async def _main(request: dict[str, Any]) -> dict[str, Any]:
         not isinstance(name, str) for name in tools
     ):
         raise CodeValidationError("invalid initial request")
+    _apply_resource_limits(request)
     validated = validate_code(source, max_nodes=int(request["max_ast_nodes"]))
     client = _GraphClient(tuple(tools))
     output = _ReturnStream()
@@ -236,6 +242,42 @@ async def _main(request: dict[str, Any]) -> dict[str, Any]:
         max_collection_items=int(request["max_collection_items"]),
     ).run(validated)
     return {"type": "done", "value": ensure_json_value(value), "logs": output.logs}
+
+
+def _apply_resource_limits(
+    request: dict[str, Any], *, resource_module: Any = None
+) -> None:
+    """Tighten worker CPU/address-space soft limits when POSIX supports it."""
+
+    limits = _resource if resource_module is None else resource_module
+    if limits is None:
+        return
+    cpu_seconds = request.get("max_cpu_seconds")
+    memory_mb = request.get("max_memory_mb")
+    if type(cpu_seconds) is not int or cpu_seconds < 1:
+        raise CodeValidationError("max_cpu_seconds must be a positive integer")
+    if type(memory_mb) is not int or memory_mb < 1:
+        raise CodeValidationError("max_memory_mb must be a positive integer")
+    _tighten_limit(limits, limits.RLIMIT_CPU, cpu_seconds)
+    if hasattr(limits, "RLIMIT_AS"):
+        try:
+            _tighten_limit(limits, limits.RLIMIT_AS, memory_mb * 1024 * 1024)
+        except (OSError, ValueError):
+            # Darwin exposes RLIMIT_AS but rejects changing it. The short-lived
+            # worker still has empty env/cwd plus wall, AST, step, collection,
+            # protocol, and output limits; Linux keeps the address-space cap.
+            pass
+
+
+def _tighten_limit(limits: Any, kind: int, requested: int) -> None:
+    current_soft, current_hard = limits.getrlimit(kind)
+    infinity = limits.RLIM_INFINITY
+    soft = (
+        requested
+        if current_soft == infinity
+        else min(current_soft, requested)
+    )
+    limits.setrlimit(kind, (soft, current_hard))
 
 
 def main() -> int:
