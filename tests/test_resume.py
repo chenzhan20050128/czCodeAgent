@@ -313,6 +313,37 @@ class SessionResumeTests(ResumeTestCase):
                     resumed.store.load(), resumed.state, self.environment()
                 )
 
+    def test_multiple_started_calls_each_become_unknown_after_parallel_crash(self) -> None:
+        self.start_turn(("first", "second"))
+        for call_id in ("first", "second"):
+            self.append(
+                "tool_started",
+                {"call_key": f"3:{call_id}", "call_id": call_id},
+            )
+
+        with self.reopen() as resumed:
+            self.assertEqual(
+                [
+                    resumed.state.tool_calls[f"3:{call_id}"].status
+                    for call_id in ("first", "second")
+                ],
+                [ToolStatus.OUTCOME_UNKNOWN, ToolStatus.OUTCOME_UNKNOWN],
+            )
+            recovery = [
+                event
+                for event in resumed.store.load()
+                if event.type == "tool_finished"
+            ]
+            self.assertEqual(
+                [event.payload["call_id"] for event in recovery],
+                ["first", "second"],
+            )
+            self.assertTrue(resumed.state.recovery_blocked)
+            with self.assertRaises(ProjectionBlockedError):
+                PromptProjector.project(
+                    resumed.store.load(), resumed.state, self.environment()
+                )
+
     def test_mixed_started_replay_never_creates_interrupted_intent(self) -> None:
         self.start_turn(("started", "pending"))
         self.append(

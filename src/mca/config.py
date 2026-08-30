@@ -26,6 +26,7 @@ class Config:
     thinking: str = "enabled"
     max_steps: int = 64
     max_tool_calls_per_batch: int = 8
+    max_parallel_tool_calls: int = 4
     request_timeout: float = 600.0
     max_attempts: int = 3
     retry_budget_seconds: float = 900.0
@@ -92,6 +93,9 @@ class Config:
             raise ValueError("MCA_THINKING must be enabled or disabled")
 
         max_steps = _positive_int_from_env("MCA_MAX_STEPS", 64)
+        max_parallel_tool_calls = _positive_int_from_env(
+            "MCA_MAX_PARALLEL_TOOL_CALLS", 4
+        )
         request_timeout = _positive_float_from_env("MCA_REQUEST_TIMEOUT", 600.0)
         retry_budget_seconds = _positive_float_from_env(
             "MCA_RETRY_BUDGET_SECONDS", 900.0
@@ -105,6 +109,7 @@ class Config:
             max_output_tokens=max_output_tokens,
             thinking=thinking,
             max_steps=max_steps,
+            max_parallel_tool_calls=max_parallel_tool_calls,
             request_timeout=request_timeout,
             retry_budget_seconds=retry_budget_seconds,
         )
@@ -119,6 +124,7 @@ class Config:
             f"max_steps={self.max_steps!r}, "
             "max_tool_calls_per_batch="
             f"{self.max_tool_calls_per_batch!r}, "
+            f"max_parallel_tool_calls={self.max_parallel_tool_calls!r}, "
             f"request_timeout={self.request_timeout!r}, "
             f"max_attempts={self.max_attempts!r}, "
             f"retry_budget_seconds={self.retry_budget_seconds!r}, "

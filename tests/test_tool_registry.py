@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from mca.tools.registry import (
+    ExecutionMode,
     SideEffect,
     ToolRegistry,
     ToolResult,
@@ -167,6 +168,80 @@ class ToolRegistryTests(unittest.TestCase):
                 side_effect=SideEffect.NONE,
             )
 
+    def test_execution_mode_requires_explicit_safe_side_effect_free_call(self) -> None:
+        safe = ToolSpec(
+            name="safe",
+            description="Safe read.",
+            schema={
+                "type": "object",
+                "properties": {"mode": {"type": "string"}},
+                "required": ["mode"],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: arguments,
+            side_effect=SideEffect.NONE,
+            is_concurrency_safe=lambda arguments: arguments["mode"] == "read",
+        )
+        write = ToolSpec(
+            name="write",
+            description="Unsafe write.",
+            schema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            prepare_handler=lambda arguments: arguments,
+            side_effect=SideEffect.WORKSPACE_WRITE,
+            is_concurrency_safe=lambda arguments: True,
+        )
+        registry = ToolRegistry([safe, write])
+
+        self.assertIs(
+            registry.execution_mode("safe", '{"mode":"read"}'),
+            ExecutionMode.PARALLEL,
+        )
+        for name, arguments in (
+            ("safe", '{"mode":"write"}'),
+            ("safe", "{}"),
+            ("safe", "{"),
+            ("write", "{}"),
+            ("missing", "{}"),
+        ):
+            with self.subTest(name=name, arguments=arguments):
+                self.assertIs(
+                    registry.execution_mode(name, arguments),
+                    ExecutionMode.EXCLUSIVE,
+                )
+
+    def test_concurrency_classifier_failure_is_exclusive_and_not_model_visible(self) -> None:
+        def explode(arguments: dict[str, object]) -> bool:
+            raise RuntimeError("classifier failed")
+
+        spec = ToolSpec(
+            name="safe",
+            description="Safe read.",
+            schema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: arguments,
+            side_effect=SideEffect.NONE,
+            is_concurrency_safe=explode,
+        )
+        registry = ToolRegistry([spec])
+
+        self.assertIs(
+            registry.execution_mode("safe", "{}"),
+            ExecutionMode.EXCLUSIVE,
+        )
+        self.assertEqual(
+            set(spec.provider_schema()["function"]),
+            {"name", "description", "parameters"},
+        )
+
 
 class ToolResultTruncationTests(unittest.TestCase):
     def test_short_output_is_unchanged(self) -> None:
@@ -266,6 +341,33 @@ class BuiltinToolSpecTests(unittest.TestCase):
 
         description = registry.resolve("write_file").description
         self.assertIn("parent directories are created", description)
+
+    def test_only_builtin_read_and_list_calls_are_parallel_safe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            registry = create_tool_registry(temporary)
+            expected = {
+                "read_file": ExecutionMode.PARALLEL,
+                "list_dir": ExecutionMode.PARALLEL,
+                "grep": ExecutionMode.EXCLUSIVE,
+                "write_file": ExecutionMode.EXCLUSIVE,
+                "edit_file": ExecutionMode.EXCLUSIVE,
+                "bash": ExecutionMode.EXCLUSIVE,
+                "exit_plan_mode": ExecutionMode.EXCLUSIVE,
+            }
+            arguments = {
+                "read_file": '{"path":"missing.txt"}',
+                "list_dir": "{}",
+                "grep": '{"pattern":"x"}',
+                "write_file": '{"path":"a","content":"x"}',
+                "edit_file": '{"path":"a","old_text":"x","new_text":"y"}',
+                "bash": '{"command":"true"}',
+                "exit_plan_mode": '{"plan":"# Plan"}',
+            }
+
+            self.assertEqual(
+                {name: registry.execution_mode(name, arguments[name]) for name in expected},
+                expected,
+            )
 
 
 if __name__ == "__main__":

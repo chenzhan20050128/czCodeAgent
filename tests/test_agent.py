@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import dataclasses
+import concurrent.futures
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from collections.abc import Callable, Mapping, Sequence
@@ -152,7 +155,10 @@ def text(content: str, *, reasoning: str = "", usage: object = None) -> Sampling
 
 
 def tool_spec(
-    name: str, handler: Callable[[dict[str, Any]], object]
+    name: str,
+    handler: Callable[[dict[str, Any]], object],
+    *,
+    parallel: bool = False,
 ) -> ToolSpec:
     return ToolSpec(
         name=name,
@@ -160,6 +166,7 @@ def tool_spec(
         schema=EMPTY_SCHEMA,
         handler=handler,
         side_effect=SideEffect.NONE,
+        is_concurrency_safe=(lambda arguments: True) if parallel else None,
     )
 
 
@@ -265,6 +272,13 @@ class AgentLoopTestCase(unittest.TestCase):
 
 
 class AgentLoopTests(AgentLoopTestCase):
+    def test_parallel_limit_must_be_positive_at_loop_construction(self) -> None:
+        with self.assertRaisesRegex(ValueError, "max_parallel_tool_calls"):
+            self.make_runtime(
+                text("unused"),
+                config=Config(api_key="test", max_parallel_tool_calls=0),
+            )
+
     def test_duplicate_provider_call_ids_fail_without_persisting_invalid_assistant(
         self,
     ) -> None:
@@ -551,6 +565,325 @@ class AgentLoopTests(AgentLoopTestCase):
         self.assertEqual(
             [message["tool_call_id"] for message in runtime.model.requests[1][0][-3:]],
             ["one", "two", "three"],
+        )
+
+    def test_parallel_safe_calls_overlap_but_results_commit_in_model_order(self) -> None:
+        rendezvous = threading.Barrier(2, timeout=1.0)
+        second_finished = threading.Event()
+        release_first = threading.Event()
+        controller_observation: list[int] = []
+
+        def parallel_read(arguments: dict[str, Any]) -> ToolResult:
+            call_id = str(arguments["id"])
+            rendezvous.wait()
+            if call_id == "1":
+                if not release_first.wait(1.0):
+                    raise AssertionError("second call never overlapped the first")
+            else:
+                second_finished.set()
+            return ToolResult(title=call_id, output=f"done-{call_id}")
+
+        spec = ToolSpec(
+            name="parallel_read",
+            description="Read independently.",
+            schema={
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+            handler=parallel_read,
+            side_effect=SideEffect.NONE,
+            is_concurrency_safe=lambda arguments: True,
+        )
+        runtime = self.make_runtime(
+            tool_batch(
+                call("one", "parallel_read", '{"id":"1"}'),
+                call("two", "parallel_read", '{"id":"2"}'),
+            ),
+            text("done"),
+            specs=[spec],
+            config=Config(api_key="test", max_parallel_tool_calls=2),
+        )
+
+        def observe_then_release() -> None:
+            if second_finished.wait(1.0):
+                controller_observation.append(
+                    sum(event.type == "tool_finished" for event in runtime.store.load())
+                )
+            release_first.set()
+
+        controller = threading.Thread(target=observe_then_release)
+        controller.start()
+        result = runtime.loop.run_turn("read both")
+        controller.join(timeout=1.0)
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(controller_observation, [0])
+        finished = [
+            event for event in runtime.store.load() if event.type == "tool_finished"
+        ]
+        self.assertEqual(
+            [(event.payload["call_id"], event.payload["status"]) for event in finished],
+            [("one", "succeeded"), ("two", "succeeded")],
+        )
+
+    def test_exclusive_call_is_a_barrier_between_parallel_groups(self) -> None:
+        actions: list[str] = []
+        lock = threading.Lock()
+
+        def record(value: str) -> None:
+            with lock:
+                actions.append(value)
+
+        def parallel_read(arguments: dict[str, Any]) -> ToolResult:
+            call_id = str(arguments["id"])
+            record(f"read-{call_id}")
+            return ToolResult(title=call_id, output=call_id)
+
+        def exclusive(_: dict[str, Any]) -> ToolResult:
+            record("exclusive")
+            return ToolResult(title="exclusive", output="exclusive")
+
+        schema = {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
+            "additionalProperties": False,
+        }
+        safe = ToolSpec(
+            "safe",
+            "Safe read.",
+            schema,
+            handler=parallel_read,
+            is_concurrency_safe=lambda arguments: True,
+        )
+        barrier = tool_spec("exclusive", exclusive)
+        runtime = self.make_runtime(
+            tool_batch(
+                call("one", "safe", '{"id":"before"}'),
+                call("two", "exclusive"),
+                call("three", "safe", '{"id":"after"}'),
+            ),
+            text("done"),
+            specs=[safe, barrier],
+        )
+
+        result = runtime.loop.run_turn("barriers")
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(actions, ["read-before", "exclusive", "read-after"])
+
+    def test_parallel_pool_respects_the_configured_cap(self) -> None:
+        release = threading.Event()
+        two_started = threading.Event()
+        lock = threading.Lock()
+        started: list[str] = []
+        maximum_active = 0
+        active = 0
+
+        def bounded(arguments: dict[str, Any]) -> ToolResult:
+            nonlocal active, maximum_active
+            with lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+                started.append(str(arguments["id"]))
+                if len(started) == 2:
+                    two_started.set()
+            if not release.wait(1.0):
+                raise AssertionError("parallel calls were not released")
+            with lock:
+                active -= 1
+            return ToolResult(title="bounded", output="done")
+
+        spec = ToolSpec(
+            "bounded",
+            "Bounded safe work.",
+            {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+            handler=bounded,
+            is_concurrency_safe=lambda arguments: True,
+        )
+        runtime = self.make_runtime(
+            tool_batch(
+                *(
+                    call(str(index), "bounded", f'{{"id":"{index}"}}')
+                    for index in range(4)
+                )
+            ),
+            text("done"),
+            specs=[spec],
+            config=Config(api_key="test", max_parallel_tool_calls=2),
+        )
+
+        controller = threading.Thread(
+            target=lambda: (two_started.wait(1.0), time.sleep(0.02), release.set())
+        )
+        controller.start()
+        result = runtime.loop.run_turn("bounded")
+        controller.join(timeout=1.0)
+
+        self.assertEqual(result.status, TurnStatus.COMPLETED)
+        self.assertEqual(maximum_active, 2)
+        self.assertEqual(started[:2], ["0", "1"])
+
+    def test_parallel_interruption_drains_started_calls_and_skips_unstarted(self) -> None:
+        rendezvous = threading.Barrier(2, timeout=1.0)
+        started: list[str] = []
+        lock = threading.Lock()
+
+        def work(arguments: dict[str, Any]) -> ToolResult:
+            call_id = str(arguments["id"])
+            with lock:
+                started.append(call_id)
+            if call_id != "3":
+                rendezvous.wait()
+            if call_id == "1":
+                return ToolResult(
+                    title="interrupted",
+                    output="interrupted",
+                    status=ToolStatus.INTERRUPTED.value,
+                )
+            if call_id == "2":
+                time.sleep(0.05)
+            return ToolResult(title="done", output=call_id)
+
+        spec = ToolSpec(
+            "work",
+            "Safe work.",
+            {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+            handler=work,
+            is_concurrency_safe=lambda arguments: True,
+        )
+        runtime = self.make_runtime(
+            tool_batch(
+                call("one", "work", '{"id":"1"}'),
+                call("two", "work", '{"id":"2"}'),
+                call("three", "work", '{"id":"3"}'),
+            ),
+            text("must not sample"),
+            specs=[spec],
+            config=Config(api_key="test", max_parallel_tool_calls=2),
+        )
+
+        result = runtime.loop.run_turn("interrupt safe work")
+
+        self.assertEqual(result.status, TurnStatus.INTERRUPTED)
+        self.assertEqual(started, ["1", "2"])
+        finished = [
+            event for event in runtime.store.load() if event.type == "tool_finished"
+        ]
+        self.assertEqual(
+            [(event.payload["call_id"], event.payload["status"]) for event in finished],
+            [
+                ("one", "interrupted"),
+                ("two", "succeeded"),
+                ("three", "not_executed"),
+            ],
+        )
+
+    def test_parallel_interruption_marks_calls_beyond_batch_limit_not_executed(self) -> None:
+        def interrupt(arguments: dict[str, Any]) -> ToolResult:
+            return ToolResult(
+                title="interrupted",
+                output="interrupted",
+                status=ToolStatus.INTERRUPTED.value,
+            )
+
+        spec = ToolSpec(
+            "interrupt",
+            "Interrupt.",
+            EMPTY_SCHEMA,
+            handler=interrupt,
+            is_concurrency_safe=lambda arguments: True,
+        )
+        runtime = self.make_runtime(
+            tool_batch(
+                call("one", "interrupt"),
+                call("two", "interrupt"),
+            ),
+            text("must not sample"),
+            specs=[spec],
+            config=Config(
+                api_key="test",
+                max_tool_calls_per_batch=1,
+                max_parallel_tool_calls=1,
+            ),
+        )
+
+        result = runtime.loop.run_turn("interrupt before overflow")
+
+        self.assertEqual(result.status, TurnStatus.INTERRUPTED)
+        finished = [
+            event for event in runtime.store.load() if event.type == "tool_finished"
+        ]
+        self.assertEqual(
+            [(event.payload["call_id"], event.payload["status"]) for event in finished],
+            [("one", "interrupted"), ("two", "not_executed")],
+        )
+
+    def test_keyboard_interrupt_waits_for_started_parallel_calls_and_commits_them(self) -> None:
+        two_started = threading.Barrier(2, timeout=1.0)
+
+        def read(arguments: dict[str, Any]) -> ToolResult:
+            two_started.wait()
+            return ToolResult(title="read", output=str(arguments["id"]))
+
+        spec = ToolSpec(
+            "read",
+            "Safe read.",
+            {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
+                "additionalProperties": False,
+            },
+            handler=read,
+            is_concurrency_safe=lambda arguments: True,
+        )
+        runtime = self.make_runtime(
+            tool_batch(
+                call("one", "read", '{"id":"1"}'),
+                call("two", "read", '{"id":"2"}'),
+                call("three", "read", '{"id":"3"}'),
+            ),
+            text("must not sample"),
+            specs=[spec],
+            config=Config(api_key="test", max_parallel_tool_calls=2),
+        )
+        real_wait = concurrent.futures.wait
+        interrupted = False
+
+        def interrupt_once(futures: object, **kwargs: object):
+            nonlocal interrupted
+            if not interrupted:
+                interrupted = True
+                raise KeyboardInterrupt
+            return real_wait(futures, **kwargs)
+
+        with patch("mca.tool_scheduler.wait", side_effect=interrupt_once):
+            result = runtime.loop.run_turn("interrupt parallel wait")
+
+        self.assertEqual(result.status, TurnStatus.INTERRUPTED)
+        finished = [
+            event for event in runtime.store.load() if event.type == "tool_finished"
+        ]
+        self.assertEqual(
+            [(event.payload["call_id"], event.payload["status"]) for event in finished],
+            [
+                ("one", "succeeded"),
+                ("two", "succeeded"),
+                ("three", "not_executed"),
+            ],
         )
 
     def test_stop_finish_reason_with_calls_still_executes_tool_batch(self) -> None:

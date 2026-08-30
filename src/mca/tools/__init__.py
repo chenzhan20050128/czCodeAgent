@@ -9,6 +9,7 @@ from ..approval import ApprovalRequest
 from .filesystem import FileSystemTools
 from .plan import prepare_exit_plan_mode
 from .registry import (
+    ExecutionMode,
     SideEffect,
     ToolRegistry,
     ToolResult,
@@ -53,6 +54,7 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             },
             handler=filesystem.read_file,
             side_effect=SideEffect.NONE,
+            is_concurrency_safe=lambda arguments: True,
         ),
         ToolSpec(
             name="list_dir",
@@ -76,6 +78,7 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
             },
             handler=filesystem.list_dir,
             side_effect=SideEffect.NONE,
+            is_concurrency_safe=lambda arguments: True,
         ),
         ToolSpec(
             name="grep",
@@ -193,6 +196,7 @@ def create_tool_registry(workspace: str | os.PathLike[str]) -> ToolRegistry:
     return ToolRegistry(specs, workspace=Path(workspace))
 
 __all__ = [
+    "ExecutionMode",
     "SideEffect",
     "ToolRegistry",
     "ToolResult",

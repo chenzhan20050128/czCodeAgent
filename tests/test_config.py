@@ -38,6 +38,7 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertGreater(config.max_steps, 0)
         self.assertIsInstance(config.max_tool_calls_per_batch, int)
         self.assertGreater(config.max_tool_calls_per_batch, 0)
+        self.assertEqual(config.max_parallel_tool_calls, 4)
         self.assertIsInstance(config.request_timeout, float)
         self.assertGreater(config.request_timeout, 0)
         self.assertIsInstance(config.max_attempts, int)
@@ -117,6 +118,7 @@ class ConfigFromEnvTests(unittest.TestCase):
                 "MCA_MAX_OUTPUT_TOKENS": "98304",
                 "MCA_THINKING": "enabled",
                 "MCA_MAX_STEPS": "96",
+                "MCA_MAX_PARALLEL_TOOL_CALLS": "3",
                 "MCA_REQUEST_TIMEOUT": "750",
                 "MCA_RETRY_BUDGET_SECONDS": "1200",
             },
@@ -128,6 +130,7 @@ class ConfigFromEnvTests(unittest.TestCase):
         self.assertEqual(config.thinking, "enabled")
         self.assertEqual(config.request_max_output_tokens, 98_304)
         self.assertEqual(config.max_steps, 96)
+        self.assertEqual(config.max_parallel_tool_calls, 3)
         self.assertEqual(config.request_timeout, 750.0)
         self.assertEqual(config.retry_budget_seconds, 1200.0)
 
@@ -137,6 +140,7 @@ class ConfigFromEnvTests(unittest.TestCase):
             ({"MCA_MAX_OUTPUT_TOKENS": "lots"}, "MCA_MAX_OUTPUT_TOKENS"),
             ({"MCA_THINKING": "sometimes"}, "MCA_THINKING"),
             ({"MCA_MAX_STEPS": "0"}, "MCA_MAX_STEPS"),
+            ({"MCA_MAX_PARALLEL_TOOL_CALLS": "0"}, "MCA_MAX_PARALLEL_TOOL_CALLS"),
             ({"MCA_REQUEST_TIMEOUT": "0"}, "MCA_REQUEST_TIMEOUT"),
             ({"MCA_RETRY_BUDGET_SECONDS": "no"}, "MCA_RETRY_BUDGET_SECONDS"),
         )

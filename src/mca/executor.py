@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -18,6 +19,7 @@ from .tools.filesystem import (
     PreparedFileChange,
 )
 from .tools.registry import (
+    ExecutionMode,
     SideEffect,
     ToolRegistry,
     ToolResult,
@@ -77,6 +79,16 @@ class AcceptedToolCall:
             name=call.name,
             raw_arguments=call.arguments,
         )
+
+
+@dataclass(frozen=True)
+class PreparedParallelCall:
+    """A started side-effect-free call whose body may run off-thread."""
+
+    call: ToolCall
+    name: str
+    arguments: dict[str, Any]
+    handler: Callable[[dict[str, Any]], object]
 
 
 class ToolExecutor:
@@ -319,6 +331,93 @@ class ToolExecutor:
 
         return self.execute(accepted)
 
+    def prepare_parallel(
+        self, accepted: AcceptedToolCall | ToolCall
+    ) -> PreparedParallelCall:
+        """Validate and durably start one explicitly safe handler call."""
+
+        if not self._usable:
+            raise ToolExecutorError("executor is unusable after reducer divergence")
+        call = (
+            AcceptedToolCall.from_tool_call(accepted)
+            if isinstance(accepted, ToolCall)
+            else accepted
+        )
+        if not isinstance(call, AcceptedToolCall):
+            raise TypeError("accepted call must be an AcceptedToolCall or ToolCall")
+        state_call = self._require_accepted_identity(call)
+        if (
+            self.registry.execution_mode(call.name, call.raw_arguments)
+            is not ExecutionMode.PARALLEL
+        ):
+            raise ToolExecutorError(
+                f"accepted call is not concurrency-safe: {call.call_key}"
+            )
+        spec = self.registry.resolve(call.name)
+        arguments = self.registry.parse_and_validate(
+            call.name, call.raw_arguments
+        )
+        if spec.handler is None:
+            raise ToolExecutorError(
+                f"parallel call has no direct handler: {call.call_key}"
+            )
+        self._append_and_reduce(
+            "tool_started",
+            {
+                "call_key": call.call_key,
+                "call_id": call.provider_call_id,
+                "name": call.name,
+                "arguments": arguments,
+            },
+        )
+        return PreparedParallelCall(
+            call=state_call,
+            name=call.name,
+            arguments=arguments,
+            handler=spec.handler,
+        )
+
+    def dispatch_parallel(self, prepared: PreparedParallelCall) -> ToolResult:
+        """Run only a prepared safe handler body without touching session state."""
+
+        if not isinstance(prepared, PreparedParallelCall):
+            raise TypeError("prepared must be a PreparedParallelCall")
+        try:
+            raw_result = prepared.handler(prepared.arguments)
+            return self._normalize_result(prepared.name, raw_result)
+        except (FileConflictError, PathSafetyError) as error:
+            return _error_result(
+                prepared.name,
+                ToolStatus.FAILED,
+                _safe_error("tool execution failed", error),
+            )
+        except KeyboardInterrupt:
+            return _error_result(
+                prepared.name,
+                ToolStatus.INTERRUPTED,
+                "tool execution interrupted",
+            )
+        except Exception as error:
+            return _error_result(
+                prepared.name,
+                ToolStatus.FAILED,
+                _safe_error("tool execution failed", error),
+            )
+
+    def commit_parallel(
+        self, prepared: PreparedParallelCall, result: ToolResult
+    ) -> None:
+        """Persist one settled safe result on the caller's serial path."""
+
+        if not isinstance(prepared, PreparedParallelCall):
+            raise TypeError("prepared must be a PreparedParallelCall")
+        state_call = self.state.tool_calls.get(prepared.call.call_key)
+        if state_call is None or state_call.status is not ToolStatus.STARTED:
+            raise ToolExecutorError(
+                f"parallel call is not started: {prepared.call.call_key}"
+            )
+        self._finish_started(state_call, result)
+
     def _require_accepted_identity(self, accepted: AcceptedToolCall) -> ToolCall:
         state_call = self.state.tool_calls.get(accepted.call_key)
         if state_call is None:
@@ -529,6 +628,7 @@ def _safe_error(prefix: str, error: BaseException) -> str:
 
 __all__ = [
     "AcceptedToolCall",
+    "PreparedParallelCall",
     "PostCommitInterrupted",
     "ToolExecutor",
     "ToolExecutorError",
