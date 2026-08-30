@@ -52,5 +52,5 @@
 
 - [x] Run `python3 -m unittest discover -s tests -v`, `python3 -m compileall -q src tests`, `git diff --check`, and a high-confidence credential scan.
 - [x] Review behavior against every design bullet, inspect ANSI/plain output manually from deterministic fixtures, and resolve every critical or important issue.
-- [ ] Commit the feature branch, switch to `main`, merge without rewriting history, rerun the full verification on the merge result, and push `main`.
-- [ ] Confirm local `main`, `origin/main`, and the fetched remote SHA are identical and the worktree is clean.
+- [x] Commit the feature branch, switch to `main`, merge without rewriting history, rerun the full verification on the merge result, and push `main`.
+- [x] Confirm local `main`, `origin/main`, and the fetched remote SHA are identical and the worktree is clean.
